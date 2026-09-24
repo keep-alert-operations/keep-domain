@@ -1,0 +1,181 @@
+from psycopg.types.json import Jsonb
+
+from appchi.alerts.lifecycle import apply_source
+from appchi.alerts.repository import publish, store_alert
+from appchi.shared.errors import AppError, unavailable
+from appchi.shared.transactions import coordinator
+
+
+def process_one(db, tenant, attempt=None, profile=None):
+    from appchi.maintenance.runtime import prepare_for_tenant
+
+    catalog = prepare_for_tenant(db, tenant, profile)
+    with db.transaction(tenant) as conn:
+        return _apply_one(conn, tenant, attempt, catalog)
+
+
+def _apply_one(conn, tenant, attempt, catalog):
+    """Exact source transaction body, also used by rolled-back repair probes.
+
+    No network, compilation or independent transaction belongs in this helper.
+    The caller owns the outer transaction and precompiles its catalog.
+    """
+    from appchi.maintenance.runtime import lock_catalog, apply_transition
+    from appchi.visibility.runtime import link_source_result
+
+    state, now = coordinator(conn, tenant)
+    lock_catalog(conn, catalog)
+    if state["blocked"] or now < state["next_attempt_at"]:
+        return False
+    item = conn.execute(
+        "SELECT * FROM ingest_items WHERE tenant_id=%s AND disposition='pending' ORDER BY admission_order LIMIT 1 FOR UPDATE",
+        (tenant,),
+    ).fetchone()
+    if not item:
+        return False
+    if attempt is not None:
+        attempt["item_id"] = item["id"]
+    claim = conn.execute(
+        "SELECT * FROM alert_key_claims WHERE tenant_id=%s AND schema_version=%s AND key_digest=%s",
+        (tenant, item["version"], item["key_digest"]),
+    ).fetchone()
+    previous = None
+    linked = []
+    if claim:
+        from appchi.incidents.routes import lock_linked_incidents
+
+        linked = lock_linked_incidents(conn, tenant, claim["alert_id"])
+        previous = conn.execute(
+            "SELECT * FROM alerts WHERE tenant_id=%s AND id=%s FOR UPDATE",
+            (tenant, claim["alert_id"]),
+        ).fetchone()
+    try:
+        if claim and (
+            claim["key_field"] != item["key_field"]
+            or bytes(claim["identity_material"]) != bytes(item["identity_material"])
+        ):
+            raise AppError("identity_conflict", "Immutable identity material differs.", 409)
+        current, changed = apply_source(previous, item)
+    except AppError as error:
+        conn.execute(
+            "UPDATE ingest_items SET disposition='rejected',error_code=%s WHERE id=%s",
+            (error.code, item["id"]),
+        )
+        conn.execute(
+            "UPDATE ingest_retry_keys SET expires_at=%s + interval '90 days' WHERE item_id=%s",
+            (item["received_at"], item["id"]),
+        )
+        link_source_result(conn, item, error_code=error.code)
+    else:
+        if previous is None:
+            store_alert(conn, current, new=True)
+        current, changed, _ = apply_transition(
+            conn,
+            previous,
+            current,
+            item["received_at"],
+            item["admission_order"],
+            "source",
+            now,
+            catalog,
+        )
+        store_alert(conn, current)
+        from appchi.incidents.routes import linked_transition
+
+        linked_transition(conn, linked, previous, current, item["received_at"])
+        if previous is None:
+            conn.execute(
+                "INSERT INTO alert_key_claims(tenant_id,schema_version,key_digest,key_field,identity_material,alert_id) VALUES(%s,%s,%s,%s,%s,%s)",
+                (
+                    tenant,
+                    item["version"],
+                    item["key_digest"],
+                    item["key_field"],
+                    item["identity_material"],
+                    current["id"],
+                ),
+            )
+        conn.execute(
+            "INSERT INTO alert_source_events(tenant_id,alert_id,id,admission_order,received_at,payload,raw_json,time_defaulted,occurrence_id) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (
+                tenant,
+                current["id"],
+                item["id"],
+                item["admission_order"],
+                item["received_at"],
+                Jsonb(item["payload"]),
+                item["raw_json"],
+                item["time_defaulted"],
+                current["occurrence_id"],
+            ),
+        )
+        if item.get("adapter_version"):
+            conn.execute(
+                "UPDATE alert_source_events SET adapter_version=%s WHERE tenant_id=%s AND alert_id=%s AND id=%s",
+                (item["adapter_version"], tenant, current["id"], item["id"]),
+            )
+        conn.execute(
+            "UPDATE ingest_items SET disposition='applied',alert_id=%s,occurrence_id=%s,payload=NULL,raw_json=NULL WHERE id=%s",
+            (current["id"], current["occurrence_id"], item["id"]),
+        )
+        publication = publish(
+            conn,
+            previous,
+            current,
+            item["received_at"],
+            "source",
+            semantic=changed,
+            original_order=item["admission_order"],
+            maintenance_input_recorded=True,
+        )
+        link_source_result(
+            conn,
+            item,
+            before=previous,
+            after=current,
+            publication=publication,
+            changed=changed,
+        )
+    conn.execute("UPDATE tenant_work_state SET failures=0 WHERE tenant_id=%s", (tenant,))
+    conn.execute(
+        "UPDATE application_outbox SET processed_at=%s WHERE tenant_id=%s AND stream='received' AND stream_order=%s",
+        (now, tenant, item["admission_order"]),
+    )
+    release_reservation(conn, tenant, item["id"])
+    return True
+
+
+def release_reservation(conn, tenant, item_id):
+    reservation = conn.execute(
+        "SELECT * FROM admission_reservations WHERE item_id=%s", (item_id,)
+    ).fetchone()
+    if not reservation or reservation["released"]:
+        raise unavailable("capacity_accounting_mismatch")
+    for scope in ("global", str(tenant)):
+        conn.execute(
+            "SELECT scope FROM admission_capacity WHERE scope=%s FOR UPDATE", (scope,)
+        ).fetchone()
+    conn.execute(
+        "UPDATE admission_reservations SET released=true WHERE item_id=%s AND NOT released",
+        (item_id,),
+    )
+    for scope in ("global", str(tenant)):
+        conn.execute(
+            "UPDATE admission_capacity SET pending_items=pending_items-1,pending_bytes=pending_bytes-%s WHERE scope=%s",
+            (reservation["bytes"], scope),
+        )
+
+
+def record_failure(db, tenant, item_id):
+    with db.transaction(tenant) as conn:
+        coordinator(conn, tenant)
+        head = conn.execute(
+            "SELECT id FROM ingest_items WHERE tenant_id=%s AND disposition='pending' ORDER BY admission_order LIMIT 1",
+            (tenant,),
+        ).fetchone()
+        if not head or head["id"] != item_id:
+            return
+        conn.execute(
+            "UPDATE tenant_work_state SET failures=failures+1,blocked=(failures+1>=10),block_generation=block_generation+CASE WHEN failures+1=10 THEN 1 ELSE 0 END,next_attempt_at=clock_timestamp()+make_interval(secs=>random()*least(30,power(2,least(failures,5)))::int) WHERE tenant_id=%s",
+            (tenant,),
+        )
