@@ -9,7 +9,11 @@ from appchi.recovery.restore import canonical_id
 from appchi.shared.errors import AppError
 
 FAMILIES = get_args(get_type_hints(Evidence)["resource_kind"])
-BASE_BLOCKERS = ("authority_baseline_unestablished", "producer_coverage_unestablished")
+BASE_BLOCKERS = (
+    "authority_baseline_unestablished",
+    "producer_coverage_unestablished",
+    "kafka_delivery_and_retired_key_baseline_unverified",
+)
 CAPABILITIES = {
     "human_auth": (
         "permission_reconciliation_unimplemented",

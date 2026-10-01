@@ -114,6 +114,8 @@ def open_occurrence(current, when):
 
 
 def apply_command(current, kind, value, actor, when):
+    if kind not in {"set_status", "set_assignee"}:
+        raise AppError("invalid_command", "Use assignment to acknowledge an alert.", 422)
     result = dict(current)
     if kind == "set_status" and result["status"] != value:
         result["status"] = value
@@ -122,12 +124,6 @@ def apply_command(current, kind, value, actor, when):
             result["last_source_activity"] = when
         else:
             result.update(resolved_at=when, retention_at=when + timedelta(days=90))
-    elif kind == "set_acknowledged" and result["acknowledged"] != value:
-        result.update(
-            acknowledged=value,
-            acknowledged_by=actor if value else None,
-            acknowledged_at=when if value else None,
-        )
     elif kind == "set_assignee":
         result["assignee_id"] = UUID(value) if value is not None else None
     changed = any(result[f] != current[f] for f in SEMANTIC_FIELDS)

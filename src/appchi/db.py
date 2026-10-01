@@ -14,8 +14,23 @@ class Database:
     @contextmanager
     def transaction(self, tenant_id=None):
         from appchi.recovery.guard import runtime_guard
+        from appchi.alert_notifications import pending, publish_best_effort
 
-        with self.pool.connection() as conn:
+        batch = []
+        token = pending.set(batch)
+        try:
+            with self.pool.connection() as conn:
+                with self._transaction(conn, tenant_id, runtime_guard):
+                    yield conn
+        except BaseException:
+            raise
+        else:
+            publish_best_effort(batch)
+        finally:
+            pending.reset(token)
+
+    @contextmanager
+    def _transaction(self, conn, tenant_id, runtime_guard):
             guard = (
                 runtime_guard(conn, self.deployment_epoch)
                 if self.deployment_epoch is not None
@@ -30,6 +45,8 @@ class Database:
                         "SELECT set_config('appchi.tenant_id', %s, true)", (str(tenant_id),)
                     )
                 yield conn
+                from appchi.maintenance.runtime import flush_inline_effects
+                flush_inline_effects(conn)
 
     def close(self):
         self.pool.close()

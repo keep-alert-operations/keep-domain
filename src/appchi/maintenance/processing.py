@@ -28,6 +28,9 @@ class Catalog:
     segments: tuple[Segment, ...]
     max_work: int
     max_inputs: int
+    inline_correlation: object | None = None
+    inline_requested: bool = False
+    source_release_since: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -64,7 +67,6 @@ def suppression_at(conn, tenant_id, alert_id, effective_at, original_order):
     if (
         not row
         or not row["complete"]
-        or row["catalog_generation"] != row["maintenance_generation"]
         or row["input_revision"] != row["head_revision"]
     ):
         raise MaintenanceProofError("maintenance_historical_checkpoint_unproven")
@@ -82,9 +84,9 @@ def suppression_at(conn, tenant_id, alert_id, effective_at, original_order):
         ).fetchone()
         source = conn.execute(
             f"""SELECT source_suppressed FROM maintenance_alert_inputs WHERE tenant_id=%s AND alert_id=%s
-            AND source_suppressed IS NOT NULL AND (effective_at,original_order) {opened} (%s,%s)
-            ORDER BY effective_at DESC,original_order DESC LIMIT 1""",
-            (tenant_id, alert_id, effective_at, original_order),
+            AND source_suppressed IS NOT NULL AND original_order {opened} %s
+            ORDER BY original_order DESC LIMIT 1""",
+            (tenant_id, alert_id, original_order),
         ).fetchone()
         result.append(bool(maintenance or (source and source["source_suppressed"])))
     return HistoricalSuppression(
@@ -100,7 +102,7 @@ def prepare_catalog(database, tenant_id, *, max_work, max_inputs, max_segments):
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         conn.execute("SELECT set_config('appchi.tenant_id',%s,true)", (str(tenant_id),))
         state = conn.execute(
-            "SELECT maintenance_generation FROM tenant_view_state WHERE tenant_id=%s", (tenant_id,)
+            "SELECT maintenance_generation,(SELECT source_release_since FROM application_scope WHERE singleton) AS source_release_since FROM tenant_view_state WHERE tenant_id=%s", (tenant_id,)
         ).fetchone()
         rows = conn.execute(
             "SELECT * FROM maintenance_segments WHERE tenant_id=%s ORDER BY activation_at,activation_order,id LIMIT %s",
@@ -143,7 +145,8 @@ def prepare_catalog(database, tenant_id, *, max_work, max_inputs, max_segments):
             )
         )
     return Catalog(
-        UUID(str(tenant_id)), state["maintenance_generation"], tuple(segments), max_work, max_inputs
+        UUID(str(tenant_id)), state["maintenance_generation"], tuple(segments), max_work, max_inputs,
+        source_release_since=state["source_release_since"],
     )
 
 
@@ -287,7 +290,7 @@ def reconcile_alert(conn, current, processing_now, *, catalog):
     tenant, alert_id = current["tenant_id"], UUID(str(current["id"]))
     _check_catalog(conn, tenant, catalog)
     rows = conn.execute(
-        "SELECT * FROM maintenance_alert_inputs WHERE tenant_id=%s AND alert_id=%s ORDER BY effective_at,original_order LIMIT %s",
+        "SELECT * FROM maintenance_alert_inputs WHERE tenant_id=%s AND alert_id=%s ORDER BY original_order LIMIT %s",
         (tenant, alert_id, catalog.max_inputs + 1),
     ).fetchall()
     if len(rows) > catalog.max_inputs:
@@ -304,7 +307,7 @@ def reconcile_alert(conn, current, processing_now, *, catalog):
             row["before_snapshot"],
             row["after_snapshot"],
             row["new_logical_alert"],
-            row["source_suppressed"],
+            row["source_suppressed"], row["kind"],
         )
         for row in rows
     )
@@ -316,6 +319,7 @@ def reconcile_alert(conn, current, processing_now, *, catalog):
         recorded_at=processing_now,
         proof_complete=bool(rows and rows[0]["new_logical_alert"]),
         max_work=catalog.max_work,
+        source_release_since=catalog.source_release_since,
     )
     if result.final_snapshot != _snapshot(current):
         raise MaintenanceProofError("maintenance_current_snapshot_unproven")
@@ -427,12 +431,21 @@ def reconcile_alert(conn, current, processing_now, *, catalog):
         ).fetchall()
     }
     new = []
+    qualifier_proofs = {at: (source_id, allowed, origin_id) for at, source_id, allowed, origin_id in result.qualifier_inputs}
     for identity, at in qualifiers.items():
         previous = previous_qualifiers.get(identity)
-        if previous is None or not previous["active"]:
+        proof = qualifier_proofs[at]
+        previous_proof = None if previous is None else (
+            str(previous["source_input_id"]), previous["correlation_allowed"],
+            str(previous["origin_input_id"]) if previous["origin_input_id"] else None,
+        )
+        if previous is None or not previous["active"] or previous_proof != proof:
+            # A delayed applied source can change the snapshot/provenance of an
+            # already-known end instant. Retract its old evidence atomically.
+            conn.execute("DELETE FROM correlation_evidence WHERE tenant_id=%s AND alert_id=%s AND qualifier_ref=%s", (tenant, alert_id, identity))
             conn.execute(
-                "INSERT INTO maintenance_qualifier_effects(tenant_id,alert_id,id,effective_at,active,recorded_at) VALUES(%s,%s,%s,%s,true,%s) ON CONFLICT(tenant_id,alert_id,id) DO UPDATE SET active=true,recorded_at=EXCLUDED.recorded_at",
-                (tenant, alert_id, identity, at, processing_now),
+                "INSERT INTO maintenance_qualifier_effects(tenant_id,alert_id,id,effective_at,active,recorded_at,source_input_id,correlation_allowed,origin_input_id) VALUES(%s,%s,%s,%s,true,%s,%s,%s,%s) ON CONFLICT(tenant_id,alert_id,id) DO UPDATE SET active=true,recorded_at=EXCLUDED.recorded_at,source_input_id=EXCLUDED.source_input_id,correlation_allowed=EXCLUDED.correlation_allowed,origin_input_id=EXCLUDED.origin_input_id",
+                (tenant, alert_id, identity, at, processing_now, *proof),
             )
             new.append((identity, at))
     withdrawn = tuple(
@@ -570,6 +583,10 @@ def step_job(database, lease, catalog, *, lock_alert, publish):
     """
     with database.transaction(lease.tenant_id) as conn:
         _, now = coordinator(conn, lease.tenant_id)
+        conn.execute(
+            "SELECT id FROM maintenance_windows WHERE tenant_id=%s AND id=ANY(%s::uuid[]) ORDER BY id FOR UPDATE",
+            (lease.tenant_id, sorted({str(segment.window_id) for segment in catalog.segments})),
+        ).fetchall()
         hint = conn.execute(
             "SELECT window_id FROM maintenance_fanout_jobs WHERE tenant_id=%s AND id=%s",
             (lease.tenant_id, lease.job_id),
@@ -628,13 +645,9 @@ def step_job(database, lease, catalog, *, lock_alert, publish):
         if before is None:
             raise MaintenanceProofError("maintenance_retained_alert_missing")
         after, effects = reconcile_alert(conn, before, now, catalog=catalog)
-        if (
-            effects.history_changed
-            or effects.suppression_changed
-            or effects.qualifiers
-            or effects.withdrawn_qualifiers
-        ):
-            publish(conn, before, after, effects, now)
+        # A previous transaction can have materialized an end while its source
+        # proof was awaiting Kafka. The callback must also see unchanged proof.
+        publish(conn, before, after, effects, now)
         from appchi.visibility.runtime import link_expiry_result
 
         link_expiry_result(
@@ -687,11 +700,7 @@ def finish_failed_job(database, lease, *, proof_blocked):
 
 
 def derive_current(conn, current, at):
-    """Read-only authoritative boolean and pending-materialization indication.
-
-    This does not establish missing history or enable correlation decisions;
-    those must reconcile_alert first under the full write lock protocol.
-    """
+    """Time alone never clears persisted suppression in the current release."""
     tenant, alert_id = current["tenant_id"], current["id"]
     checkpoint = conn.execute(
         """SELECT c.*,h.input_revision AS head_revision FROM maintenance_alert_checkpoints c
@@ -704,19 +713,4 @@ def derive_current(conn, current, at):
         or checkpoint["input_revision"] != checkpoint["head_revision"]
     ):
         raise MaintenanceProofError("maintenance_current_checkpoint_missing")
-    cause = conn.execute(
-        """SELECT 1 FROM alert_maintenance_causes c JOIN maintenance_segments s ON s.tenant_id=c.tenant_id AND s.id=c.segment_id
-        WHERE c.tenant_id=%s AND c.alert_id=%s AND c.opened_at<=%s AND (c.closed_at IS NULL OR c.closed_at>%s)
-        AND s.start_at<=%s AND s.end_at>%s AND (s.deactivation_at IS NULL OR s.deactivation_at>%s) LIMIT 1""",
-        (tenant, alert_id, at, at, at, at, at),
-    ).fetchone()
-    generation = conn.execute(
-        "SELECT maintenance_generation FROM tenant_view_state WHERE tenant_id=%s", (tenant,)
-    ).fetchone()["maintenance_generation"]
-    suppressed = bool(current.get("source_suppressed") or cause)
-    pending = (
-        checkpoint["catalog_generation"] != generation
-        or checkpoint["current_suppressed"] != suppressed
-        or bool(current.get("suppressed")) != suppressed
-    )
-    return suppressed, pending
+    return bool(current["suppressed"]), False

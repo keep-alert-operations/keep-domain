@@ -11,6 +11,7 @@ from typing import Callable
 from appchi.cel import CompiledExpression
 from appchi.cel.catalog import FIELDS, storage_name
 from appchi.cel.compiler import PROFILE
+from appchi.alerts.presentation import present_alert
 from appchi.shared.crypto import EnvelopeCipher
 from appchi.shared.errors import AppError, unavailable
 from .projection import SORTABLE, assert_complete, canonical
@@ -225,7 +226,7 @@ class SearchReader:
                 ):
                     raise unavailable("search_scope_mismatch")
                 if hit["_id"] in retained:
-                    rows.append(document["display"])
+                    rows.append(present_alert(document["display"]))
             snapshot["pit"] = current_pit
             snapshot["seen"] += len(hits)
             next_cursor = None

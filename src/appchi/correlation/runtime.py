@@ -5,13 +5,14 @@ to every configured rule and commits at most one complete winning incident.
 """
 
 from dataclasses import dataclass, replace
+from contextlib import nullcontext
 from datetime import datetime
 import json
 from uuid import UUID, uuid4, uuid5
 
 from psycopg.types.json import Jsonb
 
-from appchi.cel.catalog import RULE_FIELDS
+from appchi.cel.catalog import CORRELATION_FIELDS as RULE_FIELDS
 from appchi.shared.errors import AppError, unavailable
 from appchi.shared.transactions import coordinator, wire
 from . import repository as repo
@@ -101,10 +102,10 @@ class Prepared:
     maintenance: object
 
 
-def prepare_tenant(database, tenant, profile):
+def prepare_tenant(database, tenant, profile, *, allow_local_preview=False, maintenance_input=None):
     from appchi.maintenance.runtime import prepare_for_tenant
 
-    limits = repo.limits(profile)
+    limits = repo.limits(profile, allow_local_preview=allow_local_preview)
     with database.transaction() as conn:
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         conn.execute("SELECT set_config('appchi.tenant_id',%s,true)", (str(tenant),))
@@ -114,7 +115,7 @@ def prepare_tenant(database, tenant, profile):
         ).fetchall()
         if len(ids) > limits["enabled_rules_per_tenant"]:
             raise unavailable("correlation_enabled_capacity")
-        rows = tuple(repo.get_rule(conn, tenant, item["id"]) for item in ids)
+        rows = tuple(row for item in ids if not (row := repo.get_rule(conn, tenant, item["id"]))["kafka_schema_blocked"])
     programs = {row["id"]: repo.compile_conditions(repo.definition(row)) for row in rows}
     for row in rows:
         costs = [p.rule_cost_upper_bound for p in programs[row["id"]].values()]
@@ -122,7 +123,7 @@ def prepare_tenant(database, tenant, profile):
             raise unavailable("correlation_cost_capacity")
     if sum(row["evaluation_cost"] for row in rows) > limits["tenant_cost"]:
         raise unavailable("correlation_tenant_cost_capacity")
-    maintenance = prepare_for_tenant(database, tenant, profile)
+    maintenance = maintenance_input or prepare_for_tenant(database, tenant, profile, inline=False)
     if maintenance is None:
         with database.transaction(tenant) as conn:
             if conn.execute(
@@ -349,7 +350,7 @@ def _load(conn, prepared, position, now):
 def _event(conn, event, current, owner, prepared):
     tenant = prepared.tenant
     if event["stream"] == "effect":
-        raise CorrelationProofError("maintenance_replay_capability_required")
+        return maintenance_input(conn, event, current, owner, event["change_order"])
     before, after = event["before_snapshot"], event["after_snapshot"]
     if after.get("retired"):
         return None
@@ -357,12 +358,25 @@ def _event(conn, event, current, owner, prepared):
     kind = "source" if event["cause"] == "source" else "manual" if source_order else "bookkeeping"
     if event["cause"] == "maintenance-materialization":
         kind = "bookkeeping"
+    if _fields(after) == _fields(current) and after["suppressed"] == current["suppressed"]:
+        after = dict(after, revision=current["revision"])
     if prepared.maintenance and source_order and kind != "bookkeeping":
         from appchi.maintenance.processing import suppression_at
 
         proof = suppression_at(conn, tenant, event["alert_id"], event["effective_at"], source_order)
         before = dict(before, suppressed=proof.before) if before else None
         after = dict(after, suppressed=proof.after)
+        if after["suppressed"] and not current["suppressed"]:
+            release = conn.execute("""SELECT q.*,i.original_order FROM maintenance_qualifier_effects q
+                JOIN maintenance_alert_inputs i ON i.tenant_id=q.tenant_id AND i.alert_id=q.alert_id AND i.id=q.origin_input_id
+                WHERE q.tenant_id=%s AND q.alert_id=%s AND q.active AND q.correlation_allowed
+                AND q.effective_at>=%s AND i.original_order<=%s ORDER BY q.effective_at LIMIT 1""",
+                (tenant, current["id"], event["effective_at"], source_order)).fetchone()
+            if release:
+                value = maintenance_input(conn, release, current, owner, event["change_order"], source_order)
+                if value:
+                    conn.execute("UPDATE maintenance_effect_outbox SET processed_at=clock_timestamp() WHERE tenant_id=%s AND alert_id=%s AND qualifier_id=%s AND processed_at IS NULL", (tenant,current["id"],release["id"]))
+                    return value
     return Input(
         uuid5(tenant, "journal:" + str(event["change_order"])),
         event["change_order"],
@@ -372,6 +386,58 @@ def _event(conn, event, current, owner, prepared):
         kind,
         before is None,
     )
+
+
+def maintenance_input(conn, effect, current, owner, sequence, consuming_order=None):
+    proof = conn.execute("""WITH source_proof AS (
+        SELECT s.*, EXISTS(SELECT 1 FROM kafka_source_results r JOIN kafka_correlation_events e ON e.event_id=r.changed_event_id
+            WHERE r.tenant_id=s.tenant_id AND r.alert_id=s.alert_id AND r.application_order=s.original_order)
+            OR (s.recorded_at<=p.cutover_at AND NOT EXISTS(SELECT 1 FROM kafka_source_results r
+                WHERE r.tenant_id=s.tenant_id AND r.alert_id=s.alert_id AND r.application_order=s.original_order)) AS consumed
+        FROM maintenance_alert_inputs s CROSS JOIN kafka_pipeline_control p
+        WHERE s.tenant_id=%s AND s.alert_id=%s AND s.kind='source')
+        SELECT q.*,i.after_snapshot,i.original_order AS snapshot_order,o.original_order AS origin_order,o.consumed AS origin_consumed,
+        EXISTS(SELECT 1 FROM maintenance_cause_history h WHERE h.tenant_id=q.tenant_id AND h.alert_id=q.alert_id
+            AND h.boundary_kind='close' AND h.boundary_id=o.id::text AND h.effective_at=q.effective_at) AS source_release,
+        NOT EXISTS(SELECT 1 FROM source_proof s WHERE s.original_order<>coalesce(%s,-1)
+            AND NOT coalesce(s.consumed,false)) AS snapshot_consumed
+        FROM maintenance_qualifier_effects q
+        JOIN maintenance_alert_inputs i ON i.tenant_id=q.tenant_id AND i.alert_id=q.alert_id AND i.id=q.source_input_id
+        JOIN source_proof o ON o.id=q.origin_input_id
+        WHERE q.tenant_id=%s AND q.alert_id=%s AND q.id=%s AND q.active AND q.correlation_allowed""",
+        (current["tenant_id"],current["id"],consuming_order,current["tenant_id"],current["id"],effect.get("qualifier_id", effect["id"]))).fetchone()
+    if not proof or not proof["snapshot_consumed"] or not (proof["origin_consumed"] or proof["origin_order"] == consuming_order):
+        return None
+    if current["suppressed"] or current["status"] != "firing" or _fields(proof["after_snapshot"]) != _fields(current):
+        return None
+    before = _snapshot(dict(current, suppressed=True), owner)
+    after = _snapshot(current, owner)
+    reset = conn.execute("""SELECT max(original_order) AS original_order FROM maintenance_alert_inputs
+        WHERE tenant_id=%s AND alert_id=%s AND kind<>'source' AND original_order<=%s AND effective_at<=%s
+        AND before_snapshot->>'status'<>after_snapshot->>'status'""",
+        (current["tenant_id"],current["id"],proof["snapshot_order"],proof["effective_at"])).fetchone()["original_order"]
+    provenance = None
+    if reset is not None:
+        rows = conn.execute("""SELECT id,before_snapshot,after_snapshot,effective_at FROM maintenance_alert_inputs
+            WHERE tenant_id=%s AND alert_id=%s AND kind='source' AND original_order>%s AND original_order<=%s
+            AND effective_at<=%s ORDER BY original_order""",
+            (current["tenant_id"],current["id"],reset,proof["snapshot_order"],proof["effective_at"])).fetchall()
+        provenance = tuple((_fields(row["before_snapshot"]) if row["before_snapshot"] else None,
+            _fields(row["after_snapshot"]),row["effective_at"],
+            proof["source_release"] and row["id"] == proof["origin_input_id"]) for row in rows)
+    return Input(proof["id"], sequence, before, after, Boundary(proof["effective_at"],0), "scheduled", False, True, provenance)
+
+
+def lock_decision_scope(conn, tenant, targets, *, incidents=()):
+    """Prelock a bounded live-evidence decision scope before mutating a target."""
+    lock_contexts(conn, tenant)
+    ids = {UUID(str(value)) for value in targets}
+    ids.update(row["alert_id"] for row in conn.execute("SELECT DISTINCT alert_id FROM correlation_evidence WHERE tenant_id=%s", (tenant,)))
+    conn.execute("""SELECT id FROM incidents WHERE tenant_id=%s AND (id=ANY(%s::uuid[]) OR id IN
+        (SELECT active_incident_id FROM correlation_contexts WHERE tenant_id=%s) OR id IN
+        (SELECT incident_id FROM incident_alert_links WHERE tenant_id=%s AND alert_id=ANY(%s::uuid[]) AND unlinked_at IS NULL)) ORDER BY id FOR UPDATE""",
+        (tenant,list(incidents),tenant,tenant,sorted(ids))).fetchall()
+    conn.execute("SELECT id FROM alerts WHERE tenant_id=%s AND id=ANY(%s::uuid[]) ORDER BY id FOR UPDATE",(tenant,sorted(ids))).fetchall()
 
 
 def _persist(conn, prepared, states):
@@ -528,15 +594,16 @@ def _commit_decision(conn, prepared, decision, position, alerts):
     return incident
 
 
-def worker_turn(database, tenant, profile):
-    with database.transaction(tenant) as conn:
+def worker_turn(database, tenant, profile, *, allow_local_preview=False, prepared_input=None, input_event=None, transaction=None, kafka=False):
+    with nullcontext(transaction) if transaction is not None else database.transaction(tenant) as conn:
         gate = conn.execute(
             "SELECT ready FROM capability_gates WHERE capability='correlation'"
         ).fetchone()
         if not gate or not gate["ready"]:
             return 0
-    prepared = prepare_tenant(database, tenant, profile)
-    with database.transaction(tenant) as conn:
+    preview = {"allow_local_preview": True} if allow_local_preview else {}
+    prepared = prepared_input or prepare_tenant(database, tenant, profile, **preview)
+    with nullcontext(transaction) if transaction is not None else database.transaction(tenant) as conn:
         _, now = coordinator(conn, tenant)
         if not conn.execute(
             "SELECT ready FROM capability_gates WHERE capability='correlation'"
@@ -544,7 +611,7 @@ def worker_turn(database, tenant, profile):
             return 0
         lock_contexts(conn, tenant)
         current = conn.execute(
-            "SELECT id,revision FROM correlation_rules WHERE tenant_id=%s AND enabled AND deleted_at IS NULL ORDER BY created_at,id",
+            "SELECT id,revision FROM correlation_rules WHERE tenant_id=%s AND enabled AND NOT kafka_schema_blocked AND deleted_at IS NULL ORDER BY created_at,id",
             (tenant,),
         ).fetchall()
         if [(r["id"], r["revision"]) for r in current] != [
@@ -561,8 +628,8 @@ def worker_turn(database, tenant, profile):
         ).fetchone()
         if not consumer:
             return 0
-        position = consumer["change_order"]
-        event = _next(conn, tenant, position)
+        position = consumer["kafka_sequence"] if kafka else consumer["change_order"]
+        event = dict(input_event, change_order=position + 1) if input_event else None if kafka else _next(conn, tenant, position)
         states, active, resets, releases = _load(conn, prepared, position, now)
         ids = {m.alert_id for state in states for m in state.memberships}
         if event:
@@ -588,13 +655,14 @@ def worker_turn(database, tenant, profile):
                 (tenant, sorted(ids)),
             )
         }
+        unsafe_suppression = set()
         if prepared.maintenance:
             from appchi.maintenance.processing import derive_current
 
             for row in rows:
-                _, updating = derive_current(conn, row, now)
-                if updating:
-                    raise unavailable("correlation_maintenance_proof_pending")
+                suppressed, _ = derive_current(conn, row, now)
+                if suppressed != row["suppressed"]:
+                    unsafe_suppression.add(row["id"])
         if event:
             if event["alert_id"] not in alerts:
                 states = tuple(
@@ -609,7 +677,7 @@ def worker_turn(database, tenant, profile):
                 )
             else:
                 try:
-                    if prepared.maintenance:
+                    if prepared.maintenance and not kafka:
                         states = _replay_states(
                             conn,
                             prepared,
@@ -646,6 +714,8 @@ def worker_turn(database, tenant, profile):
                             release_boundaries=releases,
                         )
                 except CorrelationProofError as error:
+                    if kafka:
+                        raise unavailable("correlation_transition_proof_invalid") from error
                     conn.execute(
                         "UPDATE correlation_consumer_state SET health='recovery_needed',blocked_reason=%s,pending=true,updated_at=%s WHERE tenant_id=%s",
                         (str(error), now, tenant),
@@ -658,6 +728,8 @@ def worker_turn(database, tenant, profile):
         if decision_now < now:
             raise unavailable("clock_untrusted")
         snapshots = {key: _snapshot(row, owners.get(key)) for key, row in alerts.items()}
+        for key in unsafe_suppression:
+            snapshots[key] = replace(snapshots[key], suppressed=True)
         links = {
             incident: frozenset(
                 row["alert_id"]
@@ -673,12 +745,12 @@ def worker_turn(database, tenant, profile):
         )
         if decision:
             _commit_decision(conn, prepared, decision, position, alerts)
-        more = bool(decision or _next(conn, tenant, position))
+        more = bool(decision) if kafka else bool(decision or _next(conn, tenant, position))
         conn.execute(
-            "UPDATE correlation_consumer_state SET change_order=%s,pending=%s,health='healthy',blocked_reason='',updated_at=%s WHERE tenant_id=%s",
+            "UPDATE correlation_consumer_state SET " + ("kafka_sequence" if kafka else "change_order") + "=%s,pending=%s,health='healthy',blocked_reason='',updated_at=%s WHERE tenant_id=%s",
             (position, more, decision_now, tenant),
         )
-        if event and event["stream"] == "effect":
+        if event and event["stream"] == "effect" and not kafka:
             conn.execute(
                 "UPDATE maintenance_effect_outbox SET processed_at=%s WHERE tenant_id=%s AND id=%s",
                 (decision_now, tenant, event["id"]),

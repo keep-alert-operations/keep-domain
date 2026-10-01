@@ -39,6 +39,8 @@ def compile_conditions(definition):
         try:
             if source not in cache:
                 cache[source] = compile_expression(source, rule=True)
+                if "assignee_id" in cache[source].fields:
+                    raise CELValidationError("Only approved alert fields may be referenced")
             programs[condition["id"]] = cache[source]
         except CELValidationError:
             raise AppError(
@@ -52,19 +54,32 @@ def compile_conditions(definition):
     return programs
 
 
-def limits(profile):
+def limits(profile, *, allow_local_preview=False):
     config = (profile or {}).get("correlation", {})
+    qualified = (profile or {}).get("qualified") is True
+    local_preview = (
+        allow_local_preview
+        and (profile or {}).get("qualified") is False
+        and (profile or {}).get("scope") == "local-development"
+        and (profile or {}).get("correlation_preview") is True
+    )
     if (
-        (profile or {}).get("qualified") is not True
+        not (qualified or local_preview)
         or config.get("cost_model") != COST_MODEL
         or any(type(config.get(key)) is not int or config[key] < 1 for key in BUDGETS)
     ):
-        raise unavailable("correlation_capacity_profile_required")
+        raise AppError(
+            "correlation_capacity_profile_required",
+            "Correlation rules require a qualified capacity profile or an enabled local preview.",
+            503,
+        )
     return config
 
 
-def check_capacity(conn, tenant, definition, programs, profile, *, rule_id=None, enabled=True):
-    config = limits(profile)
+def check_capacity(
+    conn, tenant, definition, programs, profile, *, rule_id=None, enabled=True, allow_local_preview=False
+):
+    config = limits(profile, allow_local_preview=allow_local_preview)
     costs = [programs[item["id"]].rule_cost_upper_bound for item in definition["conditions"]]
     if max(costs) > config["condition_cost"] or sum(costs) > config["rule_cost"]:
         raise AppError(
@@ -173,7 +188,10 @@ def persist(conn, tenant, actor, now, body, programs, command_id, *, previous=No
     # This branch uses the existing pure edit classifier. Source-only programs
     # are non-executable and exist only to compare the prior configuration.
     reset, generation_changed = previous is None, False
-    if previous:
+    if previous and previous.get("kafka_schema_blocked"):
+        reset = True
+        generation_changed = previous["group_by"] != body["group_by"]
+    elif previous:
         old_programs = {item["id"]: _SourceOnly(item["cel"]) for item in previous["conditions"]}
         old = core_rule(previous, old_programs)
         new_conditions = tuple(
@@ -267,6 +285,8 @@ def persist(conn, tenant, actor, now, body, programs, command_id, *, previous=No
             actor["id"],
         ),
     )
+    if reset:
+        conn.execute("UPDATE correlation_rules SET kafka_schema_blocked=false WHERE tenant_id=%s AND id=%s", (tenant,rule_id))
     stored = {str(item["id"]): item for item in previous["condition_rows"]} if previous else {}
     conn.execute(
         "DELETE FROM correlation_conditions WHERE tenant_id=%s AND rule_id=%s", (tenant, rule_id)

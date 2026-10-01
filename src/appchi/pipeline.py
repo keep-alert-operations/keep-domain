@@ -21,7 +21,8 @@ class Lease:
 def claim(db, epoch):
     with db.transaction() as conn:
         conn.execute("""INSERT INTO pipeline_leases(tenant_id,stream)
-            SELECT DISTINCT tenant_id,stream FROM application_outbox WHERE published_at IS NULL
+            SELECT DISTINCT tenant_id,stream FROM application_outbox
+            WHERE published_at IS NULL AND stream IN ('received','changed')
             ON CONFLICT DO NOTHING""")
         row = conn.execute("""SELECT l.* FROM pipeline_leases l WHERE NOT blocked
             AND next_attempt_at<=clock_timestamp() AND (lease_until IS NULL OR lease_until<=clock_timestamp())

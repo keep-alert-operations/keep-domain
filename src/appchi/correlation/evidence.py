@@ -13,7 +13,7 @@ import json
 from typing import Literal, Protocol
 from uuid import UUID
 
-from appchi.cel.catalog import FIELDS, RULE_FIELDS
+from appchi.cel.catalog import FIELDS, CORRELATION_FIELDS as RULE_FIELDS
 
 
 class CorrelationProofError(RuntimeError):
@@ -165,6 +165,7 @@ class Input:
     kind: Literal["source", "manual", "scheduled", "bookkeeping"]
     new_logical_alert: bool = False
     derived_qualifier: bool = False
+    source_provenance: tuple[tuple[dict | None, dict, datetime, bool], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -406,9 +407,9 @@ def edit_rule(
 
 
 def _after_boundaries(event: Input, boundaries: tuple[Boundary, ...]) -> bool:
-    if event.kind == "scheduled":
-        return all(event.qualifier.at > boundary.at for boundary in boundaries)
-    return all(event.qualifier.order > boundary.order for boundary in boundaries)
+    # Receive time is from ingress; PG order is only an application/proof cursor.
+    # Equal-time control boundaries win, conservatively excluding the source.
+    return all(event.qualifier.at > boundary.at for boundary in boundaries)
 
 
 def _condition_values(rule: Rule, snapshot: Snapshot, at: datetime) -> dict[UUID, bool]:
@@ -419,6 +420,28 @@ def _condition_values(rule: Rule, snapshot: Snapshot, at: datetime) -> dict[UUID
             raise ValueError("nonboolean condition")
         values[condition.id] = result
     return values
+
+
+def _source_qualified_conditions(rule, event, group, release_boundary):
+    """Reopened manual state needs a normal source transition per condition."""
+    qualified = set()
+    for before, after, at, released in event.source_provenance:
+        allowed = release_boundary is None or at > release_boundary.at
+        after_group = group_key(rule.grouping, after)
+        if after["status"] != "firing" or after_group != group:
+            qualified.clear()
+            continue
+        broad = released or before is None or before["status"] == "resolved" or group_key(rule.grouping, before) != group
+        for condition in rule.conditions:
+            after_value = condition.program.evaluate(after, at)
+            before_value = condition.program.evaluate(before, at) if before is not None else False
+            if type(after_value) is not bool or type(before_value) is not bool:
+                raise ValueError("nonboolean source provenance condition")
+            if not after_value:
+                qualified.discard(condition.id)
+            elif allowed and (broad or not before_value):
+                qualified.add(condition.id)
+    return qualified
 
 
 def apply_input(
@@ -444,6 +467,8 @@ def apply_input(
     if (event.before is None) != event.new_logical_alert:
         raise CorrelationProofError("missing_prior_state_is_not_creation")
     derived = event.derived_qualifier
+    if event.source_provenance is not None and not derived:
+        raise CorrelationProofError("source_provenance_requires_derived_qualifier")
     if derived and (
         event.kind not in ("manual", "scheduled")
         or event.new_logical_alert
@@ -498,6 +523,9 @@ def apply_input(
         before_values = (
             _condition_values(rule, event.before, event.qualifier.at) if event.before else {}
         )
+        source_qualified = None if event.source_provenance is None else _source_qualified_conditions(
+            rule, event, group, release_boundaries.get(event.after.id)
+        )
     except Exception:
         return EvidenceState(
             replace(rule, health="blocked"), (), event.change_order, "condition_evaluation_failed"
@@ -507,7 +535,7 @@ def apply_input(
         boundaries.append(context_boundaries[context])
     if event.after.id in release_boundaries:
         boundaries.append(release_boundaries[event.after.id])
-    can_start = event.kind != "bookkeeping" and _after_boundaries(event, tuple(boundaries))
+    can_start = event.kind in ("source", "scheduled") and _after_boundaries(event, tuple(boundaries))
     broad_transition = event.new_logical_alert or (
         event.before is not None
         and (event.before.status == "resolved" or event.before.suppressed or before_group != group)
@@ -519,9 +547,9 @@ def apply_input(
         if not after_values[condition.id]:
             continue
         old = existing.get(condition.id)
-        if old is not None and not broad_transition:
+        if old is not None and (not broad_transition or (derived and old.start > event.qualifier.at)):
             others.append(replace(old, observed_revision=event.after.revision))
-        elif can_start and (broad_transition or not before_values.get(condition.id, False)):
+        elif can_start and (source_qualified is None or condition.id in source_qualified) and (broad_transition or not before_values.get(condition.id, False)):
             try:
                 expiry = event.qualifier.at + timedelta(minutes=rule.window_minutes)
             except OverflowError:

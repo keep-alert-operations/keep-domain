@@ -6,7 +6,7 @@ from hashlib import sha256
 import json
 from typing import Callable
 
-from appchi.cel.catalog import FIELDS, storage_name
+from appchi.cel.catalog import INDEX_FIELDS as FIELDS, storage_name
 from appchi.cel.compiler import PROFILE, epoch_us, timestamp
 from appchi.shared.errors import AppError, unavailable
 from .text import TOKENIZER_PROFILE, max_query_token_bytes, source_tokens

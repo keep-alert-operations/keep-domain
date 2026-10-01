@@ -74,10 +74,10 @@ def test_no_backfill_on_create_enable_or_true_repeat():
     assert result.final_unsuppression_qualifiers == ()
 
 
-def test_before_create_same_time_order_is_excluded_after_is_eligible():
+def test_equal_time_control_wins_regardless_of_application_order():
     s = segment(activation=0, order=3)
     assert reduce([s], [transition(0, None, snapshot(), order=2)]).causes == ()
-    assert len(reduce([s], [transition(0, None, snapshot(), order=4)]).causes) == 1
+    assert reduce([s], [transition(0, None, snapshot(), order=4)]).causes == ()
 
 
 def test_half_open_end_and_scheduled_start_boundaries():

@@ -46,6 +46,15 @@ def publish(
         (int(semantic), tenant),
     ).fetchone()
     now = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
+    if cause != "source" and before is not None:
+        if before["status"] != "resolved" and after["status"] == "resolved":
+            from appchi.correlation.runtime import release_alert
+            release_alert(conn, tenant, after["id"], now)
+        elif after["suppressed"]:
+            conn.execute("DELETE FROM correlation_evidence WHERE tenant_id=%s AND alert_id=%s", (tenant, after["id"]))
+        else:
+            # Ignored edits do not make live evidence stale solely by revision.
+            conn.execute("UPDATE correlation_evidence SET observed_revision=%s WHERE tenant_id=%s AND alert_id=%s AND observed_revision=%s", (after["revision"], tenant, after["id"], before["revision"]))
     from appchi.cel.catalog import RULE_FIELDS
     from appchi.maintenance.processing import record_input
 
@@ -164,12 +173,14 @@ def publish(
         actor=actor,
         original_order=original_order,
     )
-    conn.execute(
-        "INSERT INTO application_outbox(id,tenant_id,stream,stream_order,envelope) VALUES(%s,%s,%s,%s,%s)",
-        (uuid4(), tenant, "changed", state["projection_seq"], envelope),
-    )
+    conn.execute("UPDATE alert_identities SET current_projection_seq=%s WHERE tenant_id=%s AND id=%s", (state["projection_seq"], tenant, after["id"]))
+    if cause != "source":
+        from appchi.alert_notifications import remember
+        remember(envelope)
     conn.execute(
         "UPDATE tenant_view_state SET view_generation=view_generation+1 WHERE tenant_id=%s",
         (tenant,),
     )
-    return state
+    from appchi.maintenance.runtime import publish_inline_effects
+    publish_inline_effects(conn, after)
+    return {**state, "envelope": envelope}

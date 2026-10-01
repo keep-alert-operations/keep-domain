@@ -51,7 +51,7 @@ def cleanup_assignment(database, tenant_id, kind, resource_id, expected_assignee
             from appchi.alerts.repository import publish, store_alert
             from appchi.incidents.routes import lock_linked_incidents
 
-            lock_catalog(conn, catalog)
+            lock_catalog(conn, catalog, targets=[resource_id])
             lock_linked_incidents(conn, tenant_id, resource_id)
             row = retained(conn, tenant_id, resource_id, True)
         else:

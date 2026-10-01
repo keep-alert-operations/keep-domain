@@ -1,6 +1,7 @@
 """Bounded alert-owned erasure after final evidence and consumer/proof release."""
 
 from time import monotonic
+from hashlib import sha256
 
 from psycopg import sql
 
@@ -11,6 +12,42 @@ from appchi.shared.errors import unavailable
 
 
 def dependencies_released(conn, tenant, alert, final_version):
+    mode = conn.execute("SELECT enabled FROM kafka_pipeline_control WHERE singleton").fetchone()
+    if mode and mode["enabled"]:
+        fence = conn.execute(
+            """SELECT i.retired_at,i.current_projection_seq,a.schema_version,a.key_field,
+              EXISTS(SELECT 1 FROM projection_work p WHERE p.tenant_id=i.tenant_id
+                AND p.alert_id=i.id AND p.seq=i.current_projection_seq AND p.version=%s
+                AND (p.snapshot->>'live'='false' OR p.snapshot->>'deleted'='true')) AS tombstone
+              FROM alert_identities i JOIN alerts a ON a.tenant_id=i.tenant_id AND a.id=i.id
+              WHERE i.tenant_id=%s AND i.id=%s""",
+            (final_version, tenant, alert),
+        ).fetchone()
+        if not fence or not fence["retired_at"] or not fence["tombstone"]:
+            raise unavailable("retirement_projection_missing")
+        if not conn.execute(
+            """SELECT 1 FROM alert_retired_keys WHERE tenant_id=%s AND schema_version=%s
+              AND key_digest=%s AND retired_at>=%s""",
+            (
+                tenant,
+                fence["schema_version"],
+                sha256(fence["key_field"].encode()).digest(),
+                fence["retired_at"],
+            ),
+        ).fetchone():
+            raise unavailable("retirement_replay_fence_missing")
+        blocked = conn.execute(
+            """SELECT
+          EXISTS(SELECT 1 FROM alert_retention_holds WHERE tenant_id=%s AND alert_id=%s AND released_at IS NULL) OR
+          EXISTS(SELECT 1 FROM search_rebuild_jobs WHERE hold_active) OR
+          EXISTS(SELECT 1 FROM kafka_source_results r WHERE r.tenant_id=%s AND r.alert_id=%s
+            AND (NOT r.kafka_confirmed OR (r.changed_event_id IS NOT NULL AND NOT EXISTS(
+              SELECT 1 FROM kafka_correlation_events c WHERE c.event_id=r.changed_event_id
+                AND c.tenant_id=r.tenant_id)))) OR
+          EXISTS(SELECT 1 FROM alert_identities i JOIN tenant_view_state v USING(tenant_id) WHERE i.tenant_id=%s AND i.id=%s AND i.current_projection_seq>v.searchable_seq) AS blocked""",
+            (tenant, alert) * 3,
+        ).fetchone()
+        return not blocked["blocked"]
     row = conn.execute(
         """SELECT
       EXISTS(SELECT 1 FROM alert_retention_holds WHERE tenant_id=%s AND alert_id=%s AND released_at IS NULL) OR
@@ -88,10 +125,19 @@ def cleanup_alert(db, store, tenant, alert, *, limit=100):
             return False
         started = monotonic()
         cleared = conn.execute(
-            "UPDATE ingest_items SET key_field='',identity_material=''::bytea,payload=NULL,raw_json=NULL WHERE id IN (SELECT id FROM ingest_items WHERE tenant_id=%s AND alert_id=%s AND (key_field<>'' OR length(identity_material)>0 OR payload IS NOT NULL OR raw_json IS NOT NULL) ORDER BY admission_order LIMIT %s)",
+            """UPDATE kafka_source_results SET changed_envelope=NULL WHERE delivery_id IN (
+              SELECT delivery_id FROM kafka_source_results WHERE tenant_id=%s AND alert_id=%s
+              AND kafka_confirmed AND changed_envelope IS NOT NULL ORDER BY delivery_id LIMIT %s)""",
             (tenant, alert, limit),
         ).rowcount
         remaining = limit - cleared
+        if remaining == 0 or monotonic() - started >= 0.1:
+            return False
+        cleared = conn.execute(
+            "UPDATE ingest_items SET key_field='',identity_material=''::bytea,payload=NULL,raw_json=NULL WHERE id IN (SELECT id FROM ingest_items WHERE tenant_id=%s AND alert_id=%s AND (key_field<>'' OR length(identity_material)>0 OR payload IS NOT NULL OR raw_json IS NOT NULL) ORDER BY admission_order LIMIT %s)",
+            (tenant, alert, remaining),
+        ).rowcount
+        remaining -= cleared
         if remaining == 0 or monotonic() - started >= 0.1:
             return False
         # Maintenance head FK precedes its immutable input body; corrections

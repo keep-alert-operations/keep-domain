@@ -387,3 +387,32 @@ def test_metadata_condition_reorder_keeps_evidence_and_origin_priority():
     assert updated.rule.epoch == state.rule.epoch
     assert updated.rule.created_at == state.rule.created_at
     assert updated.rule.revision == state.rule.revision + 1
+
+
+@pytest.mark.parametrize("transitions,expected", [
+    ([("other","match",1)],1),
+    ([("match","match",1)],0),
+    ([("other","match",-1)],0),
+    ([("other","match",1),("match","other",-1),("other","match",-0.5)],0),
+    ([("other","match",1),("match","match",2)],1),
+])
+def test_manual_reset_release_uses_normal_source_provenance(transitions, expected):
+    current = snapshot(revision=8)
+    provenance = tuple((snapshot(message=before).fields,snapshot(message=after).fields,at(when),False)
+        for before,after,when in transitions)
+    effect = Input(uuid4(),20,replace(current,suppressed=True),current,
+        Boundary(at(5),20),"scheduled",False,True,provenance)
+    result = apply(EvidenceState(rule()),effect,now=6,
+        release_boundaries={current.id:Boundary(at(0),10)})
+    assert len(result.memberships) == expected
+
+
+def test_delayed_release_preserves_a_newer_source_membership():
+    current = snapshot(revision=4)
+    before = replace(current,revision=3,fields={**current.fields,"message":"other"})
+    state = apply(EvidenceState(rule()),event(current,before,minutes=5,order=20),now=5)
+    original = state.memberships[0]
+    delayed = Input(uuid4(),21,replace(current,suppressed=True),current,
+        Boundary(at(1),10),"scheduled",False,True)
+    result = apply(state,delayed,now=6)
+    assert result.memberships == (original,)

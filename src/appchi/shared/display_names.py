@@ -1,8 +1,9 @@
 """Read-time display-name enrichment for API responses.
 
-Names are resolved from the directory-published ``principals`` table (and the
-tenant's own incidents) while a response is being built. They are never written
-into search documents, revisions, idempotent command results or ETag inputs.
+Names are resolved from the directory-published ``principals`` table, managed
+operators, and the tenant's own incidents while a response is being built.
+They are never written into search documents, revisions, idempotent command
+results or ETag inputs.
 Each response performs at most one batched lookup per source (no N+1).
 
 Principals keep their stored ``display_name`` after they become ineligible or
@@ -12,6 +13,8 @@ Unknown identifiers yield ``None``; nothing is fabricated.
 
 from collections.abc import Iterable
 from uuid import UUID
+from typing import Literal
+from appchi.alerts.presentation import present_alert
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -50,6 +53,18 @@ def principal_names(conn, ids: Iterable) -> dict[str, str]:
     return {str(row["id"]): row["display_name"] for row in rows}
 
 
+def operator_names(conn, tenant, ids: Iterable) -> dict[str, str]:
+    """Current managed operator names, restricted to the alert's tenant."""
+    keys = _uuids(ids)
+    if not keys:
+        return {}
+    rows = conn.execute(
+        "SELECT id,name FROM operators WHERE tenant_id=%s AND id=ANY(%s::uuid[])",
+        (str(tenant), keys),
+    ).fetchall()
+    return {str(row["id"]): row["name"] for row in rows}
+
+
 def incident_titles(conn, tenant, ids: Iterable) -> dict[str, str]:
     """Titles of retained incidents owned by ``tenant``; other tenants never match."""
     keys = _uuids(ids)
@@ -77,17 +92,26 @@ def active_incident_ids(conn, tenant, alert_ids: Iterable) -> dict[str, str]:
 
 
 def enrich_alerts(conn, tenant, rows: list[dict]) -> list[dict]:
-    """Add assignee/acknowledger names and the same-tenant active incident title."""
+    """Add current ownership, operator, and active incident presentation."""
     names = principal_names(
         conn,
-        [row.get("assignee_id") for row in rows] + [row.get("acknowledged_by") for row in rows],
+        [row.get("assignee_id") for row in rows],
+    )
+    operators = operator_names(
+        conn,
+        tenant,
+        [row.get("operator") for row in rows if row.get("schema_version") == "v2"],
     )
     titles = incident_titles(conn, tenant, [row.get("active_incident_id") for row in rows])
     return [
         {
-            **row,
+            **present_alert(row),
             "assignee_display_name": names.get(_key(row.get("assignee_id"))),
-            "acknowledged_by_display_name": names.get(_key(row.get("acknowledged_by"))),
+            "operator_display_name": (
+                row.get("operator")
+                if row.get("schema_version") == "v1"
+                else operators.get(_key(row.get("operator")))
+            ),
             "active_incident_title": titles.get(_key(row.get("active_incident_id"))),
         }
         for row in rows
@@ -166,8 +190,13 @@ class AlertDisplayNames(_Open):
     assignee_display_name: str | None = Field(
         default=None, description="Stored directory name of assignee_id; null when unassigned."
     )
-    acknowledged_by_display_name: str | None = Field(
-        default=None, description="Stored directory name of acknowledged_by, when present."
+    operator_display_name: str | None = Field(
+        default=None,
+        description="Current same-tenant managed operator name for v2, or the exact legacy operator string for v1; null when unavailable.",
+    )
+    display_status: Literal["firing", "acknowledged", "resolved"] | None = Field(
+        default=None,
+        description="Firing with an assignee is acknowledged; resolved takes precedence. Derived from source lifecycle status and assignee_id.",
     )
     active_incident_title: str | None = Field(
         default=None,

@@ -14,7 +14,7 @@ def process_one(db, tenant, attempt=None, profile=None):
         return _apply_one(conn, tenant, attempt, catalog)
 
 
-def _apply_one(conn, tenant, attempt, catalog):
+def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None):
     """Exact source transaction body, also used by rolled-back repair probes.
 
     No network, compilation or independent transaction belongs in this helper.
@@ -24,10 +24,9 @@ def _apply_one(conn, tenant, attempt, catalog):
     from appchi.visibility.runtime import link_source_result
 
     state, now = coordinator(conn, tenant)
-    lock_catalog(conn, catalog)
-    if state["blocked"] or now < state["next_attempt_at"]:
+    if supplied_item is None and (state["blocked"] or now < state["next_attempt_at"]):
         return False
-    item = conn.execute(
+    item = supplied_item or conn.execute(
         "SELECT * FROM ingest_items WHERE tenant_id=%s AND disposition='pending' ORDER BY admission_order LIMIT 1 FOR UPDATE",
         (tenant,),
     ).fetchone()
@@ -35,10 +34,13 @@ def _apply_one(conn, tenant, attempt, catalog):
         return False
     if attempt is not None:
         attempt["item_id"] = item["id"]
+    publication = None
+    error_code = None
     claim = conn.execute(
         "SELECT * FROM alert_key_claims WHERE tenant_id=%s AND schema_version=%s AND key_digest=%s",
         (tenant, item["version"], item["key_digest"]),
     ).fetchone()
+    lock_catalog(conn, catalog, targets=[claim["alert_id"]] if claim else [])
     previous = None
     linked = []
     if claim:
@@ -57,15 +59,17 @@ def _apply_one(conn, tenant, attempt, catalog):
             raise AppError("identity_conflict", "Immutable identity material differs.", 409)
         current, changed = apply_source(previous, item)
     except AppError as error:
-        conn.execute(
+        error_code = error.code
+        if supplied_item is None:
+            conn.execute(
             "UPDATE ingest_items SET disposition='rejected',error_code=%s WHERE id=%s",
             (error.code, item["id"]),
-        )
-        conn.execute(
+            )
+            conn.execute(
             "UPDATE ingest_retry_keys SET expires_at=%s + interval '90 days' WHERE item_id=%s",
             (item["received_at"], item["id"]),
-        )
-        link_source_result(conn, item, error_code=error.code)
+            )
+            link_source_result(conn, item, error_code=error.code)
     else:
         if previous is None:
             store_alert(conn, current, new=True)
@@ -114,10 +118,11 @@ def _apply_one(conn, tenant, attempt, catalog):
                 "UPDATE alert_source_events SET adapter_version=%s WHERE tenant_id=%s AND alert_id=%s AND id=%s",
                 (item["adapter_version"], tenant, current["id"], item["id"]),
             )
-        conn.execute(
+        if supplied_item is None:
+            conn.execute(
             "UPDATE ingest_items SET disposition='applied',alert_id=%s,occurrence_id=%s,payload=NULL,raw_json=NULL WHERE id=%s",
             (current["id"], current["occurrence_id"], item["id"]),
-        )
+            )
         publication = publish(
             conn,
             previous,
@@ -128,14 +133,17 @@ def _apply_one(conn, tenant, attempt, catalog):
             original_order=item["admission_order"],
             maintenance_input_recorded=True,
         )
-        link_source_result(
+        if supplied_item is None:
+            link_source_result(
             conn,
             item,
             before=previous,
             after=current,
             publication=publication,
             changed=changed,
-        )
+            )
+    if supplied_item is not None:
+        return {"alert_id": current["id"] if not error_code else None, "error_code": error_code, "envelope": publication["envelope"] if publication else None}
     conn.execute("UPDATE tenant_work_state SET failures=0 WHERE tenant_id=%s", (tenant,))
     conn.execute(
         "UPDATE application_outbox SET processed_at=%s WHERE tenant_id=%s AND stream='received' AND stream_order=%s",

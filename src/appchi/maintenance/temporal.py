@@ -69,10 +69,10 @@ class Segment:
     def covers(self, boundary: Boundary) -> bool:
         return (
             self.start <= boundary.at < self.end
-            and (boundary.at, boundary.order) > (self.activation.at, self.activation.order)
+            and boundary.at > self.activation.at
             and (
                 self.deactivation is None
-                or (boundary.at, boundary.order) < (self.deactivation.at, self.deactivation.order)
+                or boundary.at < self.deactivation.at
             )
         )
 
@@ -223,6 +223,7 @@ class AlertTransition:
     after: dict
     new_logical_alert: bool = False
     source_suppressed: bool | None = None
+    kind: str = "source"
 
 
 @dataclass(frozen=True)
@@ -250,6 +251,7 @@ class Reduction:
     final_unsuppression_qualifiers: tuple[datetime, ...]
     transition_keys: frozenset[tuple[str, str, str, str]]
     final_snapshot: dict | None
+    qualifier_inputs: tuple[tuple[datetime, str, bool, str | None], ...] = ()
 
 
 def _evaluate(segment: Segment, snapshot: dict, at: datetime) -> bool:
@@ -271,6 +273,7 @@ def reduce_alert(
     recorded_at: datetime,
     proof_complete: bool,
     max_work: int = 10000,
+    source_release_since: datetime | None = None,
 ) -> Reduction:
     """Rebuild retained cause proof without mutating a newer materialized alert.
 
@@ -292,29 +295,27 @@ def reduce_alert(
         if old is not None and old != transition:
             raise MaintenanceProofError("conflicting_transition_replay")
         unique[transition.boundary.id] = transition
-    ordered = sorted(unique.values(), key=lambda t: (t.boundary.at, t.boundary.order))
+    # Application order proves the before/after chain. UTC determines coverage,
+    # but cannot sort state mutations across concurrent ingress clocks/manual writes.
+    ordered = sorted(unique.values(), key=lambda t: t.boundary.order)
     if len({(t.boundary.at, t.boundary.order) for t in ordered}) != len(ordered):
         raise MaintenanceProofError("ambiguous_transition_order")
-    events = [
-        (t.boundary.at, 0, t.boundary.order, "transition", t)
-        for t in ordered
-        if t.boundary.at <= now
-    ]
-    for segment in segments:
-        end, scheduled = segment.termination
-        if end.at <= now:
-            events.append((end.at, -1 if scheduled else 0, end.order, "end", (segment, end)))
-    events.sort(key=lambda item: item[:3])
+    if any(t.boundary.at > now for t in ordered):
+        raise MaintenanceProofError("maintenance_future_receive_time")
     active: dict[str, int] = {}
     causes: list[CauseInterval] = []
     keys = set()
     snapshot = None
-    status_history: list[tuple[Boundary, str]] = []
+    status_history: list[AlertTransition] = []
+    source_qualifiers: dict[str, Boundary] = {}
 
     def close(cause_id: str, boundary: Boundary):
         index = active.pop(cause_id, None)
         if index is not None:
-            causes[index] = replace(causes[index], closed=boundary)
+            # An older receive clock cannot create a negative interval when its
+            # source mutation is applied after a newer manual/source mutation.
+            closed = boundary if boundary.at >= causes[index].opened.at else replace(boundary, at=causes[index].opened.at)
+            causes[index] = replace(causes[index], closed=closed)
             keys.add((str(alert_id), cause_id, "close", boundary.id))
 
     def open_cause(cause_id: str, boundary: Boundary, segment: Segment | None):
@@ -335,13 +336,15 @@ def reduce_alert(
         )
         keys.add((str(alert_id), cause_id, "open", boundary.id))
 
-    for _, _, _, kind, value in events:
-        if kind == "end":
-            segment, boundary = value
-            close(str(segment.id), boundary)
-            continue
-        transition = value
+    for transition in ordered:
         boundary = transition.boundary
+        for segment in segments:
+            end, _ = segment.termination
+            if end.at <= boundary.at:
+                if source_release_since is None or end.at < source_release_since:
+                    close(str(segment.id), end)
+                elif transition.kind == "source":
+                    close(str(segment.id), boundary)
         if transition.after.get("status") not in ("firing", "resolved"):
             raise MaintenanceProofError("invalid_rule_field_snapshot")
         if snapshot is None:
@@ -372,6 +375,11 @@ def reduce_alert(
                 or (before is not None and not before_match and after["status"] == "firing")
             ):
                 open_cause(cause_id, boundary, segment)
+                if transition.kind == "source":
+                    # A source refire can qualify while a matching maintenance
+                    # cause survives a manual resolve. Its provenance must not
+                    # remain pinned to the older cause-opening receipt.
+                    source_qualifiers[boundary.id] = boundary
         if transition.source_suppressed is not None:
             if after.get("schema_version") != "v2" and transition.source_suppressed:
                 raise MaintenanceProofError("v1_source_suppression_forbidden")
@@ -382,7 +390,11 @@ def reduce_alert(
             else:
                 close("source:v2", boundary)
         snapshot = after
-        status_history.append((boundary, after["status"]))
+        status_history.append(transition)
+    for segment in segments:
+        end, _ = segment.termination
+        if end.at <= now and (source_release_since is None or end.at < source_release_since):
+            close(str(segment.id), end)
     if snapshot is None:
         raise MaintenanceProofError("missing_current_alert_baseline")
     intervals = []
@@ -399,6 +411,7 @@ def reduce_alert(
         else:
             intervals.append(EffectiveInterval(cause.opened.at, end))
     qualifiers = []
+    qualifier_inputs = []
     for interval in intervals:
         if interval.end is None:
             continue
@@ -406,12 +419,36 @@ def reduce_alert(
         # status immediately before end. Control/source closes use own order.
         closes = [c.closed for c in causes if c.closed and c.closed.at == interval.end]
         end_boundary = max(closes, key=lambda b: b.order)
-        status = None
-        for boundary, value in status_history:
-            if (boundary.at, boundary.order) <= (end_boundary.at, end_boundary.order):
-                status = value
-        if status == "firing":
+        eligible_inputs = [t for t in status_history if
+                           (t.boundary.at, t.boundary.order) <= (end_boundary.at, end_boundary.order)]
+        current_input = eligible_inputs[-1] if eligible_inputs else None
+        if current_input and current_input.after["status"] == "firing":
             qualifiers.append(interval.end)
+            manual_reset = max((t.boundary.order for t in eligible_inputs if t.kind != "source"
+                                and t.before and t.before["status"] != t.after["status"]), default=0)
+            origins = {t.boundary.id: t for t in eligible_inputs}
+            source_origins = [c.opened for c in causes if (
+                c.opened.id in origins and origins[c.opened.id].kind == "source"
+                and c.opened.order > manual_reset
+                and c.opened.at < interval.end
+                and (c.closed is None or c.closed.at > interval.start)
+            )]
+            source_origins.extend(b for b in source_qualifiers.values()
+                if b.id in origins and b.order > manual_reset
+                and interval.start <= b.at < interval.end)
+            if manual_reset:
+                # Per-rule normal source qualification is checked downstream
+                # from this retained post-reset chain. A mere repeat contributes
+                # no eligibility, even though it is valid source provenance.
+                source_origins.extend(t.boundary for t in eligible_inputs
+                    if t.kind == "source" and t.boundary.order > manual_reset
+                    and t.after["status"] == "firing"
+                    and interval.start <= t.boundary.at < interval.end)
+            # A direct source release is itself a qualifying source transition.
+            source_release = end_boundary.id in origins and origins[end_boundary.id].kind == "source"
+            manual_release = end_boundary.id in origins and origins[end_boundary.id].kind != "source"
+            origin = None if manual_release else end_boundary if source_release else max(source_origins, key=lambda b: b.order, default=None)
+            qualifier_inputs.append((interval.end, current_input.boundary.id, origin is not None, origin.id if origin else None))
     return Reduction(
         tuple(causes),
         tuple(intervals),
@@ -419,4 +456,5 @@ def reduce_alert(
         tuple(qualifiers),
         frozenset(keys),
         snapshot,
+        tuple(qualifier_inputs),
     )

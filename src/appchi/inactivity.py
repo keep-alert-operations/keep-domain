@@ -3,7 +3,7 @@
 from datetime import timedelta
 from appchi.shared.transactions import coordinator
 from appchi.shared.errors import AppError
-from appchi.correlation.runtime import lock_contexts, resolve_context
+from appchi.correlation.runtime import resolve_context
 from appchi.alerts.routes import retained, pending, maintenance_adjust
 from appchi.alerts.lifecycle import apply_command
 from appchi.alerts.repository import store_alert, publish
@@ -22,8 +22,7 @@ def expire_alert(db, tenant, alert_id, profile=None):
     catalog = prepare_for_tenant(db, tenant, profile)
     with db.transaction(tenant) as conn:
         _, now = coordinator(conn, tenant)
-        lock_contexts(conn, tenant)
-        lock_catalog(conn, catalog)
+        lock_catalog(conn, catalog, targets=[alert_id])
         linked = lock_linked_incidents(conn, tenant, alert_id)
         row = retained(conn, tenant, alert_id, True)
         pending(conn, tenant, row)
@@ -52,8 +51,10 @@ def expire_incident(db, tenant, incident_id, profile=None):
     catalog = prepare_for_tenant(db, tenant, profile)
     with db.transaction(tenant) as conn:
         _, now = coordinator(conn, tenant)
-        lock_contexts(conn, tenant)
-        lock_catalog(conn, catalog)
+        targets = [link["alert_id"] for link in conn.execute(
+            "SELECT alert_id FROM incident_alert_links WHERE tenant_id=%s AND incident_id=%s AND unlinked_at IS NULL",
+            (tenant,incident_id))]
+        lock_catalog(conn, catalog, targets=targets, incidents=[incident_id])
         row = get_incident(conn, tenant, incident_id, True)
         deadline = row["last_activity"] + timedelta(days=30)
         if row["status"] == "resolved" or now < deadline:

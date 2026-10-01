@@ -51,7 +51,7 @@ def warmup_page(database, tenant, profile, *, cursor=None, limit=100):
         try:
             with database.transaction(tenant) as conn:
                 _, now = coordinator(conn, tenant)
-                lock_catalog(conn, catalog)
+                lock_catalog(conn, catalog, targets=[row["id"]])
                 lock_linked_incidents(conn, tenant, row["id"])
                 before = retained(conn, tenant, row["id"], True)
                 pending(conn, tenant, before)

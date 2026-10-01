@@ -87,6 +87,14 @@ RULE_FIELDS = frozenset(
     )
 )
 
+# Keep immutable projection documents and protected v1 evidence byte-compatible.
+CORRELATION_FIELDS = RULE_FIELDS - {"assignee_id"}
+
+# display_status is a virtual feed field lowered to these existing indexed fields.
+INDEX_FIELDS = dict(FIELDS)
+LEGACY_ACK_FIELDS = frozenset({"acknowledged", "acknowledged_by", "acknowledged_at"})
+FIELDS["display_status"] = Field("enum", values=("firing", "acknowledged", "resolved"))
+
 
 def storage_name(name: str) -> str:
     return "last_received_at" if name == "timestamp" else name

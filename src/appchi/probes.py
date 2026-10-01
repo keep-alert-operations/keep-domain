@@ -4,6 +4,21 @@ from appchi.shared.errors import unavailable
 
 
 def check_readiness(settings, db):
+    if settings.role in ("ingestion-api", "private-ingestion"):
+        from appchi.clock_health import require_clock_health
+        require_clock_health(settings)
+        from confluent_kafka.admin import AdminClient
+        from appchi.service_clients import kafka_options
+
+        if not settings.kafka_admission_enabled:
+            raise unavailable("kafka_cutover_required")
+        if not settings.global_tenant_id or not settings.kafka_bootstrap:
+            raise unavailable("kafka_admission_unconfigured")
+        topic = f"appchi.{settings.environment}.alerts.received"
+        metadata = AdminClient(kafka_options(settings)).list_topics(timeout=2)
+        if topic not in metadata.topics or metadata.topics[topic].error:
+            raise unavailable("kafka_admission_unavailable")
+        return
     required = {
         "product-api": ("human_auth",),
         "private-ingestion": ("v2_ingress",),
@@ -44,9 +59,10 @@ def main():
     database = None
     try:
         settings = Settings(role=args.role)
-        database = Database(
-            settings.database_url.get_secret_value(), 1, deployment_epoch=settings.deployment_epoch
-        )
+        if args.role == "product-api":
+            database = Database(
+                settings.database_url.get_secret_value(), 1, deployment_epoch=settings.deployment_epoch
+            )
         check_readiness(settings, database)
     except Exception:
         raise SystemExit(1) from None

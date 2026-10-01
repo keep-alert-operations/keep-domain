@@ -22,6 +22,7 @@ SORTABLE = {
     "assignee_id",
 }
 COLUMNS = SORTABLE | {
+    "display_status",
     "id",
     "tenant_id",
     "schema_version",

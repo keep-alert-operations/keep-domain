@@ -17,6 +17,7 @@ from typing import Any
 from uuid import UUID
 
 from .catalog import FIELDS, RULE_FIELDS, storage_name
+from appchi.alerts.presentation import display_status
 
 PROFILE = "appchi-cel-v1"
 COST_MODEL = "appchi-cel-cost-v1"
@@ -133,20 +134,29 @@ class Builder:
             value = None if selected == "null_value" else getattr(const, selected)
             return IR("literal", types[selected], value, position=pos)
         if kind == "ident_expr":
-            raise CELValidationError("Only approved alert fields may be referenced", pos)
+            name = expr.ident_expr.name
+            if name not in FIELDS or (self.rule and name not in RULE_FIELDS):
+                raise CELValidationError("Only approved alert fields may be referenced", pos)
+            return IR("field", FIELDS[name].kind, name, position=pos)
         if kind == "select_expr":
             sel = expr.select_expr
-            self.nodes += 1  # the 'alert' identifier is an AST node too
+            self.nodes += 1  # the namespace or bare-field identifier is an AST node too
             if self.nodes > MAX_AST_NODES or depth + 1 > MAX_DEPTH:
                 raise CELValidationError("Expression exceeds 256 nodes or depth 32", pos)
-            if (
-                sel.operand.WhichOneof("expr_kind") != "ident_expr"
-                or sel.operand.ident_expr.name != "alert"
-            ):
-                raise CELValidationError("Only direct alert.field references are allowed", pos)
-            name = sel.field
+            if sel.operand.WhichOneof("expr_kind") != "ident_expr":
+                raise CELValidationError("Only direct approved field references are allowed", pos)
+            operand = sel.operand.ident_expr.name
+            # `alert.field` remains accepted for saved expressions. Bare fields
+            # are the current syntax; CEL's has() macro represents has(field)
+            # as a test-only select over an identifier with an empty field.
+            if operand == "alert":
+                name = sel.field
+            elif sel.test_only and not sel.field and operand in FIELDS:
+                name = operand
+            else:
+                raise CELValidationError("Only direct approved field references are allowed", pos)
             if name not in FIELDS or (self.rule and name not in RULE_FIELDS):
-                raise CELValidationError(f"Unsupported field: alert.{name}", pos)
+                raise CELValidationError(f"Unsupported field: {name}", pos)
             if sel.test_only and FIELDS[name].kind == "ids":
                 raise CELValidationError("has() requires a scalar field", pos)
             return IR(
@@ -175,6 +185,10 @@ class Builder:
         args = tuple(sub(x) for x in call.args)
         target = sub(call.target) if call.HasField("target") else None
         fn = call.function
+        if fn == "has" and target is None and len(args) == 1 and args[0].op == "field":
+            if args[0].kind == "ids":
+                raise CELValidationError("has() requires a scalar field", pos)
+            return IR("has", "bool", args[0].value, args=(args[0],), position=pos)
         if target:
             if (
                 fn not in STRING_METHODS
@@ -412,7 +426,11 @@ def elastic(ir: IR, evaluated_at: datetime) -> dict:
     if op == "field":
         return {"term": {storage_name(ir.value): True}}
     if op == "has":
-        return {"exists": {"field": storage_name(ir.value)}}
+        return {
+            "exists": {
+                "field": "status" if ir.value == "display_status" else storage_name(ir.value)
+            }
+        }
     if op == "not":
         return negate(elastic(ir.args[0], evaluated_at))
     if op in {"and", "or"}:
@@ -438,6 +456,20 @@ def elastic(ir: IR, evaluated_at: datetime) -> dict:
             else {"match_none": {}}
         )
     value = time_bound(right, evaluated_at)
+    if left.value == "display_status" and op in {"eq", "ne"}:
+        if value == "resolved":
+            query = {"term": {"status": "resolved"}}
+        else:
+            assigned = {"exists": {"field": "assignee_id"}}
+            query = {
+                "bool": {
+                    "filter": [
+                        {"term": {"status": "firing"}},
+                        assigned if value == "acknowledged" else negate(assigned),
+                    ]
+                }
+            }
+        return negate(query) if op == "ne" else query
     if op in {"eq", "ne"}:
         query = negate({"exists": {"field": name}}) if value is None else {"term": {name: value}}
         return negate(query) if op == "ne" else query
@@ -505,7 +537,11 @@ class CompiledExpression:
         defaults = {"string": "", "enum": "", "bool": False, "int": 0, "time": 0, "ids": []}
         for name in self.fields:
             spec = FIELDS[name]
-            value = alert.get(name, alert.get(storage_name(name)))
+            value = (
+                display_status(alert)
+                if name == "display_status"
+                else alert.get(name, alert.get(storage_name(name)))
+            )
             if value is None and not spec.nullable:
                 raise CELValidationError(f"Required alert field missing: {name}")
             data["p_" + name] = value is not None

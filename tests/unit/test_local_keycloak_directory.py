@@ -16,6 +16,14 @@ from appchi.identity.keycloak_directory import (
 from appchi.identity import local_keycloak_worker
 
 
+def test_continuous_local_directory_startup_fails_before_config(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["local_keycloak_worker", "--config", "missing.json"])
+    with pytest.raises(SystemExit) as error:
+        local_keycloak_worker.main()
+    assert error.value.code == 2
+    assert "directory automation is deferred" in capsys.readouterr().err
+
+
 def uid(number):
     return str(UUID(int=number))
 

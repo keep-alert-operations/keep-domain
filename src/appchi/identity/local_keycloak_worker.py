@@ -78,6 +78,8 @@ def main():
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--bootstrap", action="store_true")
     args = parser.parse_args()
+    if not args.once:
+        parser.error("directory automation is deferred; use --once for explicit publication")
     config = load_config(args.config)
     settings = Settings()
     if settings.environment != "development":

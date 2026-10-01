@@ -1,6 +1,7 @@
 import base64
 from pathlib import Path
 from typing import Literal
+from uuid import UUID
 from urllib.parse import urlsplit
 
 from pydantic import SecretStr, model_validator
@@ -12,7 +13,7 @@ from appchi.shared.crypto import EnvelopeCipher
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="APPCHI_", extra="forbid")
     environment: Literal["development", "staging", "production"] = "development"
-    database_url: SecretStr
+    database_url: SecretStr | None = None
     wrapping_key: SecretStr | None = None
     wrapping_keyring: Path | None = None
     wrapping_key_id: str = "local-1"
@@ -41,6 +42,10 @@ class Settings(BaseSettings):
     elasticsearch_client_key: Path | None = None
     redis_url: SecretStr | None = None
     kafka_bootstrap: str | None = None
+    global_tenant_id: UUID | None = None
+    kafka_admission_enabled: bool = False
+    clock_health_file: Path | None = None
+    database_clock_health_file: Path | None = None
     kafka_security_protocol: Literal["PLAINTEXT", "SSL", "SASL_SSL"] = "PLAINTEXT"
     kafka_ca_file: Path | None = None
     kafka_client_cert: Path | None = None
@@ -50,6 +55,7 @@ class Settings(BaseSettings):
     kafka_sasl_username: str | None = None
     kafka_sasl_password: SecretStr | None = None
     operator_binding: Path | None = None
+    operator_database_url: SecretStr | None = None
     operator_grafana_token: SecretStr | None = None
     operator_kong_token: SecretStr | None = None
     operator_probe_token: SecretStr | None = None
@@ -59,20 +65,26 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_settings(self):
+        ingress = self.role in ("ingestion-api", "private-ingestion")
+        if ingress and (not self.kafka_bootstrap or not self.global_tenant_id):
+            raise ValueError("Ingress requires Kafka and the immutable Global tenant ID")
+        if not ingress and not self.database_url:
+            raise ValueError("This workload requires PostgreSQL")
         if self.directory_search_profile and not self.directory_config:
             raise ValueError("Directory search requires the explicit LDAP configuration")
         if not self.public_origin.startswith("https://"):
             raise ValueError("The browser origin must use HTTPS")
         if not 1 <= self.pool_size <= 32:
             raise ValueError("A bounded pool allocation is required")
-        if bool(self.wrapping_key) == bool(self.wrapping_keyring):
+        if not ingress and bool(self.wrapping_key) == bool(self.wrapping_keyring):
             raise ValueError("Supply exactly one wrapping key or mounted wrapping keyring")
         if (
             self.wrapping_key
             and len(base64.b64decode(self.wrapping_key.get_secret_value(), validate=True)) != 32
         ):
             raise ValueError("Wrapping key must be base64 of 32 bytes")
-        self.cipher()
+        if self.wrapping_key or self.wrapping_keyring:
+            self.cipher()
         for certificate, key in (
             (self.elasticsearch_client_cert, self.elasticsearch_client_key),
             (self.kafka_client_cert, self.kafka_client_key),

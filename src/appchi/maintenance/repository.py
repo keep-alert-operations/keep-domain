@@ -297,13 +297,7 @@ def persist(
         conn.execute(
             "INSERT INTO maintenance_identities(id,tenant_id) VALUES(%s,%s)", (window, tenant)
         )
-    health = (
-        "updating"
-        if coverage and previous
-        else previous["processing_health"]
-        if previous
-        else "healthy"
-    )
+    health = "healthy"
     conn.execute(
         """INSERT INTO maintenance_windows(id,tenant_id,revision,name,name_key,reason,cel,profile,cel_digest,start_at,end_at,timezone,schedule_evidence,
         enabled,started_lock,deleted_at,processing_health,created_at,updated_at,created_by,updated_by)
@@ -404,50 +398,7 @@ def persist(
                     progress["maintenance_generation"],
                 ),
             )
-        replaced_ends = conn.execute(
-            "UPDATE maintenance_fanout_jobs SET state='obsolete' WHERE tenant_id=%s AND window_id=%s AND kind='scheduled_end' AND state='pending' RETURNING *",
-            (tenant, window),
-        ).fetchall()
-        from appchi.visibility.maintenance import dispose_replaced_end, record_scheduled_end
-
-        for old_job in replaced_ends:
-            dispose_replaced_end(
-                conn,
-                old_job,
-                control_id=control_id,
-                cancelled=next_state.deleted or not next_state.enabled,
-            )
-        current = [s for s in after_segments if s.deactivation is None and s.end > now]
-        if current:
-            segment = current[0]
-            scheduled = conn.execute(
-                "INSERT INTO maintenance_fanout_jobs(id,tenant_id,window_id,segment_id,control_id,generation,kind,due_at,expected_end,state) VALUES(%s,%s,%s,%s,%s,%s,'scheduled_end',%s,%s,'pending') RETURNING *",
-                (
-                    uuid4(),
-                    tenant,
-                    window,
-                    segment.id,
-                    control_id,
-                    progress["maintenance_generation"],
-                    segment.end,
-                    segment.end,
-                ),
-            ).fetchone()
-            record_scheduled_end(conn, scheduled, revision=rev, profile=profile)
-        # Create cannot backfill. Existing-window controls get durable fan-out;
-        # source insertion independently reconciles controls after admission.
-        conn.execute(
-            "INSERT INTO maintenance_fanout_jobs(id,tenant_id,window_id,control_id,generation,kind,due_at,state) VALUES(%s,%s,%s,%s,%s,'control',%s,%s)",
-            (
-                uuid4(),
-                tenant,
-                window,
-                control_id,
-                progress["maintenance_generation"],
-                now,
-                "pending" if previous else "complete",
-            ),
-        )
+        # Coverage proof remains durable; timer/control fan-out is deferred.
     row = get_window(conn, tenant, window, include_deleted=True)
     snapshot = public(row, now)
     conn.execute(

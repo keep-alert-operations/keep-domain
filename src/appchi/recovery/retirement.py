@@ -86,6 +86,8 @@ def retire_alert(db, store, tenant, alert_id):
         if not job:
             row = retained(conn, tenant, alert_id, True)
             pending(conn, tenant, row)
+            if conn.execute("SELECT 1 FROM kafka_source_results WHERE tenant_id=%s AND alert_id=%s AND NOT kafka_confirmed LIMIT 1", (tenant, alert_id)).fetchone():
+                return False
             if conn.execute(
                 "SELECT 1 FROM alert_retention_holds WHERE tenant_id=%s AND alert_id=%s AND released_at IS NULL LIMIT 1",
                 (tenant, alert_id),
@@ -136,6 +138,7 @@ def retire_alert(db, store, tenant, alert_id):
             eligible = (
                 not hold
                 and not queued
+                and not conn.execute("SELECT 1 FROM kafka_source_results WHERE tenant_id=%s AND alert_id=%s AND NOT kafka_confirmed LIMIT 1", (tenant, alert_id)).fetchone()
                 and row["revision"] == job["expected_revision"]
                 and row["projection_version"] < job["final_version"]
                 and row["status"] == "resolved"
@@ -165,6 +168,9 @@ def retire_alert(db, store, tenant, alert_id):
                     "UPDATE tenant_work_state SET projection_seq=projection_seq+1,change_order=change_order+1 WHERE tenant_id=%s RETURNING projection_seq,change_order",
                     (tenant,),
                 ).fetchone()
+                conn.execute("UPDATE alert_identities SET current_projection_seq=%s WHERE tenant_id=%s AND id=%s", (state["projection_seq"], tenant, alert_id))
+                conn.execute("INSERT INTO alert_retired_keys(tenant_id,schema_version,key_digest,retired_at) VALUES(%s,%s,%s,%s) ON CONFLICT(tenant_id,schema_version,key_digest) DO UPDATE SET retired_at=greatest(alert_retired_keys.retired_at,EXCLUDED.retired_at)", (tenant, row["schema_version"], sha256(row["key_field"].encode()).digest(), now))
+                conn.execute("DELETE FROM correlation_evidence WHERE tenant_id=%s AND alert_id=%s", (tenant, alert_id))
                 snapshot = {
                     "id": str(alert_id),
                     "tenant_id": str(tenant),
@@ -202,10 +208,8 @@ def retire_alert(db, store, tenant, alert_id):
                     effective_at=now,
                     recorded_at=now,
                 )
-                conn.execute(
-                    "INSERT INTO application_outbox(id,tenant_id,stream,stream_order,envelope) VALUES(%s,%s,'changed',%s,%s)",
-                    (uuid4(), tenant, state["projection_seq"], envelope),
-                )
+                from appchi.alert_notifications import remember
+                remember(envelope)
                 conn.execute(
                     "UPDATE retirement_jobs SET state='retired',intent_ack=%s,updated_at=%s WHERE id=%s",
                     (Jsonb(asdict(ack)), now, job["id"]),
