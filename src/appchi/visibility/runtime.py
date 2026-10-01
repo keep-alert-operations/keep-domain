@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from uuid import UUID, uuid5
 
 from .inputs import InputLimits, SamplingPolicy, record_input, registry_checkpoint, link_application
-from .registry import RegistryLimits
+from appchi.visibility.limits import RegistryLimits
 
 
 @dataclass(frozen=True)

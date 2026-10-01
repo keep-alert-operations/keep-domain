@@ -10,7 +10,8 @@ from psycopg.types.json import Jsonb
 from appchi.ingestion.native import canonical
 from appchi.recovery.evidence import Evidence, append_verified
 from appchi.shared.errors import AppError, unavailable
-from appchi.shared.transactions import coordinator, wire
+from appchi.shared.transactions import coordinator
+from appchi.serialization import wire
 
 
 def assignment_proof(conn, tenant_id, principal_id):
@@ -47,15 +48,15 @@ def cleanup_assignment(database, tenant_id, kind, resource_id, expected_assignee
         conn.execute("SELECT scope FROM authorization_guards WHERE scope='identity' FOR SHARE")
         _, now = coordinator(conn, tenant_id)
         if kind == "alert":
-            from appchi.alerts.routes import retained, pending, maintenance_adjust
+            from appchi.alerts.state import retained, pending, maintenance_adjust
             from appchi.alerts.repository import publish, store_alert
-            from appchi.incidents.routes import lock_linked_incidents
+            from appchi.incidents.state import lock_linked_incidents
 
             lock_catalog(conn, catalog, targets=[resource_id])
             lock_linked_incidents(conn, tenant_id, resource_id)
             row = retained(conn, tenant_id, resource_id, True)
         else:
-            from appchi.incidents.routes import get_incident, activity
+            from appchi.incidents.state import get_incident, activity
 
             hint = conn.execute(
                 "SELECT context_id FROM incidents WHERE tenant_id=%s AND id=%s",

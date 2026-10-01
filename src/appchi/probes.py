@@ -6,6 +6,7 @@ from appchi.shared.errors import unavailable
 def check_readiness(settings, db):
     if settings.role in ("ingestion-api", "private-ingestion"):
         from appchi.clock_health import require_clock_health
+
         require_clock_health(settings)
         from confluent_kafka.admin import AdminClient
         from appchi.service_clients import kafka_options
@@ -61,7 +62,9 @@ def main():
         settings = Settings(role=args.role)
         if args.role == "product-api":
             database = Database(
-                settings.database_url.get_secret_value(), 1, deployment_epoch=settings.deployment_epoch
+                settings.database_url.get_secret_value(),
+                1,
+                deployment_epoch=settings.deployment_epoch,
             )
         check_readiness(settings, database)
     except Exception:

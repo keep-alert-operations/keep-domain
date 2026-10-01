@@ -13,7 +13,8 @@ from uuid import UUID
 from appchi.access import effective_role
 from appchi.ingestion.native import canonical
 from appchi.shared.errors import unavailable
-from appchi.shared.transactions import coordinator, wire
+from appchi.shared.transactions import coordinator
+from appchi.serialization import wire
 
 SCHEMA = "appchi-visibility-authority-v1"
 

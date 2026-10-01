@@ -26,10 +26,13 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None):
     state, now = coordinator(conn, tenant)
     if supplied_item is None and (state["blocked"] or now < state["next_attempt_at"]):
         return False
-    item = supplied_item or conn.execute(
-        "SELECT * FROM ingest_items WHERE tenant_id=%s AND disposition='pending' ORDER BY admission_order LIMIT 1 FOR UPDATE",
-        (tenant,),
-    ).fetchone()
+    item = (
+        supplied_item
+        or conn.execute(
+            "SELECT * FROM ingest_items WHERE tenant_id=%s AND disposition='pending' ORDER BY admission_order LIMIT 1 FOR UPDATE",
+            (tenant,),
+        ).fetchone()
+    )
     if not item:
         return False
     if attempt is not None:
@@ -44,7 +47,7 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None):
     previous = None
     linked = []
     if claim:
-        from appchi.incidents.routes import lock_linked_incidents
+        from appchi.incidents.state import lock_linked_incidents
 
         linked = lock_linked_incidents(conn, tenant, claim["alert_id"])
         previous = conn.execute(
@@ -62,12 +65,12 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None):
         error_code = error.code
         if supplied_item is None:
             conn.execute(
-            "UPDATE ingest_items SET disposition='rejected',error_code=%s WHERE id=%s",
-            (error.code, item["id"]),
+                "UPDATE ingest_items SET disposition='rejected',error_code=%s WHERE id=%s",
+                (error.code, item["id"]),
             )
             conn.execute(
-            "UPDATE ingest_retry_keys SET expires_at=%s + interval '90 days' WHERE item_id=%s",
-            (item["received_at"], item["id"]),
+                "UPDATE ingest_retry_keys SET expires_at=%s + interval '90 days' WHERE item_id=%s",
+                (item["received_at"], item["id"]),
             )
             link_source_result(conn, item, error_code=error.code)
     else:
@@ -84,7 +87,7 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None):
             catalog,
         )
         store_alert(conn, current)
-        from appchi.incidents.routes import linked_transition
+        from appchi.incidents.state import linked_transition
 
         linked_transition(conn, linked, previous, current, item["received_at"])
         if previous is None:
@@ -120,8 +123,8 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None):
             )
         if supplied_item is None:
             conn.execute(
-            "UPDATE ingest_items SET disposition='applied',alert_id=%s,occurrence_id=%s,payload=NULL,raw_json=NULL WHERE id=%s",
-            (current["id"], current["occurrence_id"], item["id"]),
+                "UPDATE ingest_items SET disposition='applied',alert_id=%s,occurrence_id=%s,payload=NULL,raw_json=NULL WHERE id=%s",
+                (current["id"], current["occurrence_id"], item["id"]),
             )
         publication = publish(
             conn,
@@ -135,15 +138,19 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None):
         )
         if supplied_item is None:
             link_source_result(
-            conn,
-            item,
-            before=previous,
-            after=current,
-            publication=publication,
-            changed=changed,
+                conn,
+                item,
+                before=previous,
+                after=current,
+                publication=publication,
+                changed=changed,
             )
     if supplied_item is not None:
-        return {"alert_id": current["id"] if not error_code else None, "error_code": error_code, "envelope": publication["envelope"] if publication else None}
+        return {
+            "alert_id": current["id"] if not error_code else None,
+            "error_code": error_code,
+            "envelope": publication["envelope"] if publication else None,
+        }
     conn.execute("UPDATE tenant_work_state SET failures=0 WHERE tenant_id=%s", (tenant,))
     conn.execute(
         "UPDATE application_outbox SET processed_at=%s WHERE tenant_id=%s AND stream='received' AND stream_order=%s",

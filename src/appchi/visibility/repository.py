@@ -5,7 +5,7 @@ from datetime import datetime
 from psycopg.types.json import Jsonb
 
 from appchi.shared.errors import AppError, unavailable
-from appchi.shared.transactions import wire
+from appchi.serialization import wire
 
 
 def get_view(conn, tenant, view_id, session_hash, deployment_epoch):

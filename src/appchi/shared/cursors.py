@@ -2,7 +2,7 @@ import base64
 import json
 from datetime import timedelta
 from appchi.shared.errors import AppError
-from appchi.shared.transactions import wire
+from appchi.serialization import wire
 
 
 class Cursor:

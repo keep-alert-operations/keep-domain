@@ -2,7 +2,7 @@ from uuid import uuid4
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from appchi.shared.transactions import wire
+from appchi.serialization import wire
 
 
 def store_alert(conn, current, new=False):
@@ -49,12 +49,19 @@ def publish(
     if cause != "source" and before is not None:
         if before["status"] != "resolved" and after["status"] == "resolved":
             from appchi.correlation.runtime import release_alert
+
             release_alert(conn, tenant, after["id"], now)
         elif after["suppressed"]:
-            conn.execute("DELETE FROM correlation_evidence WHERE tenant_id=%s AND alert_id=%s", (tenant, after["id"]))
+            conn.execute(
+                "DELETE FROM correlation_evidence WHERE tenant_id=%s AND alert_id=%s",
+                (tenant, after["id"]),
+            )
         else:
             # Ignored edits do not make live evidence stale solely by revision.
-            conn.execute("UPDATE correlation_evidence SET observed_revision=%s WHERE tenant_id=%s AND alert_id=%s AND observed_revision=%s", (after["revision"], tenant, after["id"], before["revision"]))
+            conn.execute(
+                "UPDATE correlation_evidence SET observed_revision=%s WHERE tenant_id=%s AND alert_id=%s AND observed_revision=%s",
+                (after["revision"], tenant, after["id"], before["revision"]),
+            )
     from appchi.cel.catalog import RULE_FIELDS
     from appchi.maintenance.processing import record_input
 
@@ -173,14 +180,19 @@ def publish(
         actor=actor,
         original_order=original_order,
     )
-    conn.execute("UPDATE alert_identities SET current_projection_seq=%s WHERE tenant_id=%s AND id=%s", (state["projection_seq"], tenant, after["id"]))
+    conn.execute(
+        "UPDATE alert_identities SET current_projection_seq=%s WHERE tenant_id=%s AND id=%s",
+        (state["projection_seq"], tenant, after["id"]),
+    )
     if cause != "source":
         from appchi.alert_notifications import remember
+
         remember(envelope)
     conn.execute(
         "UPDATE tenant_view_state SET view_generation=view_generation+1 WHERE tenant_id=%s",
         (tenant,),
     )
     from appchi.maintenance.runtime import publish_inline_effects
+
     publish_inline_effects(conn, after)
     return {**state, "envelope": envelope}

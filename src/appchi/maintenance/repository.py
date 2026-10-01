@@ -9,7 +9,7 @@ from psycopg.types.json import Jsonb
 
 from appchi.ingestion.native import canonical
 from appchi.shared.errors import AppError, unavailable
-from appchi.shared.transactions import wire
+from appchi.serialization import wire
 
 from .temporal import (
     Boundary,

@@ -16,7 +16,8 @@ from appchi.cel import compile_expression
 from appchi.cel.catalog import RULE_FIELDS
 from appchi.ingestion.native import canonical
 from appchi.shared.errors import unavailable
-from appchi.shared.transactions import coordinator, wire
+from appchi.shared.transactions import coordinator
+from appchi.serialization import wire
 
 from .temporal import AlertTransition, Boundary, MaintenanceProofError, Segment, reduce_alert
 
@@ -64,11 +65,7 @@ def suppression_at(conn, tenant_id, alert_id, effective_at, original_order):
         JOIN tenant_view_state v ON v.tenant_id=c.tenant_id JOIN maintenance_alert_input_heads h ON h.tenant_id=c.tenant_id AND h.alert_id=c.alert_id WHERE c.tenant_id=%s AND c.alert_id=%s""",
         (tenant_id, alert_id),
     ).fetchone()
-    if (
-        not row
-        or not row["complete"]
-        or row["input_revision"] != row["head_revision"]
-    ):
+    if not row or not row["complete"] or row["input_revision"] != row["head_revision"]:
         raise MaintenanceProofError("maintenance_historical_checkpoint_unproven")
     if type(original_order) is not int or original_order < 1 or effective_at.tzinfo is None:
         raise MaintenanceProofError("maintenance_historical_boundary_invalid")
@@ -102,7 +99,8 @@ def prepare_catalog(database, tenant_id, *, max_work, max_inputs, max_segments):
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         conn.execute("SELECT set_config('appchi.tenant_id',%s,true)", (str(tenant_id),))
         state = conn.execute(
-            "SELECT maintenance_generation,(SELECT source_release_since FROM application_scope WHERE singleton) AS source_release_since FROM tenant_view_state WHERE tenant_id=%s", (tenant_id,)
+            "SELECT maintenance_generation,(SELECT source_release_since FROM application_scope WHERE singleton) AS source_release_since FROM tenant_view_state WHERE tenant_id=%s",
+            (tenant_id,),
         ).fetchone()
         rows = conn.execute(
             "SELECT * FROM maintenance_segments WHERE tenant_id=%s ORDER BY activation_at,activation_order,id LIMIT %s",
@@ -145,7 +143,11 @@ def prepare_catalog(database, tenant_id, *, max_work, max_inputs, max_segments):
             )
         )
     return Catalog(
-        UUID(str(tenant_id)), state["maintenance_generation"], tuple(segments), max_work, max_inputs,
+        UUID(str(tenant_id)),
+        state["maintenance_generation"],
+        tuple(segments),
+        max_work,
+        max_inputs,
         source_release_since=state["source_release_since"],
     )
 
@@ -307,7 +309,8 @@ def reconcile_alert(conn, current, processing_now, *, catalog):
             row["before_snapshot"],
             row["after_snapshot"],
             row["new_logical_alert"],
-            row["source_suppressed"], row["kind"],
+            row["source_suppressed"],
+            row["kind"],
         )
         for row in rows
     )
@@ -431,18 +434,29 @@ def reconcile_alert(conn, current, processing_now, *, catalog):
         ).fetchall()
     }
     new = []
-    qualifier_proofs = {at: (source_id, allowed, origin_id) for at, source_id, allowed, origin_id in result.qualifier_inputs}
+    qualifier_proofs = {
+        at: (source_id, allowed, origin_id)
+        for at, source_id, allowed, origin_id in result.qualifier_inputs
+    }
     for identity, at in qualifiers.items():
         previous = previous_qualifiers.get(identity)
         proof = qualifier_proofs[at]
-        previous_proof = None if previous is None else (
-            str(previous["source_input_id"]), previous["correlation_allowed"],
-            str(previous["origin_input_id"]) if previous["origin_input_id"] else None,
+        previous_proof = (
+            None
+            if previous is None
+            else (
+                str(previous["source_input_id"]),
+                previous["correlation_allowed"],
+                str(previous["origin_input_id"]) if previous["origin_input_id"] else None,
+            )
         )
         if previous is None or not previous["active"] or previous_proof != proof:
             # A delayed applied source can change the snapshot/provenance of an
             # already-known end instant. Retract its old evidence atomically.
-            conn.execute("DELETE FROM correlation_evidence WHERE tenant_id=%s AND alert_id=%s AND qualifier_ref=%s", (tenant, alert_id, identity))
+            conn.execute(
+                "DELETE FROM correlation_evidence WHERE tenant_id=%s AND alert_id=%s AND qualifier_ref=%s",
+                (tenant, alert_id, identity),
+            )
             conn.execute(
                 "INSERT INTO maintenance_qualifier_effects(tenant_id,alert_id,id,effective_at,active,recorded_at,source_input_id,correlation_allowed,origin_input_id) VALUES(%s,%s,%s,%s,true,%s,%s,%s,%s) ON CONFLICT(tenant_id,alert_id,id) DO UPDATE SET active=true,recorded_at=EXCLUDED.recorded_at,source_input_id=EXCLUDED.source_input_id,correlation_allowed=EXCLUDED.correlation_allowed,origin_input_id=EXCLUDED.origin_input_id",
                 (tenant, alert_id, identity, at, processing_now, *proof),

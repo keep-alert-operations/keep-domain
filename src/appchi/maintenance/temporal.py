@@ -70,10 +70,7 @@ class Segment:
         return (
             self.start <= boundary.at < self.end
             and boundary.at > self.activation.at
-            and (
-                self.deactivation is None
-                or boundary.at < self.deactivation.at
-            )
+            and (self.deactivation is None or boundary.at < self.deactivation.at)
         )
 
     @property
@@ -314,7 +311,11 @@ def reduce_alert(
         if index is not None:
             # An older receive clock cannot create a negative interval when its
             # source mutation is applied after a newer manual/source mutation.
-            closed = boundary if boundary.at >= causes[index].opened.at else replace(boundary, at=causes[index].opened.at)
+            closed = (
+                boundary
+                if boundary.at >= causes[index].opened.at
+                else replace(boundary, at=causes[index].opened.at)
+            )
             causes[index] = replace(causes[index], closed=closed)
             keys.add((str(alert_id), cause_id, "close", boundary.id))
 
@@ -419,36 +420,75 @@ def reduce_alert(
         # status immediately before end. Control/source closes use own order.
         closes = [c.closed for c in causes if c.closed and c.closed.at == interval.end]
         end_boundary = max(closes, key=lambda b: b.order)
-        eligible_inputs = [t for t in status_history if
-                           (t.boundary.at, t.boundary.order) <= (end_boundary.at, end_boundary.order)]
+        eligible_inputs = [
+            t
+            for t in status_history
+            if (t.boundary.at, t.boundary.order) <= (end_boundary.at, end_boundary.order)
+        ]
         current_input = eligible_inputs[-1] if eligible_inputs else None
         if current_input and current_input.after["status"] == "firing":
             qualifiers.append(interval.end)
-            manual_reset = max((t.boundary.order for t in eligible_inputs if t.kind != "source"
-                                and t.before and t.before["status"] != t.after["status"]), default=0)
+            manual_reset = max(
+                (
+                    t.boundary.order
+                    for t in eligible_inputs
+                    if t.kind != "source" and t.before and t.before["status"] != t.after["status"]
+                ),
+                default=0,
+            )
             origins = {t.boundary.id: t for t in eligible_inputs}
-            source_origins = [c.opened for c in causes if (
-                c.opened.id in origins and origins[c.opened.id].kind == "source"
-                and c.opened.order > manual_reset
-                and c.opened.at < interval.end
-                and (c.closed is None or c.closed.at > interval.start)
-            )]
-            source_origins.extend(b for b in source_qualifiers.values()
-                if b.id in origins and b.order > manual_reset
-                and interval.start <= b.at < interval.end)
+            source_origins = [
+                c.opened
+                for c in causes
+                if (
+                    c.opened.id in origins
+                    and origins[c.opened.id].kind == "source"
+                    and c.opened.order > manual_reset
+                    and c.opened.at < interval.end
+                    and (c.closed is None or c.closed.at > interval.start)
+                )
+            ]
+            source_origins.extend(
+                b
+                for b in source_qualifiers.values()
+                if b.id in origins
+                and b.order > manual_reset
+                and interval.start <= b.at < interval.end
+            )
             if manual_reset:
                 # Per-rule normal source qualification is checked downstream
                 # from this retained post-reset chain. A mere repeat contributes
                 # no eligibility, even though it is valid source provenance.
-                source_origins.extend(t.boundary for t in eligible_inputs
-                    if t.kind == "source" and t.boundary.order > manual_reset
+                source_origins.extend(
+                    t.boundary
+                    for t in eligible_inputs
+                    if t.kind == "source"
+                    and t.boundary.order > manual_reset
                     and t.after["status"] == "firing"
-                    and interval.start <= t.boundary.at < interval.end)
+                    and interval.start <= t.boundary.at < interval.end
+                )
             # A direct source release is itself a qualifying source transition.
-            source_release = end_boundary.id in origins and origins[end_boundary.id].kind == "source"
-            manual_release = end_boundary.id in origins and origins[end_boundary.id].kind != "source"
-            origin = None if manual_release else end_boundary if source_release else max(source_origins, key=lambda b: b.order, default=None)
-            qualifier_inputs.append((interval.end, current_input.boundary.id, origin is not None, origin.id if origin else None))
+            source_release = (
+                end_boundary.id in origins and origins[end_boundary.id].kind == "source"
+            )
+            manual_release = (
+                end_boundary.id in origins and origins[end_boundary.id].kind != "source"
+            )
+            origin = (
+                None
+                if manual_release
+                else end_boundary
+                if source_release
+                else max(source_origins, key=lambda b: b.order, default=None)
+            )
+            qualifier_inputs.append(
+                (
+                    interval.end,
+                    current_input.boundary.id,
+                    origin is not None,
+                    origin.id if origin else None,
+                )
+            )
     return Reduction(
         tuple(causes),
         tuple(intervals),

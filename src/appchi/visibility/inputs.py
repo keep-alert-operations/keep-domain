@@ -14,7 +14,8 @@ from psycopg.types.json import Jsonb
 
 from appchi.ingestion.native import canonical
 from appchi.shared.errors import AppError
-from appchi.shared.transactions import coordinator, wire
+from appchi.shared.transactions import coordinator
+from appchi.serialization import wire
 from .sampling import selected
 
 

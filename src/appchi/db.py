@@ -31,22 +31,21 @@ class Database:
 
     @contextmanager
     def _transaction(self, conn, tenant_id, runtime_guard):
-            guard = (
-                runtime_guard(conn, self.deployment_epoch)
-                if self.deployment_epoch is not None
-                else nullcontext()
-            )
-            with guard, conn.transaction():
-                conn.execute("SET LOCAL TIME ZONE 'UTC'")
-                conn.execute("SET LOCAL statement_timeout = '4000ms'")
-                conn.execute("SET LOCAL lock_timeout = '2000ms'")
-                if tenant_id:
-                    conn.execute(
-                        "SELECT set_config('appchi.tenant_id', %s, true)", (str(tenant_id),)
-                    )
-                yield conn
-                from appchi.maintenance.runtime import flush_inline_effects
-                flush_inline_effects(conn)
+        guard = (
+            runtime_guard(conn, self.deployment_epoch)
+            if self.deployment_epoch is not None
+            else nullcontext()
+        )
+        with guard, conn.transaction():
+            conn.execute("SET LOCAL TIME ZONE 'UTC'")
+            conn.execute("SET LOCAL statement_timeout = '4000ms'")
+            conn.execute("SET LOCAL lock_timeout = '2000ms'")
+            if tenant_id:
+                conn.execute("SELECT set_config('appchi.tenant_id', %s, true)", (str(tenant_id),))
+            yield conn
+            from appchi.maintenance.runtime import flush_inline_effects
+
+            flush_inline_effects(conn)
 
     def close(self):
         self.pool.close()

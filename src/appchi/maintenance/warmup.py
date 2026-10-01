@@ -38,8 +38,8 @@ def warmup_page(database, tenant, profile, *, cursor=None, limit=100):
             ORDER BY a.id LIMIT %s""",
             (tenant, position, limit + 1),
         ).fetchall()
-    from appchi.alerts.routes import pending, retained
-    from appchi.incidents.routes import lock_linked_incidents
+    from appchi.alerts.state import pending, retained
+    from appchi.incidents.state import lock_linked_incidents
 
     scanned = completed = 0
     blocked = []

@@ -30,7 +30,7 @@ def accessible_tenants(conn, principal):
 
 
 def authorize(conn, request, tenant, minimum="view", mutation=False):
-    from appchi.identity.session import authenticate
+    from appchi.identity.authentication import authenticate
 
     principal, session = authenticate(conn, request, mutation=mutation)
     role = effective_role(conn, principal, tenant)

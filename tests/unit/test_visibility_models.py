@@ -10,7 +10,7 @@ from appchi.visibility.models import (
     decode_acknowledgements,
     decode_model,
 )
-from appchi.visibility.registry import RegistryLimits
+from appchi.visibility.limits import RegistryLimits
 from appchi.visibility.sampling import selected
 
 

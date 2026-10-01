@@ -3,7 +3,7 @@
 from hashlib import sha256
 from uuid import uuid4
 from appchi.ingestion.native import canonical
-from appchi.shared.transactions import wire
+from appchi.serialization import wire
 from appchi.event_models import ChangedEnvelope, ReceivedEnvelope
 
 

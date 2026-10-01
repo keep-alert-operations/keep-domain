@@ -11,7 +11,7 @@ import unicodedata
 
 from appchi.shared.errors import AppError
 from appchi.shared.transactions import coordinator
-from .deletion import _ready
+from appchi.correlation.guards import _ready
 from .models import NAME_PROFILE, name_key
 
 

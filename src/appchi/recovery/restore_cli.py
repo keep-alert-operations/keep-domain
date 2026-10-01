@@ -8,7 +8,7 @@ from dataclasses import asdict
 from appchi.db import Database
 from appchi.recovery.restore import begin_restore, status, collect_restore
 from appchi.shared.errors import AppError
-from appchi.shared.transactions import wire
+from appchi.serialization import wire
 
 
 def main():

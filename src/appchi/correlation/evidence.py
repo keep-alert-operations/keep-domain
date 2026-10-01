@@ -431,7 +431,12 @@ def _source_qualified_conditions(rule, event, group, release_boundary):
         if after["status"] != "firing" or after_group != group:
             qualified.clear()
             continue
-        broad = released or before is None or before["status"] == "resolved" or group_key(rule.grouping, before) != group
+        broad = (
+            released
+            or before is None
+            or before["status"] == "resolved"
+            or group_key(rule.grouping, before) != group
+        )
         for condition in rule.conditions:
             after_value = condition.program.evaluate(after, at)
             before_value = condition.program.evaluate(before, at) if before is not None else False
@@ -523,8 +528,12 @@ def apply_input(
         before_values = (
             _condition_values(rule, event.before, event.qualifier.at) if event.before else {}
         )
-        source_qualified = None if event.source_provenance is None else _source_qualified_conditions(
-            rule, event, group, release_boundaries.get(event.after.id)
+        source_qualified = (
+            None
+            if event.source_provenance is None
+            else _source_qualified_conditions(
+                rule, event, group, release_boundaries.get(event.after.id)
+            )
         )
     except Exception:
         return EvidenceState(
@@ -535,7 +544,9 @@ def apply_input(
         boundaries.append(context_boundaries[context])
     if event.after.id in release_boundaries:
         boundaries.append(release_boundaries[event.after.id])
-    can_start = event.kind in ("source", "scheduled") and _after_boundaries(event, tuple(boundaries))
+    can_start = event.kind in ("source", "scheduled") and _after_boundaries(
+        event, tuple(boundaries)
+    )
     broad_transition = event.new_logical_alert or (
         event.before is not None
         and (event.before.status == "resolved" or event.before.suppressed or before_group != group)
@@ -547,9 +558,15 @@ def apply_input(
         if not after_values[condition.id]:
             continue
         old = existing.get(condition.id)
-        if old is not None and (not broad_transition or (derived and old.start > event.qualifier.at)):
+        if old is not None and (
+            not broad_transition or (derived and old.start > event.qualifier.at)
+        ):
             others.append(replace(old, observed_revision=event.after.revision))
-        elif can_start and (source_qualified is None or condition.id in source_qualified) and (broad_transition or not before_values.get(condition.id, False)):
+        elif (
+            can_start
+            and (source_qualified is None or condition.id in source_qualified)
+            and (broad_transition or not before_values.get(condition.id, False))
+        ):
             try:
                 expiry = event.qualifier.at + timedelta(minutes=rule.window_minutes)
             except OverflowError:

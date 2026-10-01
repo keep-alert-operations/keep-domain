@@ -12,7 +12,7 @@ from appchi.cel import CELUnavailableError, CELValidationError, compile_expressi
 from appchi.cel.compiler import COST_MODEL, PROFILE
 from appchi.ingestion.native import canonical
 from appchi.shared.errors import AppError, unavailable
-from appchi.shared.transactions import wire
+from appchi.serialization import wire
 from .evidence import Boundary, Condition, EvidenceState, GroupKey, Rule, edit_rule, group_key
 from .models import NAME_PROFILE, grouping, name_key
 
@@ -77,7 +77,15 @@ def limits(profile, *, allow_local_preview=False):
 
 
 def check_capacity(
-    conn, tenant, definition, programs, profile, *, rule_id=None, enabled=True, allow_local_preview=False
+    conn,
+    tenant,
+    definition,
+    programs,
+    profile,
+    *,
+    rule_id=None,
+    enabled=True,
+    allow_local_preview=False,
 ):
     config = limits(profile, allow_local_preview=allow_local_preview)
     costs = [programs[item["id"]].rule_cost_upper_bound for item in definition["conditions"]]
@@ -286,7 +294,10 @@ def persist(conn, tenant, actor, now, body, programs, command_id, *, previous=No
         ),
     )
     if reset:
-        conn.execute("UPDATE correlation_rules SET kafka_schema_blocked=false WHERE tenant_id=%s AND id=%s", (tenant,rule_id))
+        conn.execute(
+            "UPDATE correlation_rules SET kafka_schema_blocked=false WHERE tenant_id=%s AND id=%s",
+            (tenant, rule_id),
+        )
     stored = {str(item["id"]): item for item in previous["condition_rows"]} if previous else {}
     conn.execute(
         "DELETE FROM correlation_conditions WHERE tenant_id=%s AND rule_id=%s", (tenant, rule_id)
