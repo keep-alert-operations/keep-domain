@@ -4,7 +4,7 @@ Trusted producers pass their existing transaction; helpers never commit it.
 Nothing in this module proves eligibility, query correctness, rendering or success.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from hashlib import sha256
 import re
@@ -17,46 +17,11 @@ from appchi.shared.errors import AppError
 from appchi.shared.transactions import coordinator
 from appchi.serialization import wire
 from .sampling import selected
+from .limits import InputLimits as InputLimits, SamplingPolicy as SamplingPolicy
 
 
-@dataclass(frozen=True)
-class InputLimits:
-    max_tenant_inputs: int
-    max_tenant_candidates: int
-    max_tenant_applications: int
-    max_tenant_application_bytes: int
-    max_application_bytes: int
-    max_views_per_turn: int
-
-    def __post_init__(self):
-        if any(
-            type(value) is not int or not 0 < value < 2**63 - 1 for value in vars(self).values()
-        ):
-            raise ValueError("Explicit positive bounded visibility allocations required")
-        if self.max_application_bytes > self.max_tenant_application_bytes:
-            raise ValueError("Application allocation exceeds tenant allocation")
-        if self.max_views_per_turn > 200:
-            raise ValueError("One expansion transaction may inspect at most 200 views")
 
 
-@dataclass(frozen=True)
-class SamplingPolicy:
-    epoch: str
-    qualification: bool
-    deployment_epoch: str
-
-    def __post_init__(self):
-        if (
-            not isinstance(self.epoch, str)
-            or not 1 <= len(self.epoch.encode()) <= 256
-            or type(self.qualification) is not bool
-        ):
-            raise ValueError("Immutable server sampling policy required")
-        if (
-            not isinstance(self.deployment_epoch, str)
-            or not 1 <= len(self.deployment_epoch.encode()) <= 256
-        ):
-            raise ValueError("Explicit deployment epoch required")
 
 
 def _uuid(value):
@@ -574,3 +539,4 @@ def coverage(conn, tenant):
         "eligibility": "unclassified",
         "render_proof": "unavailable",
     }
+

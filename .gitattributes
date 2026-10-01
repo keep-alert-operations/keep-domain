@@ -1,0 +1,4 @@
+* text=auto
+*.sql -text
+*.png -text
+*.woff2 -text

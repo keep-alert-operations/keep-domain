@@ -3,7 +3,7 @@
 The implementation includes PostgreSQL-backed maintenance CRUD, schedule
 conversion, immutable revision/control/segment proof, protected deletion, a
 complete-history suppression adapter and fenced fan-out primitives. The normative
-contract remains [maintenance operations](../spec-maintenance-operations.md).
+contract remains [maintenance operations](https://github.com/appchi-alert-operations/appchi-design/blob/main/specs/spec-maintenance-operations.md).
 Capability `maintenance` remains false until shared transaction, worker,
 correlation and search visibility paths are integrated and qualified. Isolated
 component tests do not establish that the whole workflow is enabled.
