@@ -52,7 +52,6 @@ def check_readiness(settings, db):
 def main():
     import argparse
     from appchi.config import Settings
-    from appchi.db import Database
 
     parser = argparse.ArgumentParser()
     parser.add_argument("role", choices=("product-api", "ingestion-api", "private-ingestion"))
@@ -61,6 +60,8 @@ def main():
     try:
         settings = Settings(role=args.role)
         if args.role == "product-api":
+            from appchi.db import Database
+
             database = Database(
                 settings.database_url.get_secret_value(),
                 1,
