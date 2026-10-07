@@ -2,6 +2,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+from starlette.concurrency import run_in_threadpool
 from fastapi import Request
 from appchi.shared.errors import AppError, unavailable
 from .oidc import (
@@ -146,22 +147,27 @@ def _cookie(response, name, value):
 
 async def refresh_session(request: Request):
     """Claim once, exchange outside locks, atomically persist rotated credentials."""
-    with request.app.state.db.transaction() as conn:
-        principal, session = authenticate(conn, request)
-        # A worker may die after consuming a rotating provider token. Never
-        # retry its old credential after the bounded exchange lease expires.
-        conn.execute(
-            """UPDATE auth_sessions SET refresh_uncertain=true,refresh_started_at=NULL
-                     WHERE handle_hash=%s AND refresh_started_at<clock_timestamp()-interval '30 seconds'""",
-            (session["handle_hash"],),
-        )
-        claimed = conn.execute(
-            """UPDATE auth_sessions SET refresh_generation=refresh_generation+1,
-                 refresh_started_at=clock_timestamp() WHERE handle_hash=%s AND refresh_uncertain=false
-                 AND refresh_started_at IS NULL AND refresh_at<=clock_timestamp()-interval '4 minutes'
-                 RETURNING refresh_generation""",
-            (session["handle_hash"],),
-        ).fetchone()
+
+    def claim_refresh():
+        with request.app.state.db.transaction() as conn:
+            principal, session = authenticate(conn, request)
+            # A worker may die after consuming a rotating provider token. Never
+            # retry its old credential after the bounded exchange lease expires.
+            conn.execute(
+                """UPDATE auth_sessions SET refresh_uncertain=true,refresh_started_at=NULL
+                         WHERE handle_hash=%s AND refresh_started_at<clock_timestamp()-interval '30 seconds'""",
+                (session["handle_hash"],),
+            )
+            claimed = conn.execute(
+                """UPDATE auth_sessions SET refresh_generation=refresh_generation+1,
+                     refresh_started_at=clock_timestamp() WHERE handle_hash=%s AND refresh_uncertain=false
+                     AND refresh_started_at IS NULL AND refresh_at<=clock_timestamp()-interval '4 minutes'
+                     RETURNING refresh_generation""",
+                (session["handle_hash"],),
+            ).fetchone()
+        return principal, session, claimed
+
+    principal, session, claimed = await run_in_threadpool(claim_refresh)
     if not claimed:
         return
     generation, handle_hash = claimed["refresh_generation"], bytes(session["handle_hash"])
@@ -181,33 +187,41 @@ async def refresh_session(request: Request):
     try:
         refreshed = await oidc_client(request).refresh(stored["refresh_token"], identity)
     except (OIDCInvalid, OIDCUnavailable, AppError) as exc:
-        with request.app.state.db.transaction() as conn:
-            _guard(conn, exclusive=True)
-            if isinstance(exc, (OIDCRevoked, OIDCInvalid)):
-                conn.execute(
-                    """UPDATE auth_sessions SET revoked_at=clock_timestamp(),tokens=NULL,
-                             refresh_started_at=NULL WHERE handle_hash=%s AND refresh_generation=%s""",
-                    (handle_hash, generation),
-                )
-            else:
-                conn.execute(
-                    """UPDATE auth_sessions SET refresh_uncertain=true,refresh_started_at=NULL
-                             WHERE handle_hash=%s AND refresh_generation=%s""",
-                    (handle_hash, generation),
-                )
+
+        def record_refresh_failure(failure=exc):
+            with request.app.state.db.transaction() as conn:
+                _guard(conn, exclusive=True)
+                if isinstance(failure, (OIDCRevoked, OIDCInvalid)):
+                    conn.execute(
+                        """UPDATE auth_sessions SET revoked_at=clock_timestamp(),tokens=NULL,
+                                 refresh_started_at=NULL WHERE handle_hash=%s AND refresh_generation=%s""",
+                        (handle_hash, generation),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE auth_sessions SET refresh_uncertain=true,refresh_started_at=NULL
+                                 WHERE handle_hash=%s AND refresh_generation=%s""",
+                        (handle_hash, generation),
+                    )
+
+        await run_in_threadpool(record_refresh_failure)
         return
-    with request.app.state.db.transaction() as conn:
-        _guard(conn)
-        conn.execute(
-            """UPDATE auth_sessions SET tokens=%s,refresh_at=clock_timestamp(),refresh_started_at=NULL
-                     WHERE handle_hash=%s AND refresh_generation=%s AND revoked_at IS NULL
-                     AND absolute_at>clock_timestamp() AND deployment_epoch=%s""",
-            (
-                cipher.seal(
-                    json.dumps(refreshed.tokens).encode(), "session-tokens:" + handle_hash.hex()
+
+    def persist_refresh():
+        with request.app.state.db.transaction() as conn:
+            _guard(conn)
+            conn.execute(
+                """UPDATE auth_sessions SET tokens=%s,refresh_at=clock_timestamp(),refresh_started_at=NULL
+                         WHERE handle_hash=%s AND refresh_generation=%s AND revoked_at IS NULL
+                         AND absolute_at>clock_timestamp() AND deployment_epoch=%s""",
+                (
+                    cipher.seal(
+                        json.dumps(refreshed.tokens).encode(), "session-tokens:" + handle_hash.hex()
+                    ),
+                    handle_hash,
+                    generation,
+                    request.app.state.settings.deployment_epoch,
                 ),
-                handle_hash,
-                generation,
-                request.app.state.settings.deployment_epoch,
-            ),
-        )
+            )
+
+    await run_in_threadpool(persist_refresh)

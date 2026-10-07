@@ -49,8 +49,7 @@ def run(role, make_transport, *, before_turn=None, transport_optional=False):
             failed = False
             try:
                 require_clock_health(settings)
-                if before_turn is not None:
-                    before_turn(db, settings)
+                transport_failed = False
                 try:
                     if transport is None:
                         transport = make_transport(db, settings, profile)
@@ -61,7 +60,17 @@ def run(role, make_transport, *, before_turn=None, transport_optional=False):
                         transport = None
                     if not transport_optional:
                         raise
+                    transport_failed = True
                     log.warning("search_kafka_degraded_reconciliation_active")
+                if before_turn is not None:
+                    try:
+                        progress += before_turn(db, settings) or 0
+                    except Exception:
+                        # Authority scan failure must not prevent independent
+                        # Kafka hints from repairing healthy tenants.
+                        if transport_failed:
+                            raise
+                        log.warning("search_reconciliation_degraded_hints_active")
                 health.publish(ready=True)
             except Exception:
                 failed = True
@@ -84,6 +93,13 @@ def run(role, make_transport, *, before_turn=None, transport_optional=False):
             if transport is not None:
                 transport.close()
         finally:
-            db.close()
-            for sig, handler in previous.items():
-                signal.signal(sig, handler)
+            close_background = getattr(before_turn, "close", None)
+            try:
+                if close_background:
+                    close_background()
+            finally:
+                try:
+                    db.close()
+                finally:
+                    for sig, handler in previous.items():
+                        signal.signal(sig, handler)

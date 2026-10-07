@@ -7,6 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from appchi.ingestion.native import parse_json
 from appchi.shared.errors import AppError, unavailable
+from appchi.request_budget import request_budget
 
 
 def create_http_app(lifespan, *, product=False):
@@ -111,74 +112,23 @@ def create_http_app(lifespan, *, product=False):
         request.state.request_id = str(uuid4())
         request.state.received_at = datetime.now(UTC)
         try:
-            async with asyncio.timeout(5 if "/ingest/" in request.url.path else None):
-                from appchi.workload import permits_http
-
-                if not permits_http(request.app.state.settings, request.url.path):
-                    raise AppError("not_found", "Resource unavailable.", 404)
-                if "/ingest/" in request.url.path or (
-                    request.method in ("POST", "PUT", "PATCH", "DELETE")
-                    and request.url.path.startswith("/api/")
-                ):
-                    from appchi.clock_health import require_clock_health
-
-                    require_clock_health(request.app.state.settings, now=request.state.received_at)
-                for key in request.query_params:
-                    if len(request.query_params.getlist(key)) > 1:
-                        raise AppError(
-                            "duplicate_parameter", "Repeated query parameters are invalid.", 400
-                        )
-                for key in (
-                    "idempotency-key",
-                    "x-receipt-token",
-                    "x-api-key",
-                    "authorization",
-                    "if-match",
-                    "origin",
-                    "x-csrf-token",
-                ):
-                    if len(request.headers.getlist(key)) > 1:
-                        raise AppError(
-                            "duplicate_header", "Repeated security headers are invalid.", 400
-                        )
-                if request.method in ("POST", "PUT", "PATCH") and not request.url.path.startswith(
-                    "/auth/"
-                ):
-                    if request.headers.get("content-encoding", "identity") != "identity":
-                        raise AppError(
-                            "unsupported_encoding",
-                            "Compressed request bodies are not accepted.",
-                            415,
-                        )
-                    if (
-                        request.headers.get("content-type", "").split(";")[0].lower()
-                        != "application/json"
-                    ):
-                        raise AppError("unsupported_media_type", "Use application/json.", 415)
-                    limit = (
-                        4 * 1024 * 1024
-                        if "/ingest/" in request.url.path
-                        else 1024 * 1024
-                        if "/correlation-rules" in request.url.path
-                        else 256 * 1024
-                        if "/maintenance" in request.url.path
-                        else 65536
-                    )
-                    chunks = []
-                    size = 0
-                    async for chunk in request.stream():
-                        size += len(chunk)
-                        if size > limit:
-                            raise AppError(
-                                "body_too_large", "Request body exceeds its size limit.", 413
-                            )
-                        chunks.append(chunk)
-                    request._body = b"".join(chunks)
-                    request.state.receipt_started = monotonic()
-                    parse_json(request._body)
-                response = await call_next(request)
+            seconds = (
+                5
+                if "/ingest/" in request.url.path
+                else 100
+                if "/operators" in request.url.path and request.method != "GET"
+                else 10
+            )
+            with request_budget(seconds):
+                async with asyncio.timeout(seconds):
+                    response = await handle(request, call_next)
         except TimeoutError:
-            response = error_response(request, unavailable("ingress_timeout"))
+            response = error_response(
+                request,
+                unavailable(
+                    "ingress_timeout" if "/ingest/" in request.url.path else "request_timeout"
+                ),
+            )
         except AppError as error:
             response = error_response(request, error)
         response.headers.update(
@@ -194,6 +144,66 @@ def create_http_app(lifespan, *, product=False):
             }
         )
         return response
+
+    async def handle(request, call_next):
+        from appchi.workload import permits_http
+
+        if not permits_http(request.app.state.settings, request.url.path):
+            raise AppError("not_found", "Resource unavailable.", 404)
+        if "/ingest/" in request.url.path or (
+            request.method in ("POST", "PUT", "PATCH", "DELETE")
+            and request.url.path.startswith("/api/")
+        ):
+            from appchi.clock_health import require_clock_health
+
+            # A queued check may read evidence published after request arrival.
+            # Validate freshness when the worker reads it; retain received_at for commands.
+            await asyncio.to_thread(require_clock_health, request.app.state.settings)
+        for key in request.query_params:
+            if len(request.query_params.getlist(key)) > 1:
+                raise AppError("duplicate_parameter", "Repeated query parameters are invalid.", 400)
+        for key in (
+            "idempotency-key",
+            "x-receipt-token",
+            "x-api-key",
+            "authorization",
+            "if-match",
+            "origin",
+            "x-csrf-token",
+        ):
+            if len(request.headers.getlist(key)) > 1:
+                raise AppError("duplicate_header", "Repeated security headers are invalid.", 400)
+        if request.method in ("POST", "PUT", "PATCH") and not request.url.path.startswith("/auth/"):
+            if request.headers.get("content-encoding", "identity") != "identity":
+                raise AppError(
+                    "unsupported_encoding",
+                    "Compressed request bodies are not accepted.",
+                    415,
+                )
+            if request.headers.get("content-type", "").split(";")[0].lower() != "application/json":
+                raise AppError("unsupported_media_type", "Use application/json.", 415)
+            limit = (
+                4 * 1024 * 1024
+                if "/ingest/" in request.url.path
+                else 512 * 1024
+                if request.url.path.endswith("/alerts/counts")
+                else 1024 * 1024
+                if "/correlation-rules" in request.url.path
+                else 256 * 1024
+                if "/maintenance" in request.url.path
+                else 65536
+            )
+            chunks = []
+            size = 0
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > limit:
+                    raise AppError("body_too_large", "Request body exceeds its size limit.", 413)
+                chunks.append(chunk)
+            request._body = b"".join(chunks)
+            request.state.receipt_started = monotonic()
+            parse_json(request._body)
+        return await call_next(request)
 
     @app.get("/livez", tags=["health"])
     def livez():

@@ -17,18 +17,24 @@ def runtime_guard(conn, deployment_epoch):
         # Keeping the check outside that transaction preserves caller-selected
         # REPEATABLE READ before its first domain query.
         with conn.transaction():
-            conn.execute("SET LOCAL statement_timeout = '4000ms'")
-            conn.execute("SET LOCAL lock_timeout = '2000ms'")
-            acquisition_started = True
-            acquired = conn.execute(
-                "SELECT pg_try_advisory_lock_shared(%s) AS acquired", (RESTORE_LOCK,)
-            ).fetchone()["acquired"]
+            # Batch network round trips, not SQL statements/snapshots. In READ
+            # COMMITTED the control read must take its snapshot after acquiring
+            # the session lock; combining both into one SELECT would be unsafe.
+            with conn.pipeline():
+                conn.execute("SET LOCAL statement_timeout = '4000ms'")
+                conn.execute("SET LOCAL lock_timeout = '2000ms'")
+                acquisition_started = True
+                acquisition = conn.execute(
+                    "SELECT pg_try_advisory_lock_shared(%s) AS acquired", (RESTORE_LOCK,)
+                )
+                control_read = conn.execute(
+                    "SELECT deployment_epoch,fenced FROM restore_control WHERE singleton"
+                )
+            acquired = acquisition.fetchone()["acquired"]
             acquisition_known = True
             if not acquired:
                 raise unavailable("restore_in_progress")
-            control = conn.execute(
-                "SELECT deployment_epoch,fenced FROM restore_control WHERE singleton"
-            ).fetchone()
+            control = control_read.fetchone()
             if not control or control["fenced"]:
                 raise unavailable("restore_reconciliation_required")
             if (
@@ -41,10 +47,12 @@ def runtime_guard(conn, deployment_epoch):
         if acquired:
             try:
                 with conn.transaction():
-                    conn.execute("SET LOCAL statement_timeout = '4000ms'")
-                    released = conn.execute(
-                        "SELECT pg_advisory_unlock_shared(%s) AS released", (RESTORE_LOCK,)
-                    ).fetchone()["released"]
+                    with conn.pipeline():
+                        conn.execute("SET LOCAL statement_timeout = '4000ms'")
+                        release = conn.execute(
+                            "SELECT pg_advisory_unlock_shared(%s) AS released", (RESTORE_LOCK,)
+                        )
+                    released = release.fetchone()["released"]
                     if not released:
                         raise unavailable("restore_guard_release_unproven")
             except Exception:

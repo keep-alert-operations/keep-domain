@@ -13,6 +13,8 @@ class WorkerHealth:
         self.role = role
         self.ready = False
         self.draining = False
+        self._last_attempt_at = None
+        self._last_attempt_state = None
 
     def publish(self, *, ready=None, draining=None):
         if ready is not None:
@@ -21,11 +23,24 @@ class WorkerHealth:
             self.draining = draining
         if self.path is None:
             return
+        now = monotonic()
+        current = (self.ready, self.draining)
+        if (
+            current == self._last_attempt_state
+            and self._last_attempt_at is not None
+            and 0 <= now - self._last_attempt_at < 1
+        ):
+            return
+        # Bound unchanged writes (including sharing-violation retries) without
+        # delaying state transitions. Only successful replacement refreshes the
+        # probe file, so persistent failures still expire its old heartbeat.
+        self._last_attempt_at = now
+        self._last_attempt_state = current
         state = {
             "version": 1,
             "pid": os.getpid(),
             "role": self.role,
-            "heartbeat": monotonic(),
+            "heartbeat": now,
             "ready": self.ready,
             "draining": self.draining,
         }

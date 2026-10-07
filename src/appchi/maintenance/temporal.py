@@ -271,6 +271,7 @@ def reduce_alert(
     proof_complete: bool,
     max_work: int = 10000,
     source_release_since: datetime | None = None,
+    per_input_budget: bool = False,
 ) -> Reduction:
     """Rebuild retained cause proof without mutating a newer materialized alert.
 
@@ -282,7 +283,10 @@ def reduce_alert(
     _aware(recorded_at)
     if not proof_complete or not transitions:
         raise MaintenanceProofError("maintenance_complete_timeline_required")
-    if len(segments) * len(transitions) + len(segments) + len(transitions) > max_work:
+    if (
+        not per_input_budget
+        and len(segments) * len(transitions) + len(segments) + len(transitions) > max_work
+    ):
         raise MaintenanceProofError("maintenance_work_allocation_exceeded")
     if len({segment.id for segment in segments}) != len(segments):
         raise MaintenanceProofError("duplicate_maintenance_segment")
@@ -339,6 +343,14 @@ def reduce_alert(
 
     for transition in ordered:
         boundary = transition.boundary
+        if (
+            per_input_budget
+            and 2
+            * sum(str(segment.id) in active or segment.covers(boundary) for segment in segments)
+            + 1
+            > max_work
+        ):
+            raise MaintenanceProofError("maintenance_work_allocation_exceeded")
         for segment in segments:
             end, _ = segment.termination
             if end.at <= boundary.at:

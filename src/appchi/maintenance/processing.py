@@ -32,6 +32,9 @@ class Catalog:
     inline_correlation: object | None = None
     inline_requested: bool = False
     source_release_since: datetime | None = None
+    history_complete: bool = True
+    replays: object | None = None
+    require_preparation: bool = False
 
 
 @dataclass(frozen=True)
@@ -91,7 +94,17 @@ def suppression_at(conn, tenant_id, alert_id, effective_at, original_order):
     )
 
 
-def prepare_catalog(database, tenant_id, *, max_work, max_inputs, max_segments):
+def prepare_catalog(
+    database,
+    tenant_id,
+    *,
+    max_work,
+    max_inputs,
+    max_segments,
+    alert_id=None,
+    effective_at=None,
+    alert_ids=(),
+):
     """Bounded DB snapshot followed by native CEL compilation outside locks."""
     if min(max_work, max_inputs, max_segments) < 1:
         raise ValueError("explicit positive qualified work allocations are required")
@@ -99,14 +112,66 @@ def prepare_catalog(database, tenant_id, *, max_work, max_inputs, max_segments):
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         conn.execute("SELECT set_config('appchi.tenant_id',%s,true)", (str(tenant_id),))
         state = conn.execute(
-            "SELECT maintenance_generation,(SELECT source_release_since FROM application_scope WHERE singleton) AS source_release_since FROM tenant_view_state WHERE tenant_id=%s",
+            "SELECT maintenance_generation,clock_timestamp() AS prepared_at,(SELECT source_release_since FROM application_scope WHERE singleton) AS source_release_since FROM tenant_view_state WHERE tenant_id=%s",
             (tenant_id,),
         ).fetchone()
+        targets = tuple(
+            dict.fromkeys(
+                [str(value) for value in alert_ids] + ([str(alert_id)] if alert_id else [])
+            )
+        )
+        previous = (
+            conn.execute(
+                "SELECT continuation FROM maintenance_alert_checkpoints WHERE tenant_id=%s AND alert_id=ANY(%s::uuid[])",
+                (tenant_id, list(targets)),
+            ).fetchall()
+            if targets
+            else []
+        )
+        continuations = [row["continuation"] for row in previous]
+        at = effective_at or state["prepared_at"]
+        floor = None
+        active_ids = []
+        if (
+            targets
+            and len(continuations) == len(targets)
+            and all(
+                continuation
+                and continuation.get("version") in (1, "1", 2, "2")
+                and int(continuation["generation"]) == state["maintenance_generation"]
+                and at > datetime.fromisoformat(continuation.get("max_at", continuation["last_at"]))
+                for continuation in continuations
+            )
+        ):
+            floor = min(
+                datetime.fromisoformat(continuation.get("max_at", continuation["last_at"]))
+                for continuation in continuations
+            )
+            active_ids = list(
+                {
+                    cause["segment_id"]
+                    for continuation in continuations
+                    for cause in continuation["causes"]
+                    if cause["segment_id"]
+                }
+            )
+        elif not targets and effective_at is not None:
+            # An explicitly identified new alert has no preceding causes.
+            floor = effective_at
         rows = conn.execute(
-            "SELECT * FROM maintenance_segments WHERE tenant_id=%s ORDER BY activation_at,activation_order,id LIMIT %s",
-            (tenant_id, max_segments + 1),
+            """SELECT * FROM maintenance_segments WHERE tenant_id=%s
+            AND (%s::timestamptz IS NULL
+              OR LEAST(end_at,COALESCE(deactivation_at,end_at))>=%s OR id=ANY(%s::uuid[]))
+            ORDER BY activation_at,activation_order,id""",
+            (tenant_id, floor, floor, active_ids),
         ).fetchall()
-    if not state or len(rows) > max_segments:
+    active_count = sum(
+        row["start_at"] <= at < row["end_at"]
+        and row["activation_at"] < at
+        and row["deactivation_id"] is None
+        for row in rows
+    )
+    if not state or active_count > max_segments:
         raise unavailable("maintenance_catalog_allocation_exceeded")
     programs, segments = {}, []
     for row in rows:
@@ -149,6 +214,7 @@ def prepare_catalog(database, tenant_id, *, max_work, max_inputs, max_segments):
         max_work,
         max_inputs,
         source_release_since=state["source_release_since"],
+        history_complete=floor is None,
     )
 
 
@@ -291,17 +357,182 @@ def reconcile_alert(conn, current, processing_now, *, catalog):
     """
     tenant, alert_id = current["tenant_id"], UUID(str(current["id"]))
     _check_catalog(conn, tenant, catalog)
-    rows = conn.execute(
-        "SELECT * FROM maintenance_alert_inputs WHERE tenant_id=%s AND alert_id=%s ORDER BY original_order LIMIT %s",
-        (tenant, alert_id, catalog.max_inputs + 1),
-    ).fetchall()
-    if len(rows) > catalog.max_inputs:
-        raise MaintenanceProofError("maintenance_input_allocation_exceeded")
-    head = conn.execute(
-        "SELECT input_revision FROM maintenance_alert_input_heads WHERE tenant_id=%s AND alert_id=%s",
+    prior = conn.execute(
+        "SELECT * FROM maintenance_alert_checkpoints WHERE tenant_id=%s AND alert_id=%s FOR UPDATE",
         (tenant, alert_id),
     ).fetchone()
-    if rows and (not head or head["input_revision"] != len(rows)):
+    head = conn.execute(
+        "SELECT input_revision,last_input_id FROM maintenance_alert_input_heads WHERE tenant_id=%s AND alert_id=%s",
+        (tenant, alert_id),
+    ).fetchone()
+    from .incremental import advance, checkpoint
+
+    continuation = prior and prior.get("continuation")
+    incremental = False
+    result = None
+    rows = []
+    prepared = (catalog.replays or {}).get(alert_id)
+    if (
+        prepared is not None
+        and not prepared.predicted
+        and head
+        and head["input_revision"] > prepared.input_revision
+        and head["input_revision"] <= catalog.max_inputs
+        and catalog.history_complete
+        and catalog.source_release_since is not None
+        and processing_now < catalog.source_release_since
+    ):
+        # Retained pre-cutover commands use timer-release semantics, which a
+        # post-cutover continuation intentionally cannot advance. Recompute this
+        # small legacy timeline exactly from locked SQL authority; do not reject
+        # a valid command merely because its baseline was prepared off-lock.
+        # Large timelines and all current post-cutover work still require the
+        # normal fenced preparation/continuation path.
+        prepared = None
+    prepared_history = None
+    if prepared is not None:
+        latest = (
+            conn.execute(
+                "SELECT * FROM maintenance_alert_inputs WHERE tenant_id=%s AND alert_id=%s AND id=%s",
+                (tenant, alert_id, head["last_input_id"]),
+            ).fetchone()
+            if head
+            else None
+        )
+        if (
+            prepared.predicted
+            and head
+            and head["input_revision"] == prepared.input_revision
+            and latest
+        ):
+            from .preparation import bind_source
+
+            prepared = bind_source(prepared, latest, alert_id)
+        if (
+            head
+            and head["input_revision"] == prepared.input_revision
+            and head["last_input_id"] == prepared.last_id
+            and latest
+            and bytes(latest["request_digest"]) == prepared.last_digest
+        ):
+            result, continuation = prepared.result, prepared.continuation
+        elif (
+            head
+            and not prepared.predicted
+            and latest
+            and head["input_revision"] == prepared.input_revision + 1
+        ):
+            baseline_intervals = prepared.history_intervals[-1:]
+            advanced = advance(
+                alert_id,
+                prepared.continuation,
+                baseline_intervals,
+                AlertTransition(
+                    Boundary(latest["effective_at"], latest["original_order"], str(latest["id"])),
+                    latest["before_snapshot"],
+                    latest["after_snapshot"],
+                    latest["new_logical_alert"],
+                    latest["source_suppressed"],
+                    latest["kind"],
+                ),
+                catalog.segments,
+                now=processing_now,
+                generation=catalog.generation,
+                source_release_since=catalog.source_release_since,
+                max_work=catalog.max_work,
+            )
+            if advanced is None:
+                raise unavailable("maintenance_preparation_changed")
+            result, continuation = advanced
+            causes = {cause.id: cause for cause in prepared.result.causes}
+            causes.update({cause.id: cause for cause in result.causes})
+            proofs = {item[0]: item for item in prepared.result.qualifier_inputs}
+            proofs.update({item[0]: item for item in result.qualifier_inputs})
+            result = replace(
+                result,
+                causes=tuple(causes.values()),
+                final_unsuppression_qualifiers=tuple(proofs),
+                qualifier_inputs=tuple(proofs.values()),
+            )
+            rows = [latest]
+        else:
+            raise unavailable("maintenance_preparation_changed")
+        if result.final_snapshot != _snapshot(current):
+            raise unavailable("maintenance_preparation_changed")
+        prepared_history = list(prepared.history_intervals)
+        tail = wire([{"start": item.start, "end": item.end} for item in result.effective_intervals])
+        if tail and prepared_history and tail[0]["start"] == prepared_history[-1]["start"]:
+            prepared_history[-1:] = tail
+        elif tail:
+            prepared_history.extend(tail)
+        incremental = True
+    if (
+        not incremental
+        and continuation
+        and continuation.get("version") in (1, "1", 2, "2")
+        and int(continuation["generation"]) == catalog.generation
+    ):
+        rows = conn.execute(
+            """SELECT * FROM maintenance_alert_inputs WHERE tenant_id=%s AND alert_id=%s
+            AND original_order>%s ORDER BY original_order LIMIT %s""",
+            (tenant, alert_id, continuation["last_order"], catalog.max_inputs + 1),
+        ).fetchall()
+        if not rows and head and prior["input_revision"] == head["input_revision"]:
+            if continuation["snapshot"] != _snapshot(current):
+                raise MaintenanceProofError("maintenance_current_snapshot_unproven")
+            return dict(current, suppressed=prior["current_suppressed"]), Effects(
+                bool(current.get("suppressed")) != prior["current_suppressed"],
+                False,
+                (),
+                (),
+                bytes(prior["proof_digest"]),
+            )
+        if len(rows) == 1 and head and head["input_revision"] == prior["input_revision"] + 1:
+            row = rows[0]
+            advanced = advance(
+                alert_id,
+                continuation,
+                prior["union_intervals"],
+                AlertTransition(
+                    Boundary(row["effective_at"], row["original_order"], str(row["id"])),
+                    row["before_snapshot"],
+                    row["after_snapshot"],
+                    row["new_logical_alert"],
+                    row["source_suppressed"],
+                    row["kind"],
+                ),
+                catalog.segments,
+                now=processing_now,
+                generation=catalog.generation,
+                source_release_since=catalog.source_release_since,
+                max_work=catalog.max_work,
+            )
+            if advanced is not None:
+                result, continuation = advanced
+                incremental = True
+    if not incremental:
+        if not catalog.history_complete and prior is not None:
+            # A concurrent source changed the prepared predecessor. Retry
+            # preparation outside write locks, with the now-current checkpoint.
+            raise unavailable("maintenance_catalog_changed")
+        if catalog.require_preparation and head and head["input_revision"] > catalog.max_inputs:
+            # Live callers prepare a fenced historical result before acquiring
+            # writer locks. A stale/missing preparation retains the operation
+            # for retry; this is not a maximum lifetime accepted-input count.
+            raise unavailable("maintenance_preparation_required")
+        rows = []
+        position = 0
+        while True:
+            page = conn.execute(
+                """SELECT * FROM maintenance_alert_inputs WHERE tenant_id=%s AND alert_id=%s
+                AND original_order>%s ORDER BY original_order LIMIT %s""",
+                (tenant, alert_id, position, catalog.max_inputs),
+            ).fetchall()
+            rows.extend(page)
+            if len(page) < catalog.max_inputs:
+                break
+            position = page[-1]["original_order"]
+    if rows and not incremental and (not head or head["input_revision"] != len(rows)):
         raise MaintenanceProofError("maintenance_input_head_mismatch")
     transitions = tuple(
         AlertTransition(
@@ -314,7 +545,7 @@ def reconcile_alert(conn, current, processing_now, *, catalog):
         )
         for row in rows
     )
-    result = reduce_alert(
+    result = result or reduce_alert(
         alert_id,
         catalog.segments,
         transitions,
@@ -323,13 +554,18 @@ def reconcile_alert(conn, current, processing_now, *, catalog):
         proof_complete=bool(rows and rows[0]["new_logical_alert"]),
         max_work=catalog.max_work,
         source_release_since=catalog.source_release_since,
+        per_input_budget=True,
     )
     if result.final_snapshot != _snapshot(current):
         raise MaintenanceProofError("maintenance_current_snapshot_unproven")
-    prior = conn.execute(
-        "SELECT * FROM maintenance_alert_checkpoints WHERE tenant_id=%s AND alert_id=%s FOR UPDATE",
-        (tenant, alert_id),
-    ).fetchone()
+    if not incremental:
+        continuation = checkpoint(
+            result,
+            rows[-1],
+            generation=catalog.generation,
+            source_release_since=catalog.source_release_since,
+            max_at=max(row["effective_at"] for row in rows),
+        )
     intervals = wire(
         [{"start": interval.start, "end": interval.end} for interval in result.effective_intervals]
     )
@@ -349,6 +585,10 @@ def reconcile_alert(conn, current, processing_now, *, catalog):
             for item in result.causes
         ],
     }
+    if incremental:
+        evidence["predecessor"] = (
+            prepared.digest if prepared is not None else bytes(prior["proof_digest"])
+        ).hex()
     digest = hashlib.sha256(canonical(evidence)).digest()
     changed = False
     for item in result.causes:
@@ -405,21 +645,27 @@ def reconcile_alert(conn, current, processing_now, *, catalog):
                 ),
             ).fetchone()
             changed = changed or inserted is not None
-    if prior is None or prior["union_intervals"] != intervals:
+    if (
+        prior is None
+        or prior["union_intervals"] != intervals
+        or prepared is not None
+        and (prepared.result.causes or prepared.withdrawn)
+    ):
         previous_union = conn.execute(
             "SELECT id FROM maintenance_union_history WHERE tenant_id=%s AND alert_id=%s ORDER BY recorded_at DESC,id DESC LIMIT 1",
             (tenant, alert_id),
         ).fetchone()
         conn.execute(
-            "INSERT INTO maintenance_union_history(tenant_id,alert_id,id,proof_digest,effective_intervals,recorded_at,corrects_id) VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+            "INSERT INTO maintenance_union_history(tenant_id,alert_id,id,proof_digest,effective_intervals,recorded_at,corrects_id,representation) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
             (
                 tenant,
                 alert_id,
                 uuid5(alert_id, "union:" + digest.hex()),
                 digest,
-                Jsonb(intervals),
+                Jsonb(prepared_history if prepared_history is not None else intervals),
                 processing_now,
                 previous_union["id"] if previous_union else None,
+                "tail" if incremental and prepared is None else "full",
             ),
         )
     qualifiers = {
@@ -429,8 +675,16 @@ def reconcile_alert(conn, current, processing_now, *, catalog):
     previous_qualifiers = {
         row["id"]: row
         for row in conn.execute(
-            "SELECT * FROM maintenance_qualifier_effects WHERE tenant_id=%s AND alert_id=%s",
-            (tenant, alert_id),
+            """SELECT * FROM maintenance_qualifier_effects WHERE tenant_id=%s AND alert_id=%s
+            AND (%s OR id=ANY(%s::uuid[]))""",
+            (
+                tenant,
+                alert_id,
+                not incremental,
+                list(
+                    set(qualifiers) | (set(prepared.withdrawn) if prepared is not None else set())
+                ),
+            ),
         ).fetchall()
     }
     new = []
@@ -474,8 +728,8 @@ def reconcile_alert(conn, current, processing_now, *, catalog):
         )
     suppressed = bool(result.current_causes)
     conn.execute(
-        """INSERT INTO maintenance_alert_checkpoints(tenant_id,alert_id,proof_digest,catalog_generation,current_suppressed,current_cause_ids,union_intervals,complete,checked_at,input_revision)
-        VALUES(%s,%s,%s,%s,%s,%s,%s,true,%s,%s) ON CONFLICT(tenant_id,alert_id) DO UPDATE SET proof_digest=EXCLUDED.proof_digest,catalog_generation=EXCLUDED.catalog_generation,current_suppressed=EXCLUDED.current_suppressed,current_cause_ids=EXCLUDED.current_cause_ids,union_intervals=EXCLUDED.union_intervals,complete=true,checked_at=EXCLUDED.checked_at,input_revision=EXCLUDED.input_revision""",
+        """INSERT INTO maintenance_alert_checkpoints(tenant_id,alert_id,proof_digest,catalog_generation,current_suppressed,current_cause_ids,union_intervals,complete,checked_at,input_revision,continuation)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,true,%s,%s,%s) ON CONFLICT(tenant_id,alert_id) DO UPDATE SET proof_digest=EXCLUDED.proof_digest,catalog_generation=EXCLUDED.catalog_generation,current_suppressed=EXCLUDED.current_suppressed,current_cause_ids=EXCLUDED.current_cause_ids,union_intervals=EXCLUDED.union_intervals,complete=true,checked_at=EXCLUDED.checked_at,input_revision=EXCLUDED.input_revision,continuation=EXCLUDED.continuation""",
         (
             tenant,
             alert_id,
@@ -483,9 +737,10 @@ def reconcile_alert(conn, current, processing_now, *, catalog):
             catalog.generation,
             suppressed,
             Jsonb(list(result.current_causes)),
-            Jsonb(intervals),
+            Jsonb(intervals[-1:]),
             processing_now,
             head["input_revision"],
+            Jsonb(continuation),
         ),
     )
     adjusted = dict(current, suppressed=suppressed)
