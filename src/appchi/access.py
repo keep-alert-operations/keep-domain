@@ -19,14 +19,25 @@ def effective_role(conn, principal, tenant):
 
 
 def accessible_tenants(conn, principal):
-    # Filtering takes place in SQL before pagination; inherited access never trusts browser claims.
-    rows = conn.execute(
-        "SELECT t.* FROM tenants t WHERE %s OR t.kind='global' OR EXISTS(SELECT 1 FROM tenant_grants g WHERE g.tenant_id=t.id AND (g.principal_id=%s OR g.principal_id IN (SELECT team_id FROM directory_memberships WHERE user_id=%s))) ORDER BY (t.kind='global') DESC,t.name_key,t.id",
-        (principal["super_admin"], principal["id"], principal["id"]),
+    # Resolve inherited/direct grants and highest-role precedence in one query.
+    if not principal["eligible"] or principal.get("deleted"):
+        return []
+    return conn.execute(
+        """WITH roles AS (
+            SELECT tenant_id, max(CASE role WHEN 'admin' THEN 3
+                WHEN 'edit' THEN 2 ELSE 1 END) AS rank
+            FROM tenant_grants
+            WHERE principal_id=%s OR principal_id IN (
+                SELECT team_id FROM directory_memberships WHERE user_id=%s)
+            GROUP BY tenant_id
+        )
+        SELECT t.*, CASE WHEN %s THEN 'admin' WHEN t.kind='global' THEN 'edit'
+            WHEN r.rank=3 THEN 'admin' WHEN r.rank=2 THEN 'edit' ELSE 'view' END AS role
+        FROM tenants t LEFT JOIN roles r ON r.tenant_id=t.id
+        WHERE %s OR t.kind='global' OR r.rank IS NOT NULL
+        ORDER BY (t.kind='global') DESC,t.name_key,t.id""",
+        (principal["id"], principal["id"], principal["super_admin"], principal["super_admin"]),
     ).fetchall()
-    for row in rows:
-        row["role"] = effective_role(conn, principal, row["id"])
-    return rows
 
 
 def authorize(conn, request, tenant, minimum="view", mutation=False):

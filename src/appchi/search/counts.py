@@ -10,6 +10,14 @@ from appchi.cel import CompiledExpression
 from appchi.cel.compiler import PROFILE
 from appchi.shared.errors import AppError, unavailable
 from .projection import assert_complete
+from .text import query_tokens
+
+
+@dataclass(frozen=True)
+class CountQuery:
+    expression: CompiledExpression
+    q: str = ""
+    include_suppressed: bool = False
 
 
 @dataclass(frozen=True)
@@ -56,7 +64,7 @@ class CountReader:
 
     def read(
         self,
-        expressions: dict[str, CompiledExpression],
+        expressions: dict[str, CompiledExpression | CountQuery],
         tenant_id: str,
         *,
         evaluated_at: datetime,
@@ -84,10 +92,16 @@ class CountReader:
             # Identical query/profile contexts, even distinct preset IDs, need
             # one ES subsearch; every output key still receives its own result.
             unique, positions = {}, {}
-            for key, expression in expressions.items():
-                context = (PROFILE, expression.source)
+            for key, item in expressions.items():
+                query = item if isinstance(item, CountQuery) else CountQuery(item)
+                context = (
+                    PROFILE,
+                    query.expression.source,
+                    tuple(query_tokens(query.q)),
+                    query.include_suppressed,
+                )
                 if context not in unique:
-                    unique[context] = expression
+                    unique[context] = query
                 positions[key] = list(unique).index(context)
             totals = []
             if unique:
@@ -103,7 +117,13 @@ class CountReader:
                     raise unavailable("search_snapshot_unavailable")
                 pit = opened["id"]
                 searches = []
-                for expression in unique.values():
+                for query in unique.values():
+                    scoped = query.expression.scoped_query(
+                        tenant_id, evaluated_at, include_suppressed=query.include_suppressed
+                    )
+                    scoped["bool"]["filter"].extend(
+                        {"term": {"search_tokens": term}} for term in query_tokens(query.q)
+                    )
                     searches.extend(
                         [
                             {"allow_partial_search_results": False},
@@ -112,7 +132,7 @@ class CountReader:
                                 "size": 0,
                                 "track_total_hits": True,
                                 "timeout": f"{max(1, int(remaining() * 1000))}ms",
-                                "query": expression.scoped_query(tenant_id, evaluated_at),
+                                "query": scoped,
                             },
                         ]
                     )

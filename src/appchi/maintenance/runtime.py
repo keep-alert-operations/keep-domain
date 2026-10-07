@@ -30,14 +30,71 @@ class InlineCorrelation:
     prepared: object
 
 
-def prepare_for_tenant(database, tenant, profile, *, inline=True):
-    with database.transaction(tenant) as conn:
-        gate = conn.execute(
-            "SELECT ready FROM capability_gates WHERE capability='maintenance'"
-        ).fetchone()
-    if not gate or not gate["ready"]:
+def prepare_for_tenant(
+    database,
+    tenant,
+    profile,
+    *,
+    inline=True,
+    alert_id=None,
+    effective_at=None,
+    source_item=None,
+    alert_ids=(),
+    gate_ready=None,
+):
+    # A caller may reuse a gate read from its immediately preceding guarded
+    # replay-precheck transaction. Mutation still rechecks the live gate under
+    # its normal writer scope; this is not a cache or an authorization bypass.
+    if gate_ready is None:
+        with database.transaction(tenant) as conn:
+            gate = conn.execute(
+                "SELECT ready FROM capability_gates WHERE capability='maintenance'"
+            ).fetchone()
+        gate_ready = bool(gate and gate["ready"])
+    elif type(gate_ready) is not bool:
+        raise ValueError("gate_ready must be an observed boolean")
+    if not gate_ready:
         return None
-    catalog = prepare_qualified_catalog(database, tenant, profile)
+    targets = tuple(
+        dict.fromkeys([str(value) for value in alert_ids] + ([str(alert_id)] if alert_id else []))
+    )
+    catalog = prepare_qualified_catalog(
+        database, tenant, profile, alert_id=alert_id, effective_at=effective_at, alert_ids=targets
+    )
+    if targets:
+        from .preparation import prepare_replay
+
+        replays = {}
+        with database.transaction(tenant) as conn:
+            previous = {
+                str(row["alert_id"]): row["continuation"]
+                for row in conn.execute(
+                    "SELECT alert_id,continuation FROM maintenance_alert_checkpoints WHERE tenant_id=%s AND alert_id=ANY(%s::uuid[])",
+                    (tenant, list(targets)),
+                )
+            }
+            at = effective_at or conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
+        for target in targets:
+            continuation = previous.get(target)
+            from datetime import datetime
+
+            needs_replay = (
+                not continuation
+                or continuation.get("version") not in (1, "1", 2, "2")
+                or int(continuation["generation"]) != catalog.generation
+                or continuation.get("source_release_since") != wire(catalog.source_release_since)
+                or catalog.source_release_since is None
+                or at < catalog.source_release_since
+                or at <= datetime.fromisoformat(continuation.get("max_at", continuation["last_at"]))
+            )
+            if needs_replay:
+                if not catalog.history_complete:
+                    catalog = prepare_qualified_catalog(database, tenant, profile)
+                replay = prepare_replay(database, catalog, target, source_item=source_item)
+                if replay is not None:
+                    replays[UUID(target)] = replay
+        catalog = replace(catalog, replays=replays)
+    catalog = replace(catalog, require_preparation=True)
     if inline:
         catalog = replace(catalog, inline_requested=True)
         with database.transaction(tenant) as conn:
@@ -55,15 +112,19 @@ def prepare_for_tenant(database, tenant, profile, *, inline=True):
                 tenant,
                 profile,
                 maintenance_input=catalog,
+                alert_ids=targets,
                 allow_local_preview=bool(profile and profile.get("correlation_preview")),
             )
             catalog = replace(
-                catalog, inline_correlation=InlineCorrelation(database, profile, prepared)
+                prepared.maintenance,
+                inline_correlation=InlineCorrelation(database, profile, prepared),
             )
     return catalog
 
 
-def prepare_qualified_catalog(database, tenant, profile):
+def prepare_qualified_catalog(
+    database, tenant, profile, *, alert_id=None, effective_at=None, alert_ids=()
+):
     """Compile with a qualified budget, including offline proof warmup."""
     names = ("maintenance_max_work", "maintenance_max_inputs", "maintenance_max_segments")
     if (
@@ -78,6 +139,9 @@ def prepare_qualified_catalog(database, tenant, profile):
         max_work=profile[names[0]],
         max_inputs=profile[names[1]],
         max_segments=profile[names[2]],
+        alert_id=alert_id,
+        effective_at=effective_at,
+        alert_ids=alert_ids,
     )
 
 
@@ -99,7 +163,13 @@ def lock_catalog(conn, catalog, *, targets=(), incidents=()):
     )
     if not tenant:
         raise unavailable("maintenance_tenant_scope_required")
-    lock_contexts(conn, tenant)
+    lock_contexts(
+        conn,
+        tenant,
+        targets=targets,
+        incidents=incidents,
+        live=bool(catalog and catalog.inline_correlation),
+    )
     if (
         catalog
         and catalog.inline_requested

@@ -6,18 +6,23 @@ wall-clock deadline. No parsed-only expression is ever evaluated.
 
 from __future__ import annotations
 
-from functools import lru_cache
+from collections import OrderedDict
+from concurrent.futures import Future
+from threading import Condition
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
+import logging
 import multiprocessing
 import re
+from time import monotonic
 from typing import Any
 from uuid import UUID
 
 from .catalog import FIELDS, RULE_FIELDS, storage_name
 from appchi.alerts.presentation import display_status
+from appchi.request_budget import remaining
 
 PROFILE = "appchi-cel-v1"
 COST_MODEL = "appchi-cel-cost-v1"
@@ -41,6 +46,7 @@ STRING_METHODS = ("startsWith", "endsWith", "contains")
 TIME_LITERAL_FUNCTIONS = ("timestamp", "duration")
 NOW_FUNCTION = "now"
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+log = logging.getLogger(__name__)
 
 
 class CELValidationError(ValueError):
@@ -616,19 +622,98 @@ def compile_expression(source: str, *, rule: bool = False) -> CompiledExpression
     return CompiledExpression(source, ir, fields, bounds, checked, nodes, lowered)
 
 
-@lru_cache(maxsize=256)
+class _CompileCache:
+    """Bound checked-data retention and share concurrent same-key cold work.
+
+    The condition protects metadata only. Native compilation and followers wait
+    outside it, so a slow cold key cannot block hits for other expressions.
+    Failed compilation is shared with current followers but is never cached.
+    """
+
+    def __init__(self, capacity=256):
+        self.capacity = capacity
+        self.ready = OrderedDict()
+        self.pending = {}
+        self.condition = Condition()
+
+    def get(self, key, compile_one):
+        with self.condition:
+            while True:
+                remaining()
+                if key in self.ready:
+                    self.ready.move_to_end(key)
+                    return self.ready[key]
+                future = self.pending.get(key)
+                if future is not None:
+                    owner = False
+                    break
+                if len(self.pending) < self.capacity:
+                    future = Future()
+                    self.pending[key] = future
+                    owner = True
+                    break
+                # Bound bookkeeping for a burst of different expressions too.
+                # Hits and existing-key followers bypass this admission wait.
+                self.condition.wait(timeout=remaining())
+        if not owner:
+            while True:
+                try:
+                    value = future.result(timeout=remaining())
+                    break
+                except TimeoutError:
+                    if future.done():
+                        # A completed owner may itself have raised TimeoutError.
+                        # Preserve that exception (and concurrent completion).
+                        value = future.result()
+                        break
+                    # Timed waits can wake just before the monotonic deadline.
+                    # Recompute the same budget rather than leak that wakeup or
+                    # cancel shared work that can still warm the cache.
+                    remaining()
+            remaining()
+            return value
+        try:
+            value = compile_one()
+        except BaseException as error:
+            with self.condition:
+                future.set_exception(error)
+                del self.pending[key]
+                self.condition.notify_all()
+            raise
+        with self.condition:
+            self.ready[key] = value
+            self.ready.move_to_end(key)
+            if len(self.ready) > self.capacity:
+                self.ready.popitem(last=False)
+            future.set_result(value)
+            del self.pending[key]
+            self.condition.notify_all()
+        return value
+
+
+_checked_cache = _CompileCache()
+
+
 def _compile_checked(source: str, rule: bool):
+    return _checked_cache.get((source, rule), lambda: _compile_native(source, rule))
+
+
+def _compile_native(source: str, rule: bool):
+    started = monotonic()
     context = multiprocessing.get_context("spawn")
     receive, send = context.Pipe(duplex=False)
     process = context.Process(target=_compile_worker, args=(send, source, rule), daemon=True)
     process.start()
     send.close()
+    reason = "child_unavailable"
     try:
         if not receive.poll(COMPILE_TIMEOUT_SECONDS):
+            reason = "deadline"
             raise CELUnavailableError("CEL compiler exceeded one-second deadline")
         try:
             message = receive.recv()
         except EOFError as exc:
+            reason = "worker_crashed"
             raise CELUnavailableError("CEL compiler worker crashed") from exc
         if message[0] == "invalid":
             raise CELValidationError(message[1], message[2])
@@ -636,6 +721,17 @@ def _compile_checked(source: str, rule: bool):
             raise CELUnavailableError(message[1])
         _, ir, fields, bounds, checked, nodes, lowered = message
         return ir, fields, bounds, checked, nodes, lowered
+    except CELUnavailableError:
+        # Child error text can contain expression text or local paths. Emit only
+        # fixed categories and operational metadata, retaining the original error.
+        log.warning(
+            "cel_compile_unavailable reason=%s elapsed_ms=%d rule=%s child_exit_code=%s",
+            reason,
+            round((monotonic() - started) * 1000),
+            rule,
+            process.exitcode,
+        )
+        raise
     finally:
         receive.close()
         process.join(timeout=0.02)

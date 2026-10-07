@@ -43,6 +43,7 @@ class FeedPage:
     watermark: dict
     observed: dict
     updating: bool
+    close_token: str | None = None
 
 
 def sort_spec(name: str, direction: str) -> list[dict]:
@@ -103,6 +104,21 @@ class SearchReader:
     def dispose(self, token: str, scope: SearchScope):
         self.authorize(scope)
         value = self._open_cursor(token, scope)
+        self._close(value["pit"])
+
+    @staticmethod
+    def _cleanup_scope(scope):
+        # Preview cursors also bind query/revision. Cleanup may only close a
+        # snapshot, so its independent token binds the base session and tenant.
+        return SearchScope(
+            scope.tenant_id, scope.visibility.split(":preview:", 1)[0], scope.deployment_epoch
+        )
+
+    def close_snapshot(self, token: str, scope: SearchScope):
+        self.authorize(scope)
+        value = self._open_cursor(token, self._cleanup_scope(scope))
+        if value.get("purpose") != "close":
+            raise AppError("invalid_cursor", "A snapshot cleanup token is required", 409)
         self._close(value["pit"])
 
     def _close(self, pit: str):
@@ -230,9 +246,13 @@ class SearchReader:
             snapshot["pit"] = current_pit
             snapshot["seen"] += len(hits)
             next_cursor = None
+            close_token = None
             if hits and snapshot["seen"] < total["value"]:
                 snapshot["after"] = hits[-1]["sort"]  # last examined, even when purged
                 next_cursor = self._seal_cursor(snapshot, scope)
+                close_token = self._seal_cursor(
+                    {"purpose": "close", "pit": current_pit}, self._cleanup_scope(scope)
+                )
             else:
                 self._close(current_pit)
             if replace_cursor and not cursor:
@@ -245,6 +265,7 @@ class SearchReader:
                 snapshot["watermark"],
                 asdict(observed),
                 purged or snapshot["watermark"]["searchable_seq"] < observed.committed_seq,
+                close_token,
             )
         except AppError:
             if current_pit and newly_opened:

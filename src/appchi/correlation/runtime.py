@@ -31,17 +31,44 @@ from .evidence import (
     apply_all,
     choose_decision,
     replay_alert,
+    group_key,
 )
 
 
-def lock_contexts(conn, tenant):
-    """All ownership writers call after coordinator, before incident/alert locks."""
+def lock_contexts(conn, tenant, *, targets=None, incidents=(), live=True):
+    """Lock live decision contexts after the tenant coordinator.
+
+    Dormant historical groups cannot participate in arbitration. Their reset
+    proof is still read by exact group when needed; the coordinator excludes
+    concurrent tenant mutations while a dormant group becomes relevant again.
+    """
     conn.execute(
-        "SELECT id FROM correlation_rules WHERE tenant_id=%s ORDER BY id FOR UPDATE", (tenant,)
+        "SELECT id FROM correlation_rules WHERE tenant_id=%s AND enabled AND deleted_at IS NULL ORDER BY id FOR UPDATE",
+        (tenant,),
     ).fetchall()
     conn.execute(
-        "SELECT id FROM correlation_contexts WHERE tenant_id=%s ORDER BY rule_id,grouping_generation,group_key,id FOR UPDATE",
-        (tenant,),
+        """WITH relevant AS (
+          SELECT id FROM correlation_contexts WHERE tenant_id=%s AND %s AND active_incident_id IS NOT NULL
+          UNION SELECT e.context_id FROM correlation_evidence e JOIN correlation_rules r
+            ON r.tenant_id=e.tenant_id AND r.id=e.rule_id AND r.epoch=e.epoch
+            WHERE e.tenant_id=%s AND %s AND e.expires_at>clock_timestamp()
+          UNION SELECT context_id FROM incidents WHERE tenant_id=%s AND id=ANY(%s::uuid[])
+          UNION SELECT i.context_id FROM incident_alert_links l JOIN incidents i
+            ON i.tenant_id=l.tenant_id AND i.id=l.incident_id
+            WHERE l.tenant_id=%s AND l.alert_id=ANY(%s::uuid[]) AND l.unlinked_at IS NULL)
+        SELECT c.id FROM relevant r JOIN correlation_contexts c ON c.id=r.id
+        WHERE c.tenant_id=%s ORDER BY c.rule_id,c.grouping_generation,c.group_key,c.id FOR UPDATE OF c""",
+        (
+            tenant,
+            targets is None,
+            tenant,
+            live,
+            tenant,
+            list(incidents),
+            tenant,
+            list(targets or ()),
+            tenant,
+        ),
     ).fetchall()
 
 
@@ -103,7 +130,9 @@ class Prepared:
     maintenance: object
 
 
-def prepare_tenant(database, tenant, profile, *, allow_local_preview=False, maintenance_input=None):
+def prepare_tenant(
+    database, tenant, profile, *, allow_local_preview=False, maintenance_input=None, alert_ids=()
+):
     from appchi.maintenance.runtime import prepare_for_tenant
 
     limits = repo.limits(profile, allow_local_preview=allow_local_preview)
@@ -121,6 +150,14 @@ def prepare_tenant(database, tenant, profile, *, allow_local_preview=False, main
             for item in ids
             if not (row := repo.get_rule(conn, tenant, item["id"]))["kafka_schema_blocked"]
         )
+        supports = conn.execute(
+            """SELECT DISTINCT e.alert_id FROM correlation_evidence e JOIN correlation_rules r
+            ON r.tenant_id=e.tenant_id AND r.id=e.rule_id AND r.epoch=e.epoch
+            WHERE e.tenant_id=%s AND e.expires_at>clock_timestamp() LIMIT %s""",
+            (tenant, limits["live_evidence_per_tenant"] + 1),
+        ).fetchall()
+        if len(supports) > limits["live_evidence_per_tenant"]:
+            raise unavailable("correlation_evidence_capacity")
     programs = {row["id"]: repo.compile_conditions(repo.definition(row)) for row in rows}
     for row in rows:
         costs = [p.rule_cost_upper_bound for p in programs[row["id"]].values()]
@@ -128,7 +165,33 @@ def prepare_tenant(database, tenant, profile, *, allow_local_preview=False, main
             raise unavailable("correlation_cost_capacity")
     if sum(row["evaluation_cost"] for row in rows) > limits["tenant_cost"]:
         raise unavailable("correlation_tenant_cost_capacity")
-    maintenance = maintenance_input or prepare_for_tenant(database, tenant, profile, inline=False)
+    supplied_ids = {str(value) for value in alert_ids}
+    support_ids = {str(row["alert_id"]) for row in supports}
+    targets = tuple(supplied_ids | support_ids)
+    needs_attachment_preparation = bool(support_ids - supplied_ids)
+    maintenance = (
+        maintenance_input
+        if maintenance_input is not None and not needs_attachment_preparation
+        else prepare_for_tenant(database, tenant, profile, inline=False, alert_ids=targets)
+    )
+    if maintenance_input is not None and needs_attachment_preparation:
+        if (
+            maintenance is None
+            or maintenance.generation != maintenance_input.generation
+            or maintenance.source_release_since != maintenance_input.source_release_since
+        ):
+            raise unavailable("maintenance_catalog_changed")
+        # Inline source preparation may include a predicted late input. Preserve
+        # that exact proof while adding every possible decision attachment's
+        # active cause segments/checkpoints before acquiring writer locks.
+        segments = {segment.id: segment for segment in maintenance.segments}
+        segments.update({segment.id: segment for segment in maintenance_input.segments})
+        maintenance = replace(
+            maintenance_input,
+            segments=tuple(sorted(segments.values(), key=lambda value: value.activation)),
+            history_complete=maintenance.history_complete or maintenance_input.history_complete,
+            replays={**(maintenance.replays or {}), **(maintenance_input.replays or {})},
+        )
     if maintenance is None:
         with database.transaction(tenant) as conn:
             if conn.execute(
@@ -305,10 +368,47 @@ def _replay_states(conn, prepared, states, event, current, owner, now, active, r
     return tuple(output)
 
 
-def _load(conn, prepared, position, now):
+@dataclass(frozen=True)
+class EvidenceSnapshot:
+    rows: tuple
+    contexts: dict
+    at: datetime
+
+
+def _load(conn, prepared, position, now, *, event=None, bounded=False):
     tenant = prepared.tenant
+    evidence = conn.execute(
+        "SELECT e.* FROM correlation_evidence e JOIN correlation_rules r ON r.tenant_id=e.tenant_id AND r.id=e.rule_id AND r.epoch=e.epoch WHERE e.tenant_id=%s AND e.expires_at>%s ORDER BY e.rule_id,e.context_id,e.condition_id,e.alert_id LIMIT %s",
+        (tenant, now, prepared.capacity["live_evidence_per_tenant"] + 1),
+    ).fetchall()
+    if len(evidence) > prepared.capacity["live_evidence_per_tenant"]:
+        raise unavailable("correlation_evidence_capacity")
+    requested = []
+    for row in prepared.rows if event and bounded else ():
+        for value in (event.get("before_snapshot"), event.get("after_snapshot")):
+            if value is not None:
+                key = group_key(repo.grouping(row["group_by"]), value)
+                if key is not None:
+                    requested.append(
+                        {
+                            "rule_id": row["id"],
+                            "grouping_generation": row["grouping_generation"],
+                            "group_digest": key.digest.hex(),
+                        }
+                    )
     contexts = conn.execute(
-        "SELECT * FROM correlation_contexts WHERE tenant_id=%s", (tenant,)
+        """SELECT * FROM correlation_contexts c WHERE tenant_id=%s AND (%s OR id=ANY(%s::uuid[]))
+        UNION SELECT c.* FROM jsonb_to_recordset(%s) AS d(
+          rule_id uuid,grouping_generation bigint,group_digest text)
+          JOIN correlation_contexts c ON c.tenant_id=%s AND c.rule_id=d.rule_id
+          AND c.grouping_generation=d.grouping_generation AND c.group_digest=decode(d.group_digest,'hex')""",
+        (
+            tenant,
+            not bounded,
+            list({row["context_id"] for row in evidence}),
+            Jsonb(wire(requested)),
+            tenant,
+        ),
     ).fetchall()
     by_id = {row["id"]: _context(row) for row in contexts}
     active = {
@@ -322,15 +422,17 @@ def _load(conn, prepared, position, now):
     releases = {
         row["alert_id"]: Boundary(row["effective_at"], row["order_token"])
         for row in conn.execute(
-            "SELECT * FROM correlation_boundaries WHERE tenant_id=%s", (tenant,)
+            "SELECT * FROM correlation_boundaries WHERE tenant_id=%s AND (%s OR alert_id=ANY(%s::uuid[]))",
+            (
+                tenant,
+                not bounded,
+                list(
+                    {row["alert_id"] for row in evidence}
+                    | ({event["alert_id"]} if event else set())
+                ),
+            ),
         )
     }
-    evidence = conn.execute(
-        "SELECT e.* FROM correlation_evidence e JOIN correlation_rules r ON r.tenant_id=e.tenant_id AND r.id=e.rule_id AND r.epoch=e.epoch WHERE e.tenant_id=%s AND e.expires_at>%s ORDER BY e.rule_id,e.context_id,e.condition_id,e.alert_id LIMIT %s",
-        (tenant, now, prepared.capacity["live_evidence_per_tenant"] + 1),
-    ).fetchall()
-    if len(evidence) > prepared.capacity["live_evidence_per_tenant"]:
-        raise unavailable("correlation_evidence_capacity")
     states = []
     for row in prepared.rows:
         rule = repo.core_rule(row, prepared.programs[row["id"]])
@@ -349,7 +451,13 @@ def _load(conn, prepared, position, now):
             if m["rule_id"] == rule.id
         )
         states.append(EvidenceState(rule, members, position, row["blocked_reason"]))
-    return tuple(states), active, resets, releases
+    return (
+        tuple(states),
+        active,
+        resets,
+        releases,
+        EvidenceSnapshot(tuple(evidence), {by_id[row["id"]]: row["id"] for row in contexts}, now),
+    )
 
 
 def _event(conn, event, current, owner, prepared):
@@ -485,17 +593,23 @@ def maintenance_input(conn, effect, current, owner, sequence, consuming_order=No
 
 def lock_decision_scope(conn, tenant, targets, *, incidents=()):
     """Prelock a bounded live-evidence decision scope before mutating a target."""
-    lock_contexts(conn, tenant)
+    lock_contexts(conn, tenant, targets=targets, incidents=incidents)
     ids = {UUID(str(value)) for value in targets}
     ids.update(
         row["alert_id"]
         for row in conn.execute(
-            "SELECT DISTINCT alert_id FROM correlation_evidence WHERE tenant_id=%s", (tenant,)
+            """SELECT DISTINCT e.alert_id FROM correlation_evidence e JOIN correlation_rules r
+            ON r.tenant_id=e.tenant_id AND r.id=e.rule_id AND r.epoch=e.epoch
+            WHERE e.tenant_id=%s AND e.expires_at>clock_timestamp()""",
+            (tenant,),
         )
     )
     conn.execute(
         """SELECT id FROM incidents WHERE tenant_id=%s AND (id=ANY(%s::uuid[]) OR id IN
-        (SELECT active_incident_id FROM correlation_contexts WHERE tenant_id=%s) OR id IN
+        (SELECT c.active_incident_id FROM correlation_evidence e JOIN correlation_contexts c
+         ON c.tenant_id=e.tenant_id AND c.id=e.context_id JOIN correlation_rules r
+         ON r.tenant_id=e.tenant_id AND r.id=e.rule_id AND r.epoch=e.epoch
+         WHERE e.tenant_id=%s AND e.expires_at>clock_timestamp()) OR id IN
         (SELECT incident_id FROM incident_alert_links WHERE tenant_id=%s AND alert_id=ANY(%s::uuid[]) AND unlinked_at IS NULL)) ORDER BY id FOR UPDATE""",
         (tenant, list(incidents), tenant, tenant, sorted(ids)),
     ).fetchall()
@@ -505,38 +619,74 @@ def lock_decision_scope(conn, tenant, targets, *, incidents=()):
     ).fetchall()
 
 
-def _persist(conn, prepared, states):
+def _persist(conn, prepared, states, previous):
+    """Persist only membership deltas, in two bounded SQL batches.
+
+    The snapshot and writes share the tenant coordinator transaction. Unchanged
+    support keeps its original start/expiry and is neither deleted nor rewritten.
+    Context lookup is once per newly encountered group, never per membership.
+    """
+    columns = ("rule_id", "epoch", "context_id", "condition_id", "alert_id")
+    values = ("qualifier_ref", "start_at", "expires_at", "observed_revision")
+    old = {tuple(row[key] for key in columns): row for row in previous.rows}
+    contexts = dict(previous.contexts)
+    desired = {}
     for state in states:
         rule = state.rule
-        conn.execute(
-            "DELETE FROM correlation_evidence WHERE tenant_id=%s AND rule_id=%s",
-            (prepared.tenant, rule.id),
-        )
         row = next(row for row in prepared.rows if row["id"] == rule.id)
         for member in state.memberships:
-            context = repo.ensure_context(
-                conn, row, member.context.group, max_bucket=prepared.capacity["digest_bucket"]
-            )
-            conn.execute(
-                "INSERT INTO correlation_evidence(tenant_id,rule_id,epoch,context_id,condition_id,alert_id,qualifier_ref,start_at,expires_at,observed_revision) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (
-                    prepared.tenant,
-                    rule.id,
-                    rule.epoch,
-                    context,
-                    member.condition_id,
-                    member.alert_id,
-                    member.input_id,
-                    member.start,
-                    member.expiry,
-                    member.observed_revision,
-                ),
+            context = contexts.get(member.context)
+            if context is None:
+                context = repo.ensure_context(
+                    conn, row, member.context.group, max_bucket=prepared.capacity["digest_bucket"]
+                )
+                contexts[member.context] = context
+            key = (rule.id, rule.epoch, context, member.condition_id, member.alert_id)
+            desired[key] = dict(
+                zip(
+                    columns + values,
+                    (*key, member.input_id, member.start, member.expiry, member.observed_revision),
+                )
             )
         if state.blocked_reason != row["blocked_reason"] or rule.health != row["health"]:
             conn.execute(
                 "UPDATE correlation_rules SET health=%s,blocked_reason=%s WHERE tenant_id=%s AND id=%s",
                 (rule.health, state.blocked_reason, prepared.tenant, rule.id),
             )
+    removed = [dict(zip(columns, key)) for key in old.keys() - desired.keys()]
+    changed = [
+        row
+        for key, row in desired.items()
+        if key not in old or any(row[name] != old[key][name] for name in values)
+    ]
+    # The loader excludes expired/old-epoch evidence. Prune that excluded set as
+    # well, rather than retaining it forever after replacing full-rule deletes.
+    conn.execute(
+        """DELETE FROM correlation_evidence e WHERE e.tenant_id=%s AND
+        (e.expires_at<=%s OR NOT EXISTS(SELECT 1 FROM correlation_rules r
+          WHERE r.tenant_id=e.tenant_id AND r.id=e.rule_id AND r.epoch=e.epoch))""",
+        (prepared.tenant, previous.at),
+    )
+    if removed:
+        conn.execute(
+            """DELETE FROM correlation_evidence e USING jsonb_to_recordset(%s) AS d(
+            rule_id uuid,epoch bigint,context_id uuid,condition_id uuid,alert_id uuid)
+            WHERE e.tenant_id=%s AND (e.rule_id,e.epoch,e.context_id,e.condition_id,e.alert_id)=
+            (d.rule_id,d.epoch,d.context_id,d.condition_id,d.alert_id)""",
+            (Jsonb(wire(removed)), prepared.tenant),
+        )
+    if changed:
+        conn.execute(
+            """INSERT INTO correlation_evidence(tenant_id,rule_id,epoch,context_id,condition_id,
+            alert_id,qualifier_ref,start_at,expires_at,observed_revision)
+            SELECT %s,d.* FROM jsonb_to_recordset(%s) AS d(rule_id uuid,epoch bigint,
+            context_id uuid,condition_id uuid,alert_id uuid,qualifier_ref uuid,
+            start_at timestamptz,expires_at timestamptz,observed_revision bigint)
+            ON CONFLICT(tenant_id,rule_id,epoch,context_id,condition_id,alert_id) DO UPDATE SET
+            qualifier_ref=EXCLUDED.qualifier_ref,start_at=EXCLUDED.start_at,
+            expires_at=EXCLUDED.expires_at,observed_revision=EXCLUDED.observed_revision""",
+            (prepared.tenant, Jsonb(wire(changed))),
+        )
 
 
 def _commit_decision(conn, prepared, decision, position, alerts):
@@ -692,7 +842,7 @@ def worker_turn(
             "SELECT ready FROM capability_gates WHERE capability='correlation'"
         ).fetchone()["ready"]:
             return 0
-        lock_contexts(conn, tenant)
+        lock_contexts(conn, tenant, targets=())
         current = conn.execute(
             "SELECT id,revision FROM correlation_rules WHERE tenant_id=%s AND enabled AND NOT kafka_schema_blocked AND deleted_at IS NULL ORDER BY created_at,id",
             (tenant,),
@@ -719,7 +869,9 @@ def worker_turn(
             if kafka
             else _next(conn, tenant, position)
         )
-        states, active, resets, releases = _load(conn, prepared, position, now)
+        states, active, resets, releases, persisted = _load(
+            conn, prepared, position, now, event=event, bounded=kafka
+        )
         ids = {m.alert_id for state in states for m in state.memberships}
         if event:
             ids.add(event["alert_id"])
@@ -811,7 +963,7 @@ def worker_turn(
                     )
                     return 0
             position = event["change_order"]
-        _persist(conn, prepared, states)
+        _persist(conn, prepared, states, persisted)
         # Final time is sampled after all decision locks, and cannot go backwards.
         decision_now = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
         if decision_now < now:

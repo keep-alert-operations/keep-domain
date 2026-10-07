@@ -78,6 +78,9 @@ class Projection:
     alert_id: str
     version: int
     snapshot: dict
+    # Authority readers may tokenize notes through a bounded server cursor.
+    # This is an internal projection value, never a source-supplied field.
+    tokens: tuple[str, ...] | None = None
 
 
 def build_document(item: Projection) -> dict:
@@ -134,8 +137,10 @@ def build_document(item: Projection) -> dict:
     if not isinstance(notes, list) or any(not isinstance(note, str) for note in notes):
         raise AppError("invalid_projection", "Only current undeleted note strings may be projected")
     # Notes are searchable tokens; alert-owned authoritative note reads stay in PG.
-    result["search_tokens"] = source_tokens(
-        [snapshot["message"], snapshot.get("impact") or "", *notes]
+    result["search_tokens"] = (
+        list(item.tokens)
+        if item.tokens is not None
+        else source_tokens([snapshot["message"], snapshot.get("impact") or "", *notes])
     )
     result["severity_clear_last"] = snapshot["severity"] == "clear"
     result["severity_rank"] = {"critical": 0, "high": 1, "warning": 2, "clear": 3}[

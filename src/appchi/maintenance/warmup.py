@@ -5,7 +5,7 @@ An activation checker must lock all relevant tenant coordinators and recheck
 input heads and catalog generations atomically with the capability update.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from time import monotonic
 from uuid import UUID
 
@@ -49,13 +49,17 @@ def warmup_page(database, tenant, profile, *, cursor=None, limit=100):
         if scanned and monotonic() - started >= 0.1:
             break
         try:
+            from .preparation import prepare_replay
+
+            proof = prepare_replay(database, catalog, row["id"])
+            prepared = replace(catalog, replays={row["id"]: proof} if proof else {})
             with database.transaction(tenant) as conn:
                 _, now = coordinator(conn, tenant)
-                lock_catalog(conn, catalog, targets=[row["id"]])
+                lock_catalog(conn, prepared, targets=[row["id"]])
                 lock_linked_incidents(conn, tenant, row["id"])
                 before = retained(conn, tenant, row["id"], True)
                 pending(conn, tenant, before)
-                after, effects = reconcile_alert(conn, before, now, catalog=catalog)
+                after, effects = reconcile_alert(conn, before, now, catalog=prepared)
                 publish_reconciliation(conn, before, after, effects, now)
             completed += 1
         except MaintenanceProofError as error:
