@@ -5,7 +5,7 @@ repeat, and every semantic rule-field transition. Existing snapshots without a
 creation baseline are deliberately not accepted as reconstructed history.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 import hashlib
 from uuid import UUID, uuid5
@@ -45,6 +45,25 @@ class Effects:
     withdrawn_qualifiers: tuple[UUID, ...]
     proof_digest: bytes
     input_suppressed: bool | None = None
+
+
+@dataclass(frozen=True)
+class CatalogSnapshot:
+    """Preparation reads from one REPEATABLE READ snapshot, taken before locks.
+
+    Writers revalidate the generation, gates, checkpoints and input heads under
+    their own locks; nothing here substitutes for that proof.
+    """
+
+    tenant_id: UUID
+    targets: tuple[str, ...]
+    maintenance_ready: bool
+    correlation_enabled: bool
+    state: dict | None = None
+    at: datetime | None = None
+    continuations: dict = field(default_factory=dict)
+    rows: tuple = ()
+    floor: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -108,27 +127,56 @@ def prepare_catalog(
     """Bounded DB snapshot followed by native CEL compilation outside locks."""
     if min(max_work, max_inputs, max_segments) < 1:
         raise ValueError("explicit positive qualified work allocations are required")
+    snapshot = read_catalog(
+        database, tenant_id, alert_id=alert_id, effective_at=effective_at, alert_ids=alert_ids
+    )
+    return compile_catalog(
+        snapshot, max_work=max_work, max_inputs=max_inputs, max_segments=max_segments
+    )
+
+
+def read_catalog(
+    database, tenant_id, *, alert_id=None, effective_at=None, alert_ids=(), gated=False
+):
+    """Read gates, catalog state, target checkpoints and segments in one snapshot.
+
+    The caller reuses the checkpoints and the snapshot clock instead of reading
+    them again. With gated=True, a closed maintenance gate ends the snapshot
+    before catalog reads, and the caller prepares nothing.
+    """
+    targets = tuple(
+        dict.fromkeys([str(value) for value in alert_ids] + ([str(alert_id)] if alert_id else []))
+    )
     with database.transaction() as conn:
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         conn.execute("SELECT set_config('appchi.tenant_id',%s,true)", (str(tenant_id),))
         state = conn.execute(
-            "SELECT maintenance_generation,clock_timestamp() AS prepared_at,(SELECT source_release_since FROM application_scope WHERE singleton) AS source_release_since FROM tenant_view_state WHERE tenant_id=%s",
-            (tenant_id,),
+            """SELECT v.maintenance_generation,clock_timestamp() AS prepared_at,
+            (SELECT source_release_since FROM application_scope WHERE singleton) AS source_release_since,
+            coalesce((SELECT ready FROM capability_gates WHERE capability='maintenance'),false) AS maintenance_ready,
+            coalesce((SELECT ready FROM capability_gates WHERE capability='correlation') AND EXISTS(
+              SELECT 1 FROM correlation_rules WHERE tenant_id=%s AND enabled
+              AND NOT kafka_schema_blocked AND deleted_at IS NULL),false) AS correlation_enabled
+            FROM (SELECT 1) AS scope LEFT JOIN tenant_view_state v ON v.tenant_id=%s""",
+            (tenant_id, tenant_id),
         ).fetchone()
-        targets = tuple(
-            dict.fromkeys(
-                [str(value) for value in alert_ids] + ([str(alert_id)] if alert_id else [])
-            )
+        snapshot = CatalogSnapshot(
+            UUID(str(tenant_id)),
+            targets,
+            state["maintenance_ready"],
+            state["correlation_enabled"],
         )
+        if (gated and not snapshot.maintenance_ready) or state["maintenance_generation"] is None:
+            return snapshot
         previous = (
             conn.execute(
-                "SELECT continuation FROM maintenance_alert_checkpoints WHERE tenant_id=%s AND alert_id=ANY(%s::uuid[])",
+                "SELECT alert_id,continuation FROM maintenance_alert_checkpoints WHERE tenant_id=%s AND alert_id=ANY(%s::uuid[])",
                 (tenant_id, list(targets)),
             ).fetchall()
             if targets
             else []
         )
-        continuations = [row["continuation"] for row in previous]
+        continuations = {str(row["alert_id"]): row["continuation"] for row in previous}
         at = effective_at or state["prepared_at"]
         floor = None
         active_ids = []
@@ -140,17 +188,17 @@ def prepare_catalog(
                 and continuation.get("version") in (1, "1", 2, "2")
                 and int(continuation["generation"]) == state["maintenance_generation"]
                 and at > datetime.fromisoformat(continuation.get("max_at", continuation["last_at"]))
-                for continuation in continuations
+                for continuation in continuations.values()
             )
         ):
             floor = min(
                 datetime.fromisoformat(continuation.get("max_at", continuation["last_at"]))
-                for continuation in continuations
+                for continuation in continuations.values()
             )
             active_ids = list(
                 {
                     cause["segment_id"]
-                    for continuation in continuations
+                    for continuation in continuations.values()
                     for cause in continuation["causes"]
                     if cause["segment_id"]
                 }
@@ -165,6 +213,19 @@ def prepare_catalog(
             ORDER BY activation_at,activation_order,id""",
             (tenant_id, floor, floor, active_ids),
         ).fetchall()
+    return replace(
+        snapshot,
+        state=state,
+        at=at,
+        continuations=continuations,
+        rows=tuple(rows),
+        floor=floor,
+    )
+
+
+def compile_catalog(snapshot, *, max_work, max_inputs, max_segments):
+    """Compile a catalog snapshot outside locks, reusing this thread's programs."""
+    state, at, rows = snapshot.state, snapshot.at, snapshot.rows
     active_count = sum(
         row["start_at"] <= at < row["end_at"]
         and row["activation_at"] < at
@@ -177,7 +238,7 @@ def prepare_catalog(
     for row in rows:
         key = (row["cel"], row["profile"], row["cel_digest"])
         if key not in programs:
-            program = compile_expression(row["cel"], rule=True)
+            program = compile_expression(row["cel"], rule=True, reuse=True)
             if (
                 program.profile != row["profile"]
                 or hashlib.sha256(row["cel"].encode()).hexdigest() != row["cel_digest"]
@@ -208,13 +269,13 @@ def prepare_catalog(
             )
         )
     return Catalog(
-        UUID(str(tenant_id)),
+        snapshot.tenant_id,
         state["maintenance_generation"],
         tuple(segments),
         max_work,
         max_inputs,
         source_release_since=state["source_release_since"],
-        history_complete=floor is None,
+        history_complete=snapshot.floor is None,
     )
 
 

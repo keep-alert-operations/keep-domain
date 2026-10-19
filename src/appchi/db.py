@@ -125,7 +125,14 @@ class Database:
         )
 
     @contextmanager
-    def transaction(self, tenant_id=None):
+    def transaction(self, tenant_id=None, *, read_committed=False):
+        """Run one restore-guarded unit of work.
+
+        Tenant-scoped units, and unscoped callers passing read_committed=True,
+        stay READ COMMITTED and take the restore guard inside the transaction.
+        Other unscoped callers may select REPEATABLE READ before their first
+        query, so the session-lock guard still runs around their transaction.
+        """
         from appchi.recovery.guard import runtime_guard
         from appchi.alert_notifications import pending, publish_best_effort
 
@@ -134,7 +141,9 @@ class Database:
         try:
             with self.pool.connection(timeout=remaining(3)) as conn:
                 conn = BudgetConnection(conn) if deadline.get() is not None else conn
-                with self._transaction(conn, tenant_id, runtime_guard):
+                with self._transaction(
+                    conn, tenant_id, runtime_guard, read_committed=read_committed
+                ):
                     yield conn
         except BaseException:
             raise
@@ -144,24 +153,34 @@ class Database:
             pending.reset(token)
 
     @contextmanager
-    def _transaction(self, conn, tenant_id, runtime_guard):
+    def _transaction(self, conn, tenant_id, runtime_guard, *, read_committed=False):
+        from appchi.recovery.guard import queue_transaction_guard, require_transaction_guard
+
+        guarded = self.deployment_epoch is not None
+        # The tenant set_config SELECT already rules out a later isolation change.
+        in_transaction = guarded and (bool(tenant_id) or read_committed)
         guard = (
             runtime_guard(conn, self.deployment_epoch)
-            if self.deployment_epoch is not None
+            if guarded and not in_transaction
             else nullcontext()
         )
+        queued = None
         with guard, conn.transaction():
-            # Only setup is pipelined. Keep SET commands (not set_config SELECTs)
-            # for unscoped callers which select REPEATABLE READ before queries.
+            # Only setup is pipelined. Keep SET commands (not SELECTs) for
+            # unscoped callers which may select REPEATABLE READ before queries.
             with conn.pipeline():
                 conn.execute("SET LOCAL TIME ZONE 'UTC'")
                 if not isinstance(conn, BudgetConnection):
                     conn.execute("SET LOCAL statement_timeout = '4000ms'")
                 conn.execute("SET LOCAL lock_timeout = '2000ms'")
+                if in_transaction:
+                    queued = queue_transaction_guard(conn)
                 if tenant_id:
                     conn.execute(
                         "SELECT set_config('appchi.tenant_id', %s, true)", (str(tenant_id),)
                     )
+            if queued is not None:
+                require_transaction_guard(queued, self.deployment_epoch)
             yield conn
             from appchi.maintenance.runtime import flush_inline_effects
 

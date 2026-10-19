@@ -139,16 +139,14 @@ def prepare_tenant(
     with database.transaction() as conn:
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         conn.execute("SELECT set_config('appchi.tenant_id',%s,true)", (str(tenant),))
-        ids = conn.execute(
-            "SELECT id FROM correlation_rules WHERE tenant_id=%s AND enabled AND deleted_at IS NULL ORDER BY created_at,id LIMIT %s",
+        enabled = conn.execute(
+            "SELECT * FROM correlation_rules WHERE tenant_id=%s AND enabled AND deleted_at IS NULL ORDER BY created_at,id LIMIT %s",
             (tenant, limits["enabled_rules_per_tenant"] + 1),
         ).fetchall()
-        if len(ids) > limits["enabled_rules_per_tenant"]:
+        if len(enabled) > limits["enabled_rules_per_tenant"]:
             raise unavailable("correlation_enabled_capacity")
-        rows = tuple(
-            row
-            for item in ids
-            if not (row := repo.get_rule(conn, tenant, item["id"]))["kafka_schema_blocked"]
+        rows = repo.with_conditions(
+            conn, tenant, [row for row in enabled if not row["kafka_schema_blocked"]]
         )
         supports = conn.execute(
             """SELECT DISTINCT e.alert_id FROM correlation_evidence e JOIN correlation_rules r
@@ -158,7 +156,10 @@ def prepare_tenant(
         ).fetchall()
         if len(supports) > limits["live_evidence_per_tenant"]:
             raise unavailable("correlation_evidence_capacity")
-    programs = {row["id"]: repo.compile_conditions(repo.definition(row)) for row in rows}
+    # Rule revisions are rechecked under the coordinator by worker_turn.
+    programs = {
+        row["id"]: repo.compile_conditions(repo.definition(row), reuse=True) for row in rows
+    }
     for row in rows:
         costs = [p.rule_cost_upper_bound for p in programs[row["id"]].values()]
         if max(costs) > limits["condition_cost"] or sum(costs) > limits["rule_cost"]:

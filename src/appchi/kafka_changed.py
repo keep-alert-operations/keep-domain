@@ -16,13 +16,18 @@ class PartitionRetries:
         self.client = client
         self.failed = {}
 
-    def fail(self, message):
+    def fail(self, message, *, delay=5):
         from confluent_kafka import TopicPartition
 
         point = TopicPartition(message.topic(), message.partition(), message.offset())
         self.client.pause([point])
         self.client.seek(point)
-        self.failed[(point.topic, point.partition)] = (point, monotonic() + 5)
+        self.failed[(point.topic, point.partition)] = (point, monotonic() + delay)
+
+    def timeout(self, limit):
+        """Bound an idle poll so a short retry resumes near its deadline."""
+        due = min((deadline for _, deadline in self.failed.values()), default=float("inf"))
+        return max(0.0, min(limit, due - monotonic()))
 
     def resume_due(self):
         now = monotonic()

@@ -8,13 +8,14 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from concurrent.futures import Future
-from threading import Condition
+from threading import Condition, local
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import logging
 import multiprocessing
+import os
 import re
 from time import monotonic
 from typing import Any
@@ -46,7 +47,25 @@ STRING_METHODS = ("startsWith", "endsWith", "contains")
 TIME_LITERAL_FUNCTIONS = ("timestamp", "duration")
 NOW_FUNCTION = "now"
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+MAX_PENDING_COMPILES = 256
 log = logging.getLogger(__name__)
+
+
+def _cache_entries() -> int:
+    try:
+        entries = int(os.environ.get("APPCHI_CEL_CACHE_ENTRIES", "4096"))
+    except ValueError:
+        entries = 0
+    if not 1 <= entries <= 65536:
+        raise ValueError("APPCHI_CEL_CACHE_ENTRIES must be an integer from 1 to 65536")
+    return entries
+
+
+# Distinct expressions retained: checked data per process and reusable programs
+# per thread. Size it above a worker's working set (maintenance segments plus
+# enabled correlation conditions of its tenants); a checked-data miss starts a
+# compiler process, and a cyclic working set larger than an LRU always misses.
+CACHE_ENTRIES = _cache_entries()
 
 
 class CELValidationError(ValueError):
@@ -572,6 +591,16 @@ class CompiledExpression:
             data["v_" + name] = defaults[spec.kind] if value is None else value
         for i, offset in enumerate(self.bounds):
             data[f"clock_{i}"] = time_bound(IR("bound", "time", offset), evaluated_at)
+        program = self._runtime()
+        try:
+            result = program.eval(data=data).value()
+        except Exception as exc:
+            raise CELUnavailableError("Native CEL evaluation failed") from exc
+        if type(result) is not bool:
+            raise CELUnavailableError("Native CEL evaluation did not return a boolean")
+        return result
+
+    def _runtime(self):
         if self._program is None:
             try:
                 object.__setattr__(
@@ -581,13 +610,7 @@ class CompiledExpression:
                 )
             except Exception as exc:
                 raise CELUnavailableError("Checked native runtime unavailable") from exc
-        try:
-            result = self._program.eval(data=data).value()
-        except Exception as exc:
-            raise CELUnavailableError("Native CEL evaluation failed") from exc
-        if type(result) is not bool:
-            raise CELUnavailableError("Native CEL evaluation did not return a boolean")
-        return result
+        return self._program
 
     def to_elasticsearch(self, evaluated_at: datetime) -> dict:
         """Return only the CEL predicate; caller must enforce tenant/live/suppression."""
@@ -607,9 +630,19 @@ class CompiledExpression:
         return {"bool": {"filter": filters}}
 
 
-def compile_expression(source: str, *, rule: bool = False) -> CompiledExpression:
+def compile_expression(
+    source: str, *, rule: bool = False, reuse: bool = False
+) -> CompiledExpression:
+    """Compile checked CEL; reuse=True returns this thread's warmed instance.
+
+    Preparation that evaluates the same programs for many alerts passes reuse,
+    so writers never rebuild a native handle under their locks.
+    """
     if not isinstance(source, str):
         raise CELValidationError("Expression source must be a string")
+    if reuse:
+        # Checked output depends only on profile, mode and source text.
+        return _reusable.get((PROFILE, rule, source), lambda: _warmed(source, rule))
     try:
         encoded = source.encode("utf-8")
     except UnicodeEncodeError as exc:
@@ -622,16 +655,54 @@ def compile_expression(source: str, *, rule: bool = False) -> CompiledExpression
     return CompiledExpression(source, ir, fields, bounds, checked, nodes, lowered)
 
 
+def _warmed(source: str, rule: bool) -> CompiledExpression:
+    program = compile_expression(source, rule=rule)
+    program._runtime()
+    return program
+
+
+class _ThreadPrograms(local):
+    """One LRU of reusable compiled expressions per thread.
+
+    Reuse keeps each instance's native handle across alerts. Handles stay
+    thread-local, as for fresh instances, so concurrent API threads never share
+    native runtime state; do not hand a reused instance to another thread.
+    """
+
+    def __init__(self, capacity=CACHE_ENTRIES):
+        self.capacity = capacity
+        self.entries = OrderedDict()
+
+    def get(self, key, create):
+        program = self.entries.get(key)
+        if program is None:
+            # A failed compile or warmup is raised and never cached.
+            program = create()
+            self.entries[key] = program
+            if len(self.entries) > self.capacity:
+                self.entries.popitem(last=False)
+        else:
+            self.entries.move_to_end(key)
+        return program
+
+
+_reusable = _ThreadPrograms()
+
+
 class _CompileCache:
     """Bound checked-data retention and share concurrent same-key cold work.
 
     The condition protects metadata only. Native compilation and followers wait
     outside it, so a slow cold key cannot block hits for other expressions.
     Failed compilation is shared with current followers but is never cached.
+    Concurrent cold compilations are bounded separately from retention.
     """
 
-    def __init__(self, capacity=256):
+    def __init__(self, capacity=CACHE_ENTRIES, max_pending=None):
         self.capacity = capacity
+        self.max_pending = (
+            min(capacity, MAX_PENDING_COMPILES) if max_pending is None else max_pending
+        )
         self.ready = OrderedDict()
         self.pending = {}
         self.condition = Condition()
@@ -647,7 +718,7 @@ class _CompileCache:
                 if future is not None:
                     owner = False
                     break
-                if len(self.pending) < self.capacity:
+                if len(self.pending) < self.max_pending:
                     future = Future()
                     self.pending[key] = future
                     owner = True

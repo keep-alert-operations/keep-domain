@@ -10,16 +10,37 @@ from appchi.serialization import wire as wire
 
 
 def coordinator(conn, tenant):
+    row = lock_coordinator(conn, tenant)
+    now, _ = advance_clock(conn, tenant)
+    return row, now
+
+
+def lock_coordinator(conn, tenant):
+    """Take the tenant coordinator row lock; call advance_clock before any write."""
     row = conn.execute(
         "SELECT * FROM tenant_work_state WHERE tenant_id=%s FOR UPDATE", (tenant,)
     ).fetchone()
     if row is None:
         raise AppError("not_found", "Resource unavailable.", 404)
-    now = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
-    if row["last_clock"] and now < row["last_clock"]:
+    return row
+
+
+def advance_clock(conn, tenant, *, admission=False):
+    """Under the held coordinator, record a non-regressing clock in one statement.
+
+    The clock is read once, after the lock is held. A regression leaves the row
+    unchanged. With admission=True the next admission order is also allocated.
+    """
+    row = conn.execute(
+        """WITH c AS MATERIALIZED (SELECT clock_timestamp() AS now)
+        UPDATE tenant_work_state t SET last_clock=c.now,admission_order=t.admission_order+%s FROM c
+        WHERE t.tenant_id=%s AND (t.last_clock IS NULL OR c.now>=t.last_clock)
+        RETURNING c.now,t.admission_order""",
+        (int(admission), tenant),
+    ).fetchone()
+    if row is None:
         raise unavailable("clock_untrusted")
-    conn.execute("UPDATE tenant_work_state SET last_clock=%s WHERE tenant_id=%s", (now, tenant))
-    return row, now
+    return row["now"], row["admission_order"]
 
 
 def command_result(conn, scope, command_id, payload):

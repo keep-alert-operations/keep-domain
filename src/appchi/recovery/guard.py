@@ -6,6 +6,40 @@ from appchi.shared.errors import unavailable
 
 RESTORE_LOCK = 418003227
 
+CONTROL_READ = "SELECT deployment_epoch,fenced FROM restore_control WHERE singleton"
+
+
+def _require_current(acquired, control, deployment_epoch):
+    if not acquired:
+        raise unavailable("restore_in_progress")
+    if not control or control["fenced"]:
+        raise unavailable("restore_reconciliation_required")
+    if control["deployment_epoch"] is not None and control["deployment_epoch"] != deployment_epoch:
+        raise unavailable("deployment_epoch_fenced")
+
+
+def queue_transaction_guard(conn):
+    """Queue the guard inside a READ COMMITTED unit's setup pipeline.
+
+    Call before the unit's first query. Restore's exclusive lock conflicts with
+    this shared transaction lock exactly as with the session lock, and commit or
+    rollback releases it, so no extra transactions or uncertain release exist.
+    Pinned READ COMMITTED gives the control read its own snapshot, taken after
+    the acquisition statement finishes (see runtime_guard). A later switch to
+    REPEATABLE READ fails in PostgreSQL instead of reusing a stale control read.
+    """
+    conn.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+    acquisition = conn.execute(
+        "SELECT pg_try_advisory_xact_lock_shared(%s) AS acquired", (RESTORE_LOCK,)
+    )
+    return acquisition, conn.execute(CONTROL_READ)
+
+
+def require_transaction_guard(queued, deployment_epoch):
+    """Check queued guard results; raising rolls back and releases the lock."""
+    acquisition, control_read = queued
+    _require_current(acquisition.fetchone()["acquired"], control_read.fetchone(), deployment_epoch)
+
 
 @contextmanager
 def runtime_guard(conn, deployment_epoch):
@@ -27,21 +61,10 @@ def runtime_guard(conn, deployment_epoch):
                 acquisition = conn.execute(
                     "SELECT pg_try_advisory_lock_shared(%s) AS acquired", (RESTORE_LOCK,)
                 )
-                control_read = conn.execute(
-                    "SELECT deployment_epoch,fenced FROM restore_control WHERE singleton"
-                )
+                control_read = conn.execute(CONTROL_READ)
             acquired = acquisition.fetchone()["acquired"]
             acquisition_known = True
-            if not acquired:
-                raise unavailable("restore_in_progress")
-            control = control_read.fetchone()
-            if not control or control["fenced"]:
-                raise unavailable("restore_reconciliation_required")
-            if (
-                control["deployment_epoch"] is not None
-                and control["deployment_epoch"] != deployment_epoch
-            ):
-                raise unavailable("deployment_epoch_fenced")
+            _require_current(acquired, control_read.fetchone(), deployment_epoch)
         yield
     finally:
         if acquired:

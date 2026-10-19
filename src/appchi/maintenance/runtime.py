@@ -1,6 +1,7 @@
 """Suppression proof and atomic original-time correlation release effects."""
 
 from dataclasses import dataclass, replace
+from datetime import datetime
 from time import monotonic
 from uuid import UUID, uuid5
 
@@ -13,8 +14,10 @@ from appchi.serialization import wire
 
 from .processing import (
     claim_due,
+    compile_catalog,
     finish_failed_job,
     prepare_catalog,
+    read_catalog,
     record_input,
     record_transition,
     reconcile_alert,
@@ -45,39 +48,29 @@ def prepare_for_tenant(
     # A caller may reuse a gate read from its immediately preceding guarded
     # replay-precheck transaction. Mutation still rechecks the live gate under
     # its normal writer scope; this is not a cache or an authorization bypass.
-    if gate_ready is None:
-        with database.transaction(tenant) as conn:
-            gate = conn.execute(
-                "SELECT ready FROM capability_gates WHERE capability='maintenance'"
-            ).fetchone()
-        gate_ready = bool(gate and gate["ready"])
-    elif type(gate_ready) is not bool:
+    if gate_ready is not None and type(gate_ready) is not bool:
         raise ValueError("gate_ready must be an observed boolean")
-    if not gate_ready:
+    if gate_ready is False:
         return None
-    targets = tuple(
-        dict.fromkeys([str(value) for value in alert_ids] + ([str(alert_id)] if alert_id else []))
+    # One snapshot supplies the gates, the catalog and the target checkpoints.
+    snapshot = read_catalog(
+        database,
+        tenant,
+        alert_id=alert_id,
+        effective_at=effective_at,
+        alert_ids=alert_ids,
+        gated=gate_ready is None,
     )
-    catalog = prepare_qualified_catalog(
-        database, tenant, profile, alert_id=alert_id, effective_at=effective_at, alert_ids=targets
-    )
+    if gate_ready is None and not snapshot.maintenance_ready:
+        return None
+    catalog = compile_catalog(snapshot, **_qualified_budget(profile))
+    targets, at = snapshot.targets, snapshot.at
     if targets:
         from .preparation import prepare_replay
 
         replays = {}
-        with database.transaction(tenant) as conn:
-            previous = {
-                str(row["alert_id"]): row["continuation"]
-                for row in conn.execute(
-                    "SELECT alert_id,continuation FROM maintenance_alert_checkpoints WHERE tenant_id=%s AND alert_id=ANY(%s::uuid[])",
-                    (tenant, list(targets)),
-                )
-            }
-            at = effective_at or conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
         for target in targets:
-            continuation = previous.get(target)
-            from datetime import datetime
-
+            continuation = snapshot.continuations.get(target)
             needs_replay = (
                 not continuation
                 or continuation.get("version") not in (1, "1", 2, "2")
@@ -97,14 +90,8 @@ def prepare_for_tenant(
     catalog = replace(catalog, require_preparation=True)
     if inline:
         catalog = replace(catalog, inline_requested=True)
-        with database.transaction(tenant) as conn:
-            enabled = conn.execute(
-                """SELECT ready AND EXISTS(SELECT 1 FROM correlation_rules
-                WHERE tenant_id=%s AND enabled AND NOT kafka_schema_blocked AND deleted_at IS NULL) AS ready
-                FROM capability_gates WHERE capability='correlation'""",
-                (tenant,),
-            ).fetchone()["ready"]
-        if enabled:
+        # lock_catalog and worker_turn recheck this observation under locks.
+        if snapshot.correlation_enabled:
             from appchi.correlation.runtime import prepare_tenant
 
             prepared = prepare_tenant(
@@ -126,6 +113,17 @@ def prepare_qualified_catalog(
     database, tenant, profile, *, alert_id=None, effective_at=None, alert_ids=()
 ):
     """Compile with a qualified budget, including offline proof warmup."""
+    return prepare_catalog(
+        database,
+        tenant,
+        **_qualified_budget(profile),
+        alert_id=alert_id,
+        effective_at=effective_at,
+        alert_ids=alert_ids,
+    )
+
+
+def _qualified_budget(profile):
     names = ("maintenance_max_work", "maintenance_max_inputs", "maintenance_max_segments")
     if (
         not isinstance(profile, dict)
@@ -133,16 +131,11 @@ def prepare_qualified_catalog(
         or any(type(profile.get(name)) is not int or profile[name] < 1 for name in names)
     ):
         raise unavailable("maintenance_capacity_profile_required")
-    return prepare_catalog(
-        database,
-        tenant,
-        max_work=profile[names[0]],
-        max_inputs=profile[names[1]],
-        max_segments=profile[names[2]],
-        alert_id=alert_id,
-        effective_at=effective_at,
-        alert_ids=alert_ids,
-    )
+    return {
+        "max_work": profile["maintenance_max_work"],
+        "max_inputs": profile["maintenance_max_inputs"],
+        "max_segments": profile["maintenance_max_segments"],
+    }
 
 
 def lock_catalog(conn, catalog, *, targets=(), incidents=()):
