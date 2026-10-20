@@ -29,7 +29,8 @@ BUDGETS = (
 )
 
 
-def compile_conditions(definition):
+def compile_conditions(definition, *, reuse=False):
+    """Compile every condition; reuse=True shares this thread's warmed programs."""
     programs, cache = {}, {}
     deadline = time.monotonic() + 8
     for index, condition in enumerate(definition["conditions"]):
@@ -38,7 +39,7 @@ def compile_conditions(definition):
         source = condition["cel"]
         try:
             if source not in cache:
-                cache[source] = compile_expression(source, rule=True)
+                cache[source] = compile_expression(source, rule=True, reuse=reuse)
                 if "assignee_id" in cache[source].fields:
                     raise CELValidationError("Only approved alert fields may be referenced")
             programs[condition["id"]] = cache[source]
@@ -118,13 +119,31 @@ def get_rule(conn, tenant, rule, *, lock=False, include_deleted=False):
     ).fetchone()
     if not row:
         raise AppError("not_found", "Correlation rule unavailable.", 404)
-    row["condition_rows"] = conn.execute(
-        "SELECT * FROM correlation_conditions WHERE tenant_id=%s AND rule_id=%s ORDER BY position",
-        (tenant, rule),
-    ).fetchall()
+    return _with_conditions(
+        row,
+        conn.execute(
+            "SELECT * FROM correlation_conditions WHERE tenant_id=%s AND rule_id=%s ORDER BY position",
+            (tenant, rule),
+        ).fetchall(),
+    )
+
+
+def with_conditions(conn, tenant, rows):
+    """Attach each rule's ordered conditions, as get_rule does, in one query."""
+    items = {}
+    if rows:
+        for item in conn.execute(
+            "SELECT * FROM correlation_conditions WHERE tenant_id=%s AND rule_id=ANY(%s::uuid[]) ORDER BY rule_id,position",
+            (tenant, [row["id"] for row in rows]),
+        ):
+            items.setdefault(item["rule_id"], []).append(item)
+    return tuple(_with_conditions(row, items.get(row["id"], [])) for row in rows)
+
+
+def _with_conditions(row, items):
+    row["condition_rows"] = items
     row["conditions"] = [
-        {"id": str(item["id"]), "label": item["label"], "cel": item["cel"]}
-        for item in row["condition_rows"]
+        {"id": str(item["id"]), "label": item["label"], "cel": item["cel"]} for item in items
     ]
     return row
 

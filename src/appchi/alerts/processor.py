@@ -1,7 +1,7 @@
 from psycopg.types.json import Jsonb
 
 from appchi.alerts.lifecycle import apply_source
-from appchi.alerts.repository import publish, store_alert
+from appchi.alerts.repository import insert_alert_identity, publish, store_alert
 from appchi.shared.errors import AppError, unavailable
 from appchi.shared.transactions import coordinator
 
@@ -14,16 +14,17 @@ def process_one(db, tenant, attempt=None, profile=None):
         return _apply_one(conn, tenant, attempt, catalog)
 
 
-def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None):
+def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None, coordinated=None):
     """Exact source transaction body, also used by rolled-back repair probes.
 
     No network, compilation or independent transaction belongs in this helper.
-    The caller owns the outer transaction and precompiles its catalog.
+    The caller owns the outer transaction and precompiles its catalog. A caller
+    already holding the tenant coordinator passes its (state, now) as coordinated.
     """
     from appchi.maintenance.runtime import lock_catalog, apply_transition
     from appchi.visibility.runtime import link_source_result
 
-    state, now = coordinator(conn, tenant)
+    state, now = coordinated or coordinator(conn, tenant)
     if supplied_item is None and (state["blocked"] or now < state["next_attempt_at"]):
         return False
     item = (
@@ -49,7 +50,8 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None):
     if claim:
         from appchi.incidents.state import lock_linked_incidents
 
-        linked = lock_linked_incidents(conn, tenant, claim["alert_id"])
+        # lock_catalog already locked this alert's linked contexts.
+        linked = lock_linked_incidents(conn, tenant, claim["alert_id"], contexts_locked=True)
         previous = conn.execute(
             "SELECT * FROM alerts WHERE tenant_id=%s AND id=%s FOR UPDATE",
             (tenant, claim["alert_id"]),
@@ -75,7 +77,9 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None):
             link_source_result(conn, item, error_code=error.code)
     else:
         if previous is None:
-            store_alert(conn, current, new=True)
+            # Maintenance proof references the identity. Nothing in
+            # apply_transition reads the alerts row, so store it once, final.
+            insert_alert_identity(conn, current)
         current, changed, _ = apply_transition(
             conn,
             previous,
@@ -86,7 +90,7 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None):
             now,
             catalog,
         )
-        store_alert(conn, current)
+        store_alert(conn, current, new=previous is None, identity_inserted=True)
         from appchi.incidents.state import linked_transition
 
         linked_transition(conn, linked, previous, current, item["received_at"])
@@ -103,7 +107,7 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None):
                 ),
             )
         conn.execute(
-            "INSERT INTO alert_source_events(tenant_id,alert_id,id,admission_order,received_at,payload,raw_json,time_defaulted,occurrence_id) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "INSERT INTO alert_source_events(tenant_id,alert_id,id,admission_order,received_at,payload,raw_json,time_defaulted,occurrence_id,adapter_version) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 tenant,
                 current["id"],
@@ -114,13 +118,10 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None):
                 item["raw_json"],
                 item["time_defaulted"],
                 current["occurrence_id"],
+                # The column has no default; only Grafana events carry a version.
+                item.get("adapter_version") or None,
             ),
         )
-        if item.get("adapter_version"):
-            conn.execute(
-                "UPDATE alert_source_events SET adapter_version=%s WHERE tenant_id=%s AND alert_id=%s AND id=%s",
-                (item["adapter_version"], tenant, current["id"], item["id"]),
-            )
         if supplied_item is None:
             conn.execute(
                 "UPDATE ingest_items SET disposition='applied',alert_id=%s,occurrence_id=%s,payload=NULL,raw_json=NULL WHERE id=%s",
@@ -150,6 +151,7 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None):
             "alert_id": current["id"] if not error_code else None,
             "error_code": error_code,
             "envelope": publication["envelope"] if publication else None,
+            "event_id": publication["event_id"] if publication else None,
         }
     conn.execute("UPDATE tenant_work_state SET failures=0 WHERE tenant_id=%s", (tenant,))
     conn.execute(

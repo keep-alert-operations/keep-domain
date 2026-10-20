@@ -20,10 +20,11 @@ def changed(
     recorded_at,
     actor=None,
     original_order=None,
+    event_id=None,
 ):
     body = {
         "schema_version": 1,
-        "event_id": str(uuid4()),
+        "event_id": str(event_id) if event_id is not None else str(uuid4()),
         "kind": "alerts.changed",
         "tenant_id": str(tenant),
         "alert_id": str(alert),

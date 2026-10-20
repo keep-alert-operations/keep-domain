@@ -156,8 +156,14 @@ def boundary(conn, tenant, alert_id, now):
     release_alert(conn, tenant, alert_id, now)
 
 
-def lock_linked_incidents(conn, tenant, alert_id):
-    lock_contexts(conn, tenant, targets=(alert_id,), live=False)
+def lock_linked_incidents(conn, tenant, alert_id, *, contexts_locked=False):
+    """Lock the alert's linked contexts, then its open linked incidents.
+
+    Pass contexts_locked=True only when the caller already locked a superset,
+    such as lock_catalog with this alert among its targets.
+    """
+    if not contexts_locked:
+        lock_contexts(conn, tenant, targets=(alert_id,), live=False)
     return conn.execute(
         "SELECT i.* FROM incidents i JOIN incident_alert_links l ON l.tenant_id=i.tenant_id AND l.incident_id=i.id WHERE l.tenant_id=%s AND l.alert_id=%s AND l.unlinked_at IS NULL AND i.status<>'resolved' ORDER BY i.id FOR UPDATE OF i",
         (tenant, alert_id),
