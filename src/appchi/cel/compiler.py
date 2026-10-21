@@ -669,9 +669,10 @@ def compile_expression(
     """Compile checked CEL; reuse=True returns this thread's warmed instance.
 
     Preparation that evaluates the same programs for many alerts passes reuse,
-    so writers never rebuild a native handle under their locks. Callers that
-    only build Elasticsearch queries never build a handle, and a request that
-    evaluates once spends well under a millisecond building one; they keep fresh
+    so writers never rebuild a native handle under their locks. That includes
+    API mutation handlers, which prepare inline on server threads. Callers that
+    only build Elasticsearch queries never build a handle, and test handlers
+    evaluate once, spending well under a millisecond on one; they keep fresh
     instances so request-supplied expressions are not retained per server thread.
     Both paths share the process-wide checked-data cache.
     """

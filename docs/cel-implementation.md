@@ -73,11 +73,16 @@ Which callers reuse:
 - The correlation worker's `prepare_tenant` and maintenance `compile_catalog`
   pass `reuse=True`. They evaluate the same programs for many alerts and
   recompile every enabled expression of a tenant on each turn.
-- Request handlers do not. Search, count and validation handlers only build
-  Elasticsearch queries and never build a native handle. Rule and maintenance
-  test handlers evaluate once per request; building that handle took about
-  0.4 ms when measured. Reuse there would retain each request-supplied
-  expression in every server thread, at about 27 KiB per warmed program.
+- Product API alert, incident and admin mutation handlers prepare inline
+  through `prepare_for_tenant`, so they reuse too: `compile_catalog`, and with
+  correlation enabled `prepare_tenant`. They run on the server threadpool, and
+  each thread keeps its own program cache.
+- Test, validation, search and count handlers do not. Search, count and
+  validation handlers only build Elasticsearch queries and never build a native
+  handle. Rule and maintenance test handlers evaluate once per request; building
+  that handle took about 0.4 ms when measured. Reuse there would retain each
+  request-supplied expression in every server thread, at about 27 KiB per
+  warmed program.
 - The processor's cutover check reads only fields, and the indexer probe
   evaluates one instance many times, which builds its handle once.
 
@@ -92,8 +97,19 @@ and every checked miss starts a compiler process.
   default covers about 1.2 distinct conditions per rule at that scale.
 - Processor (inline maintenance and correlation preparation): the same terms for
   the tenants on its partitions.
-- Product API: feed, preset, dashboard and count expressions in active use.
-  Every distinct request-supplied expression is retained up to the bound.
+- Product API, checked data: feed, preset, dashboard and count expressions in
+  active use, plus the mutation working set below. Every distinct
+  request-supplied expression is retained up to the bound.
+- Product API, programs: per thread, the maintenance segments and correlation
+  conditions of the tenants whose alerts and incidents that thread mutates.
+  Requests land on any thread of the threadpool (40 by default with anyio), so
+  each thread converges on the whole mutated-tenant working set. Program memory
+  is therefore up to `threads × min(working set, entries) × 27 KiB`: about
+  110 MiB per thread and 4.3 GiB for 40 threads when the 4096 bound is full.
+  The default suits the API only while the mutated-tenant working set stays in
+  the hundreds of expressions. Above that, set a lower bound or fewer threads
+  for the API, accepting some misses there, rather than raising it. One setting
+  bounds both caches, so lowering it also shrinks the API's checked cache.
 
 Measured on Windows CPython 3.13 with `cel-expr-python` 0.1.3, for a
 three-clause expression: about 4.4 KiB per checked entry and about 27 KiB per
@@ -106,11 +122,15 @@ An eviction logs `cel_cache_evicting` with the cache kind (`checked` or
 kind and never with source text. Repeated warnings mean the working set exceeds
 the setting. Raise it, or spread tenants across more workers.
 
-A cold miss pays process start and module import. On a 12-core Windows
-development machine a miss took about 0.35–0.8 s when idle. With every core busy,
-12 of 12 misses overran the one-second deadline. Replacing the per-miss process with a pre-started one is an
-open design decision. See the design register entry "CEL cold compilation
-process" of 2026-10-21.
+A cold miss pays process start, module import and the compile itself. On a
+12-core Windows development machine an idle miss took 0.35–0.85 s (two runs:
+medians about 0.4 s and 0.6 s, maximum 0.84 s); process start and module
+import were about 0.4–0.5 s of that. With every core busy, 12 of 12 misses
+overran the one-second deadline. The design contract asks only for one-second
+compiler jobs in a replaceable worker process (alert history technical
+supplement, section 5). Which pre-started process replaces the per-miss one is
+an open implementation decision. See the design register entry "CEL cold
+compilation process" of 2026-10-21.
 
 `rule_cost_upper_bound` exposes deterministic AST-plus-comparison work with
 catalog maximum string bytes and conservative substring work, versioned as
