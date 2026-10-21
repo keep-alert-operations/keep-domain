@@ -445,3 +445,210 @@ def test_worker_turn_still_rejects_a_changed_revision(native, monkeypatch):
             Database(tenant), tenant.id, QUALIFIED, prepared_input=prepared, kafka=True
         )
     assert raised.value.code == "correlation_compiled_revision_changed"
+
+
+# [#9] Evidence alerts and active incidents are read in one statement each.
+
+
+class EvidenceTenant(WorkerTenant):
+    """Answers a whole worker turn: three evidence alerts and three active incidents."""
+
+    def __init__(self, *, stale=frozenset()):
+        super().__init__()
+        self.alerts = sorted((uuid4() for _ in range(3)), key=str)
+        self.incidents = sorted((uuid4() for _ in range(3)), key=str)
+        self.stale = stale  # alert indexes without a current checkpoint
+        # Incident 0 links two alerts, incident 1 one, incident 2 none; one unlinked row.
+        self.links = [
+            (self.incidents[0], self.alerts[0], None),
+            (self.incidents[0], self.alerts[1], None),
+            (self.incidents[1], self.alerts[2], None),
+            (self.incidents[2], self.alerts[0], NOW),
+        ]
+
+    def alert_row(self, alert):
+        return {"id": alert, "tenant_id": self.id, "suppressed": alert == self.alerts[1]}
+
+    def checkpoint(self, alert):
+        head = 2 if self.alerts.index(alert) in self.stale else 1
+        return {"alert_id": alert, "complete": True, "input_revision": 1, "head_revision": head}
+
+    @staticmethod
+    def wanted(text, column, params):
+        values = params[1] if f"{column}=ANY(" in text else [params[1]]
+        return {str(value) for value in values}
+
+    def respond(self, text, params):
+        if text.endswith("FOR UPDATE OF c"):
+            return []  # lock_contexts, which also mentions incident_alert_links
+        if "FROM maintenance_alert_checkpoints" in text:
+            assert params[0] == self.id
+            wanted = self.wanted(text, "alert_id", params)
+            return [
+                checkpoint
+                for checkpoint in (self.checkpoint(a) for a in self.alerts if str(a) in wanted)
+                if checkpoint is not None
+            ]
+        if "FROM incident_alert_links" in text:
+            assert params[0] == self.id
+            wanted = self.wanted(text, "incident_id", params)
+            return [
+                {"incident_id": incident, "alert_id": alert}
+                for incident, alert, unlinked in self.links
+                if str(incident) in wanted and unlinked is None
+            ]
+        if text.endswith("FOR UPDATE OF a"):
+            wanted = {str(value) for value in params[1]}
+            return [self.alert_row(a) for a in self.alerts if str(a) in wanted]
+        if "FROM alert_active_ownership" in text:
+            return []
+        if text.startswith("SELECT clock_timestamp()"):
+            return [{"now": NOW}]
+        if text.startswith("UPDATE correlation_consumer_state"):
+            return []
+        return super().respond(text, params)
+
+
+def per_row_reference(conn, tenant, rows, incident_ids):
+    """The former per-alert and per-incident reads, kept as the oracle."""
+    from appchi.maintenance.processing import derive_current
+
+    unsafe = set()
+    for row in rows:
+        suppressed, _ = derive_current(conn, row, NOW)
+        if suppressed != row["suppressed"]:
+            unsafe.add(row["id"])
+    links = {
+        incident: frozenset(
+            row["alert_id"]
+            for row in conn.execute(
+                "SELECT alert_id FROM incident_alert_links WHERE tenant_id=%s AND incident_id=%s AND unlinked_at IS NULL",
+                (tenant, incident),
+            )
+        )
+        for incident in incident_ids
+    }
+    return unsafe, links
+
+
+def batched(conn, tenant, rows, incident_ids):
+    from appchi.maintenance.processing import derive_current_many
+
+    unsafe = {
+        row["id"]
+        for row, (suppressed, _) in zip(rows, derive_current_many(conn, tenant, rows, NOW))
+        if suppressed != row["suppressed"]
+    }
+    return unsafe, correlation._active_links(conn, tenant, incident_ids)
+
+
+def test_batched_reads_match_the_per_row_reads():
+    tenant = EvidenceTenant()
+    rows = [tenant.alert_row(a) for a in tenant.alerts]
+    old, new = [], []
+    expected = per_row_reference(Connection(tenant, old), tenant.id, rows, tenant.incidents)
+    actual = batched(Connection(tenant, new), tenant.id, rows, tenant.incidents)
+    assert actual == expected
+    assert list(actual[1]) == list(expected[1]) == tenant.incidents
+    assert actual[1] == {
+        tenant.incidents[0]: frozenset(tenant.alerts[:2]),
+        tenant.incidents[1]: frozenset({tenant.alerts[2]}),
+        tenant.incidents[2]: frozenset(),
+    }
+    # Formerly 3 checkpoint reads and 3 link reads; now one statement each.
+    assert len(old) == 6 and len(new) == 2
+    assert sum("maintenance_alert_checkpoints" in text for text in new) == 1
+    assert sum("incident_alert_links" in text for text in new) == 1
+
+
+def test_batched_reads_issue_nothing_for_empty_input():
+    tenant = EvidenceTenant()
+    statements = []
+    assert batched(Connection(tenant, statements), tenant.id, [], []) == (set(), {})
+    assert statements == []
+
+
+@pytest.mark.parametrize("stale", [{0}, {2}, {0, 2}])
+def test_batched_checkpoint_proof_fails_like_the_per_row_read(stale):
+    from appchi.maintenance.processing import MaintenanceProofError
+
+    tenant = EvidenceTenant(stale=frozenset(stale))
+    rows = [tenant.alert_row(a) for a in tenant.alerts]
+    errors = []
+    for read in (per_row_reference, batched):
+        with pytest.raises(MaintenanceProofError) as raised:
+            read(Connection(tenant, []), tenant.id, rows, tenant.incidents)
+        errors.append(str(raised.value))
+    assert errors[0] == errors[1] == "maintenance_current_checkpoint_missing"
+
+
+def test_batched_checkpoint_proof_rejects_a_missing_checkpoint():
+    from appchi.maintenance.processing import MaintenanceProofError
+
+    tenant = EvidenceTenant()
+    missing = tenant.alerts[1]
+    tenant.checkpoint = lambda alert, real=tenant.checkpoint: (
+        None if alert == missing else real(alert)
+    )
+    rows = [tenant.alert_row(a) for a in tenant.alerts]
+    for read in (per_row_reference, batched):
+        with pytest.raises(MaintenanceProofError):
+            read(Connection(tenant, []), tenant.id, rows, [])
+
+
+def test_worker_turn_reads_evidence_alerts_and_links_once(native, monkeypatch):
+    from dataclasses import dataclass, replace
+    from types import SimpleNamespace
+
+    @dataclass(frozen=True)
+    class Snap:
+        id: object
+        suppressed: bool
+
+    tenant = EvidenceTenant()
+    prepared = replace(
+        correlation.prepare_tenant(Database(tenant), tenant.id, QUALIFIED), maintenance=True
+    )
+    states = (
+        SimpleNamespace(memberships=tuple(SimpleNamespace(alert_id=a) for a in tenant.alerts)),
+    )
+    active = {f"context-{i}": incident for i, incident in enumerate(reversed(tenant.incidents))}
+    seen = {}
+
+    def choose(states, snapshots, **kwargs):
+        seen.update(kwargs, snapshots=snapshots)
+        return None
+
+    monkeypatch.setattr(correlation, "_load", lambda *a, **k: (states, active, {}, {}, None))
+    monkeypatch.setattr(correlation, "_persist", lambda *a, **k: None)
+    monkeypatch.setattr(
+        correlation, "_snapshot", lambda row, owner=None: Snap(row["id"], row["suppressed"])
+    )
+    monkeypatch.setattr(correlation, "choose_decision", choose)
+    database = Database(tenant)
+    turn = correlation.worker_turn(
+        database, tenant.id, QUALIFIED, prepared_input=prepared, kafka=True
+    )
+    assert turn == 0
+    # Formerly one checkpoint read per evidence alert and one link read per incident.
+    assert database.reads("FROM maintenance_alert_checkpoints") == 1
+    assert database.reads("FROM incident_alert_links WHERE") == 1
+    assert seen["linked_alerts"] == {
+        tenant.incidents[0]: frozenset(tenant.alerts[:2]),
+        tenant.incidents[1]: frozenset({tenant.alerts[2]}),
+        tenant.incidents[2]: frozenset(),
+    }
+    assert {key: snap.suppressed for key, snap in seen["snapshots"].items()} == {
+        a: a == tenant.alerts[1] for a in tenant.alerts
+    }
+    # Lock order is unchanged: incidents, then alerts, both by id, before the reads.
+    (statements,) = [s for s in database.transactions if any("FOR UPDATE OF a" in t for t in s)]
+    starts = (
+        "SELECT id FROM incidents WHERE",
+        "SELECT a.* FROM alerts a",
+        "SELECT c.*,h.input_revision AS head_revision FROM maintenance_alert_checkpoints",
+        "SELECT clock_timestamp() AS now",
+        "SELECT incident_id,alert_id FROM incident_alert_links",
+    )
+    order = [next(i for i, t in enumerate(statements) if t.startswith(m)) for m in starts]
+    assert order == sorted(order)

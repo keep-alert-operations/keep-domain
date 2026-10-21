@@ -81,6 +81,8 @@ not invent historical input for existing alerts. Missing baseline blocks reducti
 5. `derive_current(conn, current, at)` is read-only and returns current suppression
    plus materialization-pending status from trusted causes and live boundaries.
    Missing checkpoints fail closed. Decisions still require transactional replay.
+   `derive_current_many(conn, tenant, rows, at)` applies the same check to several
+   alerts of one tenant with one checkpoint read; the correlation worker turn uses it.
 
 `temporal.reduce_alert` retains source/control order and requires explicit creation
 plus the complete before/after chain. Scheduled ends are exclusive and precede

@@ -810,6 +810,23 @@ def _commit_decision(conn, prepared, decision, position, alerts):
     return incident
 
 
+def _active_links(conn, tenant, incident_ids):
+    """Currently linked alerts per incident, in one statement (formerly one each).
+
+    Every requested incident gets an entry, empty when nothing is linked, in
+    ``incident_ids`` order. Empty input issues no statement.
+    """
+    if not incident_ids:
+        return {}
+    linked = {str(incident): set() for incident in incident_ids}
+    for row in conn.execute(
+        "SELECT incident_id,alert_id FROM incident_alert_links WHERE tenant_id=%s AND incident_id=ANY(%s::uuid[]) AND unlinked_at IS NULL",
+        (tenant, list(incident_ids)),
+    ):
+        linked[str(row["incident_id"])].add(row["alert_id"])
+    return {incident: frozenset(linked[str(incident)]) for incident in incident_ids}
+
+
 def worker_turn(
     database,
     tenant,
@@ -905,10 +922,10 @@ def worker_turn(
         }
         unsafe_suppression = set()
         if prepared.maintenance:
-            from appchi.maintenance.processing import derive_current
+            from appchi.maintenance.processing import derive_current_many
 
-            for row in rows:
-                suppressed, _ = derive_current(conn, row, now)
+            # One statement for every loaded alert (formerly one per alert).
+            for row, (suppressed, _) in zip(rows, derive_current_many(conn, tenant, rows, now)):
                 if suppressed != row["suppressed"]:
                     unsafe_suppression.add(row["id"])
         if event:
@@ -978,16 +995,7 @@ def worker_turn(
         snapshots = {key: _snapshot(row, owners.get(key)) for key, row in alerts.items()}
         for key in unsafe_suppression:
             snapshots[key] = replace(snapshots[key], suppressed=True)
-        links = {
-            incident: frozenset(
-                row["alert_id"]
-                for row in conn.execute(
-                    "SELECT alert_id FROM incident_alert_links WHERE tenant_id=%s AND incident_id=%s AND unlinked_at IS NULL",
-                    (tenant, incident),
-                )
-            )
-            for incident in incident_ids
-        }
+        links = _active_links(conn, tenant, incident_ids)
         decision = choose_decision(
             states, snapshots, now=decision_now, active_contexts=active, linked_alerts=links
         )
