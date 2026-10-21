@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from concurrent.futures import Future
-from threading import Condition, local
+from threading import Condition, Lock, local
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -65,7 +65,40 @@ def _cache_entries() -> int:
 # per thread. Size it above a worker's working set (maintenance segments plus
 # enabled correlation conditions of its tenants); a checked-data miss starts a
 # compiler process, and a cyclic working set larger than an LRU always misses.
+# Preparation recompiles every enabled expression of a tenant on each turn, so an
+# undersized cache misses on every turn. docs/cel-implementation.md gives the
+# sizing formula and measured per-entry memory; evictions log a warning.
 CACHE_ENTRIES = _cache_entries()
+EVICTION_LOG_INTERVAL_SECONDS = 60.0
+
+
+class _Evictions:
+    """Count LRU evictions of one cache kind and warn at most once a minute.
+
+    An eviction means the working set exceeded APPCHI_CEL_CACHE_ENTRIES. The
+    warning has fixed text and counts only; it never includes expression source.
+    """
+
+    def __init__(self, kind: str):
+        self.kind = kind
+        self.count = 0
+        self.next_log = 0.0
+        self.lock = Lock()
+
+    def record(self, capacity: int) -> None:
+        with self.lock:
+            self.count += 1
+            count = self.count
+            now = monotonic()
+            if now < self.next_log:
+                return
+            self.next_log = now + EVICTION_LOG_INTERVAL_SECONDS
+        log.warning(
+            "cel_cache_evicting cache=%s capacity=%d evictions=%d setting=APPCHI_CEL_CACHE_ENTRIES",
+            self.kind,
+            capacity,
+            count,
+        )
 
 
 class CELValidationError(ValueError):
@@ -636,7 +669,11 @@ def compile_expression(
     """Compile checked CEL; reuse=True returns this thread's warmed instance.
 
     Preparation that evaluates the same programs for many alerts passes reuse,
-    so writers never rebuild a native handle under their locks.
+    so writers never rebuild a native handle under their locks. Callers that
+    only build Elasticsearch queries never build a handle, and a request that
+    evaluates once spends well under a millisecond building one; they keep fresh
+    instances so request-supplied expressions are not retained per server thread.
+    Both paths share the process-wide checked-data cache.
     """
     if not isinstance(source, str):
         raise CELValidationError("Expression source must be a string")
@@ -669,9 +706,12 @@ class _ThreadPrograms(local):
     native runtime state; do not hand a reused instance to another thread.
     """
 
-    def __init__(self, capacity=CACHE_ENTRIES):
+    def __init__(self, capacity=CACHE_ENTRIES, evictions=None):
+        # threading.local reapplies these arguments in every thread, so one
+        # evictions counter passed here is shared by all threads.
         self.capacity = capacity
         self.entries = OrderedDict()
+        self.evictions = evictions or _Evictions("programs")
 
     def get(self, key, create):
         program = self.entries.get(key)
@@ -681,12 +721,13 @@ class _ThreadPrograms(local):
             self.entries[key] = program
             if len(self.entries) > self.capacity:
                 self.entries.popitem(last=False)
+                self.evictions.record(self.capacity)
         else:
             self.entries.move_to_end(key)
         return program
 
 
-_reusable = _ThreadPrograms()
+_reusable = _ThreadPrograms(CACHE_ENTRIES, _Evictions("programs"))
 
 
 class _CompileCache:
@@ -706,6 +747,7 @@ class _CompileCache:
         self.ready = OrderedDict()
         self.pending = {}
         self.condition = Condition()
+        self.evictions = _Evictions("checked")
 
     def get(self, key, compile_one):
         with self.condition:
@@ -751,14 +793,19 @@ class _CompileCache:
                 del self.pending[key]
                 self.condition.notify_all()
             raise
+        evicted = False
         with self.condition:
             self.ready[key] = value
             self.ready.move_to_end(key)
             if len(self.ready) > self.capacity:
                 self.ready.popitem(last=False)
+                evicted = True
             future.set_result(value)
             del self.pending[key]
             self.condition.notify_all()
+        if evicted:
+            # Counted and logged outside the condition so hits never wait on it.
+            self.evictions.record(self.capacity)
         return value
 
 
