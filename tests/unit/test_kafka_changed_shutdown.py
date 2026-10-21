@@ -13,6 +13,7 @@ def test_close_does_not_restart_assignment_or_retention_checks():
             # topology or mutate retention diagnostics during shutdown.
             consumer._assign(self, [object()])
 
+    consumer.uncommitted = {}
     consumer.client = Client()
     consumer.close()
     assert consumer.closing
