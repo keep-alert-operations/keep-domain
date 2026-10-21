@@ -8,6 +8,7 @@ import httpx
 import pytest
 from fastapi import Request
 
+import appchi.clock_health as clock_health
 import appchi.http as protocol
 from appchi.request_budget import deadline
 
@@ -32,7 +33,7 @@ def application(clock):
     ],
 )
 async def test_blocked_clock_read_keeps_loop_and_request_deadline_responsive(
-    monkeypatch, path, seconds, code
+    monkeypatch, tmp_path, path, seconds, code
 ):
     loop = asyncio.get_running_loop()
     entered = asyncio.Event()
@@ -41,15 +42,21 @@ async def test_blocked_clock_read_keeps_loop_and_request_deadline_responsive(
     timeouts = []
     calls = []
 
-    class BlockedClock:
-        def read_bytes(self):
-            loop.call_soon_threadsafe(entered.set)
-            try:
-                # Backstop prevents a regressed inline read from hanging the suite.
-                assert release.wait(5), "clock worker was not released"
-                return b"{}"
-            finally:
-                loop.call_soon_threadsafe(finished.set)
+    clock = tmp_path / "clock.json"
+    clock.write_bytes(b"{}")
+    real_stat = clock_health._stat
+
+    def blocked_stat(path):
+        # The cached check stats the evidence on every call; block that file access.
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            # Backstop prevents a regressed inline read from hanging the suite.
+            assert release.wait(5), "clock worker was not released"
+            return real_stat(path)
+        finally:
+            loop.call_soon_threadsafe(finished.set)
+
+    monkeypatch.setattr(clock_health, "_stat", blocked_stat)
 
     def controlled_timeout(value):
         scope = asyncio.timeout(None)
@@ -62,7 +69,7 @@ async def test_blocked_clock_read_keeps_loop_and_request_deadline_responsive(
         "asyncio",
         SimpleNamespace(timeout=controlled_timeout, to_thread=asyncio.to_thread),
     )
-    app = application(BlockedClock())
+    app = application(clock)
 
     @app.post(path)
     async def mutation():
@@ -100,8 +107,9 @@ async def test_clock_offload_propagates_budget(monkeypatch):
     observed = []
     main_thread = get_ident()
 
-    def clock_check(settings):
+    def clock_check(settings, *, cache):
         observed.append((deadline.get(), get_ident()))
+        assert cache is app.state.clock_evidence
 
     monkeypatch.setattr("appchi.clock_health.require_clock_health", clock_check)
     app = application(None)
@@ -228,3 +236,75 @@ async def test_clock_evidence_still_fails_closed(tmp_path, valid):
     assert bool(called) is valid
     if not valid:
         assert response.json()["error"]["code"] == "clock_untrusted"
+
+
+def evidence(path, *, synchronized=True):
+    path.write_text(
+        json.dumps(
+            {
+                "measured_at": datetime.now(UTC).isoformat(),
+                "synchronized": synchronized,
+                "offset_seconds": 0,
+            }
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_each_app_reuses_one_clock_evidence_cache(monkeypatch, tmp_path):
+    clock = tmp_path / "clock.json"
+    evidence(clock)
+    parses = []
+    real_parse = clock_health._parse
+
+    def counted(raw):
+        parses.append(raw)
+        return real_parse(raw)
+
+    monkeypatch.setattr(clock_health, "_parse", counted)
+    app = application(clock)
+    other = application(clock)
+    assert isinstance(app.state.clock_evidence, clock_health.ClockEvidenceCache)
+    assert app.state.clock_evidence is not other.state.clock_evidence
+
+    @app.post("/api/tenants/test/probe")
+    async def probe():
+        return {"ok": True}
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://clock.test"
+    ) as client:
+        for _ in range(3):
+            response = await client.post("/api/tenants/test/probe", json={})
+            assert response.status_code == 200
+    # Product roles check host and database evidence; both name the same unchanged file.
+    assert len(parses) == 1
+
+
+@pytest.mark.asyncio
+async def test_cached_clock_evidence_fails_closed_until_replaced(tmp_path):
+    clock = tmp_path / "clock.json"
+    evidence(clock, synchronized=False)
+    app = application(clock)
+    called = []
+
+    @app.post("/api/ingest/v1/alerts")
+    async def ingest():
+        called.append(True)
+        return {"ok": True}
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://clock.test"
+    ) as client:
+        for _ in range(2):
+            response = await client.post("/api/ingest/v1/alerts", json={})
+            assert response.status_code == 503
+            assert response.json()["error"]["code"] == "clock_untrusted"
+        assert not called
+        clock.unlink()
+        response = await client.post("/api/ingest/v1/alerts", json={})
+        assert response.status_code == 503
+        evidence(clock)
+        response = await client.post("/api/ingest/v1/alerts", json={})
+        assert response.status_code == 200
+        assert called == [True]

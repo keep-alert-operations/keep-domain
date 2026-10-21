@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 from fastapi import FastAPI, Request, Depends
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from appchi.clock_health import ClockEvidenceCache
 from appchi.ingestion.native import parse_json
 from appchi.shared.errors import AppError, unavailable
 from appchi.request_budget import request_budget
@@ -44,6 +45,8 @@ def create_http_app(lifespan, *, product=False):
         redoc_url=None,
         openapi_url=None,
     )
+    # One cache per application: unchanged clock evidence is stat-checked, not re-read.
+    app.state.clock_evidence = ClockEvidenceCache()
 
     def error_response(request, error):
         content = {
@@ -158,7 +161,12 @@ def create_http_app(lifespan, *, product=False):
 
             # A queued check may read evidence published after request arrival.
             # Validate freshness when the worker reads it; retain received_at for commands.
-            await asyncio.to_thread(require_clock_health, request.app.state.settings)
+            # The cached path still stats the file, so it stays off the event loop.
+            await asyncio.to_thread(
+                require_clock_health,
+                request.app.state.settings,
+                cache=request.app.state.clock_evidence,
+            )
         for key in request.query_params:
             if len(request.query_params.getlist(key)) > 1:
                 raise AppError("duplicate_parameter", "Repeated query parameters are invalid.", 400)
@@ -202,7 +210,8 @@ def create_http_app(lifespan, *, product=False):
                 chunks.append(chunk)
             request._body = b"".join(chunks)
             request.state.receipt_started = monotonic()
-            parse_json(request._body)
+            # Validated once here; handlers reuse the value instead of parsing again.
+            request.state.json_body = parse_json(request._body)
         return await call_next(request)
 
     @app.get("/livez", tags=["health"])
