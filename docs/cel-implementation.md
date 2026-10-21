@@ -77,10 +77,13 @@ Which callers reuse:
   through `prepare_for_tenant`, so they reuse too: `compile_catalog`, and with
   correlation enabled `prepare_tenant`. They run on the server threadpool, and
   each thread keeps its own program cache.
-- Test, validation, search and count handlers do not. Search, count and
-  validation handlers only build Elasticsearch queries and never build a native
-  handle. Rule and maintenance test handlers evaluate once per request; building
-  that handle took about 0.4 ms when measured. Reuse there would retain each
+- Test, validation, search, count and configuration save handlers do not.
+  Search, count and validation handlers only build Elasticsearch queries and
+  never build a native handle. Configuration saves compile to validate and
+  persist the definition: correlation rule create, replace and enable,
+  maintenance window saves and deletion, and preset and dashboard saves. Rule
+  and maintenance test handlers evaluate once per request; building that handle
+  took about 0.4 ms when measured. Reuse there would retain each
   request-supplied expression in every server thread, at about 27 KiB per
   warmed program.
 - The processor's cutover check reads only fields, and the indexer probe
@@ -105,11 +108,12 @@ and every checked miss starts a compiler process.
   Requests land on any thread of the threadpool (40 by default with anyio), so
   each thread converges on the whole mutated-tenant working set. Program memory
   is therefore up to `threads × min(working set, entries) × 27 KiB`: about
-  110 MiB per thread and 4.3 GiB for 40 threads when the 4096 bound is full.
+  108 MiB per thread and 4.2 GiB for 40 threads when the 4096 bound is full.
   The default suits the API only while the mutated-tenant working set stays in
-  the hundreds of expressions. Above that, set a lower bound or fewer threads
-  for the API, accepting some misses there, rather than raising it. One setting
-  bounds both caches, so lowering it also shrinks the API's checked cache.
+  the hundreds of expressions. Above that, set a lower bound for the API,
+  accepting some misses there, rather than raising it. One setting bounds both
+  caches, so lowering it also shrinks the API's checked cache. The API has no
+  setting for its threadpool size; changing it would need an API change.
 
 Measured on Windows CPython 3.13 with `cel-expr-python` 0.1.3, for a
 three-clause expression: about 4.4 KiB per checked entry and about 27 KiB per
@@ -125,11 +129,11 @@ the setting. Raise it, or spread tenants across more workers.
 A cold miss pays process start, module import and the compile itself. On a
 12-core Windows development machine an idle miss took 0.35–0.85 s (two runs:
 medians about 0.4 s and 0.6 s, maximum 0.84 s); process start and module
-import were about 0.4–0.5 s of that. With every core busy, 12 of 12 misses
+import were most of that. With every core busy, 12 of 12 misses
 overran the one-second deadline. The design contract asks only for one-second
 compiler jobs in a replaceable worker process (alert history technical
-supplement, section 5). Which pre-started process replaces the per-miss one is
-an open implementation decision. See the design register entry "CEL cold
+supplement, section 5). Whether and how to replace the per-miss process is an
+open decision. See the design register entry "CEL cold
 compilation process" of 2026-10-21.
 
 `rule_cost_upper_bound` exposes deterministic AST-plus-comparison work with
