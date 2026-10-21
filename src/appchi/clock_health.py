@@ -40,10 +40,14 @@ class ClockEvidenceCache:
     timestamp (ext4 jiffies, FAT, lazily updated NTFS times) leaves with an
     identical identity is seen within ``recheck_seconds``.
 
-    The age, offset and synchronized checks run on every call against the cached
-    values, so cached evidence is never accepted beyond its own 60 second
-    validity. A missing, unreadable, oversized or unhealthy file is never cached
-    and fails closed on that call.
+    Offset, ``synchronized`` and the size limit are validated before any
+    evidence is reused, and age is evaluated on every call from the cached
+    ``measured_at``, so cached evidence is never accepted beyond its own 60
+    second validity. Missing, unreadable, oversized, malformed, unsynchronized or
+    out-of-bound-offset evidence is never cached and fails closed on that call.
+    Stale, future-dated or naive-timestamp evidence may be cached and is
+    rejected on every call; its replacement is seen like any other change, at
+    once when the identity changes and otherwise within ``recheck_seconds``.
     """
 
     def __init__(self, *, recheck_seconds=1.0, clock=monotonic):
