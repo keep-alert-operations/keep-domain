@@ -184,7 +184,8 @@ def lock_catalog(conn, catalog, *, targets=(), incidents=()):
     if catalog and catalog.inline_correlation:
         from appchi.correlation.runtime import lock_decision_scope
 
-        lock_decision_scope(conn, tenant, targets, incidents=incidents)
+        # lock_contexts above already ran with live=True and these targets.
+        lock_decision_scope(conn, tenant, targets, incidents=incidents, contexts_locked=True)
 
 
 def apply_transition(conn, before, after, when, order, cause, now, catalog):

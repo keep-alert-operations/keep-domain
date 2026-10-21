@@ -592,9 +592,15 @@ def maintenance_input(conn, effect, current, owner, sequence, consuming_order=No
     )
 
 
-def lock_decision_scope(conn, tenant, targets, *, incidents=()):
-    """Prelock a bounded live-evidence decision scope before mutating a target."""
-    lock_contexts(conn, tenant, targets=targets, incidents=incidents)
+def lock_decision_scope(conn, tenant, targets, *, incidents=(), contexts_locked=False):
+    """Prelock a bounded live-evidence decision scope before mutating a target.
+
+    Pass contexts_locked=True only when the caller already ran lock_contexts in
+    this transaction with live=True and the same targets and incidents (or a
+    superset), such as lock_catalog with inline correlation.
+    """
+    if not contexts_locked:
+        lock_contexts(conn, tenant, targets=targets, incidents=incidents)
     ids = {UUID(str(value)) for value in targets}
     ids.update(
         row["alert_id"]
