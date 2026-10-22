@@ -158,7 +158,9 @@ class ChangedConsumer:
             asynchronous=False,
         )
         self._forget(list(self.uncommitted))
-        with self.db.transaction() as conn:
+        # One statement that never selects REPEATABLE READ: take the restore
+        # guard inside this transaction instead of around it.
+        with self.db.transaction(read_committed=True) as conn:
             conn.execute(
                 """INSERT INTO kafka_consumer_positions(consumer,topic,partition,next_offset)
                 SELECT %s,* FROM unnest(%s::text[],%s::integer[],%s::bigint[])
