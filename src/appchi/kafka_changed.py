@@ -267,6 +267,8 @@ class ChangedConsumer:
         here; the head then takes the single-partition path below, which
         isolates and fences a faulty input exactly as before.
         """
+        # A partition a failed shared call included runs alone until its own
+        # batch handler proves its group (see _turn_head), or it is fenced.
         if self._key(self.pending[0]) in self.solo:
             return 0, False
         chosen, seen, room = [], set(), self.batch_size
@@ -311,6 +313,9 @@ class ChangedConsumer:
 
     def _turn_head(self):
         group = self.pending.popleft()
+        # Whether this turn proved the partition's whole pending group: only
+        # then may a solo partition rejoin shared calls.
+        proven = True
         try:
             if self.batch_handler:
                 try:
@@ -321,14 +326,14 @@ class ChangedConsumer:
                     # A bad later record must not pin the partition before the
                     # actual fault. Resolve its healthy prefix without skipping.
                     self.handler(self.db, self.settings, self.profile, group[0])
-                    count = 1
+                    count, proven = 1, False
                 if count is None:
                     count = len(group)
                 if type(count) is not int or not 1 <= count <= len(group):
                     raise unavailable("changed_batch_progress_invalid")
             else:
                 self.handler(self.db, self.settings, self.profile, group[0])
-                count = 1
+                count, proven = 1, len(group) == 1
         except Exception:
             failed = group[0]
             self.retries.fail(failed)
@@ -349,13 +354,20 @@ class ChangedConsumer:
             # must not wait behind the retry.
             self.flush()
             return 0
-        self._advance(group, count)
+        self._advance(group, count, proven=proven)
         return count
 
-    def _advance(self, group, count, *, flush=True):
-        """Record a handled prefix of a removed group and requeue its remainder."""
+    def _advance(self, group, count, *, flush=True, proven=True):
+        """Record a handled prefix of a removed group and requeue its remainder.
+
+        A solo mark is cleared only when the group was proven: its batch
+        handler returned a count, or the whole group was handled. A one-record
+        fallback after a failed batch keeps the partition solo, because a fault
+        later in the group would fail shared calls again.
+        """
         message = group[count - 1]
-        self.solo = self.solo - {self._key(group)}
+        if proven:
+            self.solo = self.solo - {self._key(group)}
         self._handled(message, count, flush=flush)
         if count < len(group):
             # Preserve partition append order while rotating healthy partitions.

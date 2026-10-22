@@ -288,3 +288,46 @@ def test_revocation_clears_solo_marks():
     worker.solo = frozenset({("changed", 1), ("changed", 2)})
     worker._revoke(worker.client, [SimpleNamespace(topic="changed", partition=1)])
     assert worker.solo == {("changed", 2)}
+
+
+def test_a_fallback_solo_turn_keeps_a_later_fault_out_of_shared_calls():
+    shared = []
+
+    def groups(db, settings, profile, prefixes):
+        partitions = [prefix[0].partition() for prefix in prefixes]
+        shared.append(partitions)
+        if 1 in partitions:
+            raise RuntimeError("partition 1 offset 1 poisons every bulk it joins")
+        return [len(prefix) for prefix in prefixes]
+
+    def poisoned(value):
+        group = value if isinstance(value, list) else [value]
+        return any((m.partition(), m.offset()) == (1, 1) for m in group)
+
+    def batch(db, settings, profile, group):
+        if poisoned(group):
+            raise RuntimeError("poison")
+        return len(group)
+
+    def single(db, settings, profile, item):
+        if poisoned(item):
+            raise RuntimeError("poison")
+
+    worker = consumer(
+        [message(p, o) for o in range(3) for p in range(2)],
+        groups_handler=groups,
+        batch_handler=Mock(side_effect=batch),
+        handler=Mock(side_effect=single),
+    )
+    worker.client.poll.side_effect = [None, message(0, 3), *([None] * 10)]
+    # The shared call fails; partition 0 runs alone and 1 is marked solo.
+    assert worker.turn() == 3
+    # Partition 1's batch fails at offset 1; the fallback handles offset 0 only.
+    assert worker.turn() == 1
+    assert worker.solo == {("changed", 1)}
+    # It stays solo, so it runs alone again and is fenced at the actual fault.
+    assert worker.turn() == 0
+    assert ("changed", 1) in worker.retries.failed and worker.solo == frozenset()
+    assert worker.turn() == 1
+    assert shared == [[0, 1]]
+    assert committed(worker)[-1] == [(0, 4)]
