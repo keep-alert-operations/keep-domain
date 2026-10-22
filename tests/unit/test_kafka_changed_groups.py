@@ -270,13 +270,13 @@ def test_a_lasting_fault_in_a_non_head_partition_stops_failing_shared_calls():
     )
     # The failed shared call runs the head alone and marks the others solo.
     assert worker.turn() == 1
-    assert worker.solo == {("changed", 1), ("changed", 2), ("changed", 3)}
+    assert worker.solo.keys() == {("changed", 1), ("changed", 2), ("changed", 3)}
     # Each solo partition then takes one single-partition turn; 2 is fenced.
     assert worker.turn() == 1
     assert worker.turn() == 0
     assert ("changed", 2) in worker.retries.failed
     assert worker.turn() == 1
-    assert worker.solo == frozenset()
+    assert not worker.solo
     # Later turns batch the healthy partitions again without the faulty one.
     assert worker.turn() == 3
     assert shared == [[0, 1, 2, 3], [0, 1, 3]]
@@ -285,9 +285,9 @@ def test_a_lasting_fault_in_a_non_head_partition_stops_failing_shared_calls():
 
 def test_revocation_clears_solo_marks():
     worker = consumer(groups_handler=Mock())
-    worker.solo = frozenset({("changed", 1), ("changed", 2)})
+    worker.solo = {("changed", 1): 4, ("changed", 2): 7}
     worker._revoke(worker.client, [SimpleNamespace(topic="changed", partition=1)])
-    assert worker.solo == {("changed", 2)}
+    assert worker.solo == {("changed", 2): 7}
 
 
 def test_a_fallback_solo_turn_keeps_a_later_fault_out_of_shared_calls():
@@ -324,10 +324,63 @@ def test_a_fallback_solo_turn_keeps_a_later_fault_out_of_shared_calls():
     assert worker.turn() == 3
     # Partition 1's batch fails at offset 1; the fallback handles offset 0 only.
     assert worker.turn() == 1
-    assert worker.solo == {("changed", 1)}
+    assert worker.solo == {("changed", 1): 2}
     # It stays solo, so it runs alone again and is fenced at the actual fault.
     assert worker.turn() == 0
-    assert ("changed", 1) in worker.retries.failed and worker.solo == frozenset()
+    assert ("changed", 1) in worker.retries.failed and not worker.solo
     assert worker.turn() == 1
     assert shared == [[0, 1]]
     assert committed(worker)[-1] == [(0, 4)]
+
+
+def test_handler_only_solo_partition_rejoins_once_its_failed_prefix_is_handled():
+    shared = []
+
+    def groups(db, settings, profile, prefixes):
+        shared.append([prefix[0].partition() for prefix in prefixes])
+        if len(shared) == 1:
+            raise RuntimeError("bulk failed")
+        return [len(prefix) for prefix in prefixes]
+
+    worker = consumer([message(p, o) for o in range(2) for p in range(2)], groups_handler=groups)
+    worker.batch_handler = None
+    # A continuous trickle: every turn polls one more input, alternating partitions.
+    worker.client.poll.side_effect = [message(o % 2, 2 + o // 2) for o in range(80)]
+    assert worker.turn() == 1
+    assert worker.solo == {("changed", 1): 1}
+    turns = 0
+    while worker.solo:
+        worker.turn()
+        turns += 1
+        assert turns < 10
+    # Its pending group never shrinks to one input, yet the mark clears once
+    # offset 1, the last input it had in the failed call, is handled.
+    assert any((1, 2) in commit for commit in committed(worker))
+    for _ in range(3):
+        worker.turn()
+    # Shared calls resume with both partitions.
+    assert len(shared) >= 2 and set(shared[1]) == {0, 1}
+
+
+def test_a_partial_solo_batch_keeps_the_mark_until_the_failed_prefix_is_handled():
+    def groups(db, settings, profile, prefixes):
+        raise RuntimeError("bulk failed")
+
+    def batch(db, settings, profile, group):
+        # Partition 1 is capped (4 MiB or 500 documents) at one input per turn.
+        return 1 if group[0].partition() == 1 else len(group)
+
+    worker = consumer(
+        [message(p, o) for o in range(3) for p in range(2)],
+        groups_handler=groups,
+        batch_handler=Mock(side_effect=batch),
+    )
+    assert worker.turn() == 3
+    assert worker.solo == {("changed", 1): 2}
+    assert worker.turn() == 1
+    assert worker.solo == {("changed", 1): 2}
+    assert worker.turn() == 1
+    assert worker.solo == {("changed", 1): 2}
+    assert worker.turn() == 1
+    assert not worker.solo
+    assert committed(worker)[-1] == [(1, 3)]

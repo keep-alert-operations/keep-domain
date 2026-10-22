@@ -2,6 +2,7 @@
 
 from collections import deque
 from time import monotonic
+from types import MappingProxyType
 import logging
 
 from appchi.shared.errors import unavailable
@@ -56,9 +57,10 @@ class PartitionRetries:
 class ChangedConsumer:
     # Optional handler for several partitions' groups at once; see _turn_groups.
     groups_handler = None
-    # Partitions that must go through _turn_head once before joining a shared
-    # call again, because a shared call that included them failed.
-    solo = frozenset()
+    # Partitions a failed shared call included, each mapped to the last offset
+    # of its prefix in that call. Such a partition runs alone until that offset
+    # is handled, or it is fenced, revoked or lost. Replaced, never mutated.
+    solo = MappingProxyType({})
 
     def __init__(
         self,
@@ -123,7 +125,7 @@ class ChangedConsumer:
             except Exception:
                 log.warning("changed_revoke_commit_failed", extra={"consumer": self.role})
         self._forget(revoked)
-        self.solo = self.solo - revoked
+        self.solo = {key: offset for key, offset in self.solo.items() if key not in revoked}
         self.pending = deque(
             group
             for group in self.pending
@@ -267,8 +269,8 @@ class ChangedConsumer:
         here; the head then takes the single-partition path below, which
         isolates and fences a faulty input exactly as before.
         """
-        # A partition a failed shared call included runs alone until its own
-        # batch handler proves its group (see _turn_head), or it is fenced.
+        # A partition a failed shared call included runs alone until every input
+        # it had in that call is handled (see _advance), or it is fenced.
         if self._key(self.pending[0]) in self.solo:
             return 0, False
         chosen, seen, room = [], set(), self.batch_size
@@ -299,7 +301,10 @@ class ChangedConsumer:
             log.warning("changed_groups_batch_failed", extra={"consumer": self.role})
             # One lasting fault would fail every shared call. The head runs alone
             # now; each other partition runs alone once before rejoining.
-            self.solo = self.solo | {self._key(group) for group, _ in chosen[1:]}
+            self.solo = {
+                **self.solo,
+                **{self._key(prefix): prefix[-1].offset() for _, prefix in chosen[1:]},
+            }
             return 0, False
         total = 0
         for (group, _), count in zip(chosen, counts):
@@ -313,9 +318,6 @@ class ChangedConsumer:
 
     def _turn_head(self):
         group = self.pending.popleft()
-        # Whether this turn proved the partition's whole pending group: only
-        # then may a solo partition rejoin shared calls.
-        proven = True
         try:
             if self.batch_handler:
                 try:
@@ -326,19 +328,19 @@ class ChangedConsumer:
                     # A bad later record must not pin the partition before the
                     # actual fault. Resolve its healthy prefix without skipping.
                     self.handler(self.db, self.settings, self.profile, group[0])
-                    count, proven = 1, False
+                    count = 1
                 if count is None:
                     count = len(group)
                 if type(count) is not int or not 1 <= count <= len(group):
                     raise unavailable("changed_batch_progress_invalid")
             else:
                 self.handler(self.db, self.settings, self.profile, group[0])
-                count, proven = 1, len(group) == 1
+                count = 1
         except Exception:
             failed = group[0]
             self.retries.fail(failed)
             key = (failed.topic(), failed.partition())
-            self.solo = self.solo - {key}
+            self.solo = {k: offset for k, offset in self.solo.items() if k != key}
             self.pending = deque(g for g in self.pending if (g[0].topic(), g[0].partition()) != key)
             with self.db.transaction() as conn:
                 conn.execute(
@@ -354,20 +356,21 @@ class ChangedConsumer:
             # must not wait behind the retry.
             self.flush()
             return 0
-        self._advance(group, count, proven=proven)
+        self._advance(group, count)
         return count
 
-    def _advance(self, group, count, *, flush=True, proven=True):
+    def _advance(self, group, count, *, flush=True):
         """Record a handled prefix of a removed group and requeue its remainder.
 
-        A solo mark is cleared only when the group was proven: its batch
-        handler returned a count, or the whole group was handled. A one-record
-        fallback after a failed batch keeps the partition solo, because a fault
-        later in the group would fail shared calls again.
+        A solo mark clears once the last offset the partition had in the failed
+        shared call is handled, whichever path handled it. A partial batch or a
+        one-record fallback short of that offset keeps the partition solo, so a
+        fault inside the failed prefix cannot fail shared calls again.
         """
         message = group[count - 1]
-        if proven:
-            self.solo = self.solo - {self._key(group)}
+        key = self._key(group)
+        if key in self.solo and message.offset() >= self.solo[key]:
+            self.solo = {k: offset for k, offset in self.solo.items() if k != key}
         self._handled(message, count, flush=flush)
         if count < len(group):
             # Preserve partition append order while rotating healthy partitions.
