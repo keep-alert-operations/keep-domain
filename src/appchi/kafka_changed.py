@@ -8,6 +8,10 @@ from appchi.shared.errors import unavailable
 
 log = logging.getLogger(__name__)
 
+# Most inputs one fetch or one handler call may carry. A search hint becomes at
+# most one document, so this matches the projection writer's bulk limit.
+MAX_BATCH = 500
+
 
 class PartitionRetries:
     """Retain failed offsets without repeatedly rebalancing healthy partitions."""
@@ -50,6 +54,9 @@ class PartitionRetries:
 
 
 class ChangedConsumer:
+    # Optional handler for several partitions' groups at once; see _turn_groups.
+    groups_handler = None
+
     def __init__(
         self,
         db,
@@ -59,6 +66,7 @@ class ChangedConsumer:
         handler,
         *,
         batch_handler=None,
+        groups_handler=None,
         batch_size=50,
         commit_every=100,
         commit_interval=0.1,
@@ -69,7 +77,8 @@ class ChangedConsumer:
         self.db, self.settings, self.profile, self.role = db, settings, profile, role
         self.handler = handler
         self.batch_handler = batch_handler
-        self.batch_size = min(50, max(1, batch_size))
+        self.groups_handler = groups_handler
+        self.batch_size = min(MAX_BATCH, max(1, batch_size))
         self.pending = deque()
         self.closing = False
         # Handled inputs whose PostgreSQL transactions committed but whose offsets
@@ -127,12 +136,13 @@ class ChangedConsumer:
         if not self.uncommitted:
             self.uncommitted_count, self.uncommitted_since = 0, None
 
-    def _handled(self, message, count):
+    def _handled(self, message, count, *, flush=True):
         self.uncommitted[(message.topic(), message.partition())] = message
         self.uncommitted_count += count
         if self.uncommitted_since is None:
             self.uncommitted_since = monotonic()
-        self._flush_due()
+        if flush:
+            self._flush_due()
 
     def _flush_due(self):
         if self.uncommitted and (
@@ -232,6 +242,61 @@ class ChangedConsumer:
         if not self.pending:
             self._flush_due()
             return 0
+        total = 0
+        if self.groups_handler:
+            total, head_done = self._turn_groups()
+            if head_done or not self.pending:
+                return total
+        return total + self._turn_head()
+
+    def _turn_groups(self):
+        """Handle the first pending group of every partition in one handler call.
+
+        The handler receives one input prefix per partition, at most batch_size
+        inputs in all, and returns how many leading inputs of each prefix are
+        durably handled. Each partition advances only by its own count, after
+        the call returned. A failed call or an unhandled head advances nothing
+        here; the head then takes the single-partition path below, which
+        isolates and fences a faulty input exactly as before.
+        """
+        chosen, seen, room = [], set(), self.batch_size
+        for group in self.pending:
+            key = (group[0].topic(), group[0].partition())
+            if key in seen:
+                continue
+            seen.add(key)
+            chosen.append((group, group[:room]))
+            room -= len(chosen[-1][1])
+            if room <= 0:
+                break
+        if len(chosen) < 2:
+            return 0, False
+        prefixes = [prefix for _, prefix in chosen]
+        try:
+            counts = self.groups_handler(self.db, self.settings, self.profile, prefixes)
+            if (
+                not isinstance(counts, (list, tuple))
+                or len(counts) != len(prefixes)
+                or any(
+                    type(count) is not int or not 0 <= count <= len(prefix)
+                    for count, prefix in zip(counts, prefixes)
+                )
+            ):
+                raise unavailable("changed_batch_progress_invalid")
+        except Exception:
+            log.warning("changed_groups_batch_failed", extra={"consumer": self.role})
+            return 0, False
+        total = 0
+        for (group, _), count in zip(chosen, counts):
+            if count:
+                self.pending = deque(g for g in self.pending if g is not group)
+                self._advance(group, count, flush=False)
+                total += count
+        # One broker commit then carries every advanced partition's own offset.
+        self._flush_due()
+        return total, counts[0] > 0
+
+    def _turn_head(self):
         group = self.pending.popleft()
         try:
             if self.batch_handler:
@@ -270,8 +335,13 @@ class ChangedConsumer:
             # must not wait behind the retry.
             self.flush()
             return 0
+        self._advance(group, count)
+        return count
+
+    def _advance(self, group, count, *, flush=True):
+        """Record a handled prefix of a removed group and requeue its remainder."""
         message = group[count - 1]
-        self._handled(message, count)
+        self._handled(message, count, flush=flush)
         if count < len(group):
             # Preserve partition append order while rotating healthy partitions.
             remainder = group[count:]
@@ -283,7 +353,6 @@ class ChangedConsumer:
                     remainder.extend(queued)
                     self.pending.remove(queued)
             self.pending.append(remainder)
-        return count
 
     def close(self):
         self.closing = True
