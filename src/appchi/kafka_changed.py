@@ -300,7 +300,8 @@ class ChangedConsumer:
         except Exception:
             log.warning("changed_groups_batch_failed", extra={"consumer": self.role})
             # One lasting fault would fail every shared call. The head runs alone
-            # now; each other partition runs alone once before rejoining.
+            # now; each other partition runs alone until every input it had in
+            # this call is handled (see _advance).
             self.solo = {
                 **self.solo,
                 **{self._key(prefix): prefix[-1].offset() for _, prefix in chosen[1:]},
