@@ -652,3 +652,60 @@ def test_worker_turn_reads_evidence_alerts_and_links_once(native, monkeypatch):
     )
     order = [next(i for i, t in enumerate(statements) if t.startswith(m)) for m in starts]
     assert order == sorted(order)
+
+
+class LockConnection:
+    """Records lock statements; every read is empty except the transaction id."""
+
+    def __init__(self):
+        self.statements = []
+
+    def execute(self, sql, params=()):
+        text = " ".join(sql.split())
+        self.statements.append((text, params))
+        return Result([{"id": "1"}] if "pg_current_xact_id" in text else [])
+
+    def index(self, prefix):
+        return [i for i, (text, _) in enumerate(self.statements) if text.startswith(prefix)]
+
+
+RULE_LOCK = "SELECT id FROM correlation_rules WHERE tenant_id=%s AND enabled AND deleted_at"
+CONTEXT_LOCK = "WITH relevant AS"
+
+
+def lock_catalog_with(inline_correlation, targets, incidents=()):
+    from types import SimpleNamespace
+
+    catalog = SimpleNamespace(
+        tenant_id=uuid4(), segments=(), inline_requested=True, inline_correlation=inline_correlation
+    )
+    conn = LockConnection()
+    maintenance.lock_catalog(conn, catalog, targets=targets, incidents=incidents)
+    return conn
+
+
+def test_inline_lock_catalog_locks_contexts_once_before_the_decision_scope():
+    target, incident = uuid4(), uuid4()
+    conn = lock_catalog_with(object(), [target], [incident])
+    (rules,), (contexts,) = conn.index(RULE_LOCK), conn.index(CONTEXT_LOCK)
+    # The single context lock covers the decision scope: live, same targets and incidents.
+    _, params = conn.statements[contexts]
+    assert params[1] is False and params[3] is True
+    assert params[5] == [incident] and params[7] == [target]
+    (incidents,) = conn.index("SELECT id FROM incidents WHERE")
+    (alerts,) = conn.index("SELECT id FROM alerts WHERE")
+    assert rules < contexts < incidents < alerts
+
+
+def test_paths_without_inline_correlation_still_lock_contexts():
+    target = uuid4()
+    conn = lock_catalog_with(None, [target])
+    assert len(conn.index(RULE_LOCK)) == len(conn.index(CONTEXT_LOCK)) == 1
+    assert conn.statements[conn.index(CONTEXT_LOCK)[0]][1][3] is False  # not live
+    assert not conn.index("SELECT id FROM incidents WHERE")
+    # A direct decision-scope lock still takes the context lock itself.
+    direct = LockConnection()
+    correlation.lock_decision_scope(direct, uuid4(), [target])
+    (rules,), (contexts,) = direct.index(RULE_LOCK), direct.index(CONTEXT_LOCK)
+    assert direct.statements[contexts][1][3] is True
+    assert rules < contexts < direct.index("SELECT id FROM incidents WHERE")[0]
