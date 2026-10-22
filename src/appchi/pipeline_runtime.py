@@ -7,7 +7,7 @@ import signal
 from threading import Event
 
 from appchi.alert_notifications import configure
-from appchi.clock_health import require_clock_health
+from appchi.clock_health import ClockEvidenceCache, require_clock_health
 from appchi.config import Settings
 from appchi.db import Database
 from appchi.visibility.runtime import capture_profile
@@ -31,6 +31,8 @@ def run(role, make_transport, *, before_turn=None, transport_optional=False):
     transport = None
     stopped = Event()
     previous = {}
+    # Each turn checks clock health; unchanged evidence files are not re-read.
+    clock_evidence = ClockEvidenceCache()
 
     def stop(*_):
         health.publish(draining=True)
@@ -48,7 +50,7 @@ def run(role, make_transport, *, before_turn=None, transport_optional=False):
             progress = 0
             failed = False
             try:
-                require_clock_health(settings)
+                require_clock_health(settings, cache=clock_evidence)
                 transport_failed = False
                 try:
                     if transport is None:
