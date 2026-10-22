@@ -56,6 +56,9 @@ class PartitionRetries:
 class ChangedConsumer:
     # Optional handler for several partitions' groups at once; see _turn_groups.
     groups_handler = None
+    # Partitions that must go through _turn_head once before joining a shared
+    # call again, because a shared call that included them failed.
+    solo = frozenset()
 
     def __init__(
         self,
@@ -120,12 +123,17 @@ class ChangedConsumer:
             except Exception:
                 log.warning("changed_revoke_commit_failed", extra={"consumer": self.role})
         self._forget(revoked)
+        self.solo = self.solo - revoked
         self.pending = deque(
             group
             for group in self.pending
             if (group[0].topic(), group[0].partition()) not in revoked
         )
         self.retries.revoke(partitions)
+
+    @staticmethod
+    def _key(group):
+        return (group[0].topic(), group[0].partition())
 
     def _lost(self, client, partitions):
         self._revoke(client, partitions, lost=True)
@@ -259,10 +267,12 @@ class ChangedConsumer:
         here; the head then takes the single-partition path below, which
         isolates and fences a faulty input exactly as before.
         """
+        if self._key(self.pending[0]) in self.solo:
+            return 0, False
         chosen, seen, room = [], set(), self.batch_size
         for group in self.pending:
-            key = (group[0].topic(), group[0].partition())
-            if key in seen:
+            key = self._key(group)
+            if key in seen or key in self.solo:
                 continue
             seen.add(key)
             chosen.append((group, group[:room]))
@@ -285,6 +295,9 @@ class ChangedConsumer:
                 raise unavailable("changed_batch_progress_invalid")
         except Exception:
             log.warning("changed_groups_batch_failed", extra={"consumer": self.role})
+            # One lasting fault would fail every shared call. The head runs alone
+            # now; each other partition runs alone once before rejoining.
+            self.solo = self.solo | {self._key(group) for group, _ in chosen[1:]}
             return 0, False
         total = 0
         for (group, _), count in zip(chosen, counts):
@@ -320,6 +333,7 @@ class ChangedConsumer:
             failed = group[0]
             self.retries.fail(failed)
             key = (failed.topic(), failed.partition())
+            self.solo = self.solo - {key}
             self.pending = deque(g for g in self.pending if (g[0].topic(), g[0].partition()) != key)
             with self.db.transaction() as conn:
                 conn.execute(
@@ -341,6 +355,7 @@ class ChangedConsumer:
     def _advance(self, group, count, *, flush=True):
         """Record a handled prefix of a removed group and requeue its remainder."""
         message = group[count - 1]
+        self.solo = self.solo - {self._key(group)}
         self._handled(message, count, flush=flush)
         if count < len(group):
             # Preserve partition append order while rotating healthy partitions.

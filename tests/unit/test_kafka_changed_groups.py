@@ -242,3 +242,49 @@ def test_batch_size_is_capped_at_the_writer_document_limit(monkeypatch):
     assert ChangedConsumer(Db(), settings, None, "correlation", Mock()).batch_size == 50
     # Fixtures that build the consumer with __new__ inherit no shared handler.
     assert ChangedConsumer.__new__(ChangedConsumer).groups_handler is None
+
+
+def test_a_lasting_fault_in_a_non_head_partition_stops_failing_shared_calls():
+    shared = []
+
+    def groups(db, settings, profile, prefixes):
+        partitions = [prefix[0].partition() for prefix in prefixes]
+        shared.append(partitions)
+        if 2 in partitions:
+            raise RuntimeError("partition 2 poisons every bulk it joins")
+        return [len(prefix) for prefix in prefixes]
+
+    def alone(db, settings, profile, value):
+        group = value if isinstance(value, list) else [value]
+        if group[0].partition() == 2:
+            raise RuntimeError("poison")
+        return len(group)
+
+    later = [message(p, 1) for p in range(4)]
+    worker = consumer(
+        [message(p, 0) for p in range(4)],
+        later,
+        groups_handler=groups,
+        batch_handler=Mock(side_effect=alone),
+        handler=Mock(side_effect=alone),
+    )
+    # The failed shared call runs the head alone and marks the others solo.
+    assert worker.turn() == 1
+    assert worker.solo == {("changed", 1), ("changed", 2), ("changed", 3)}
+    # Each solo partition then takes one single-partition turn; 2 is fenced.
+    assert worker.turn() == 1
+    assert worker.turn() == 0
+    assert ("changed", 2) in worker.retries.failed
+    assert worker.turn() == 1
+    assert worker.solo == frozenset()
+    # Later turns batch the healthy partitions again without the faulty one.
+    assert worker.turn() == 3
+    assert shared == [[0, 1, 2, 3], [0, 1, 3]]
+    assert committed(worker)[-1] == [(0, 2), (1, 2), (3, 2)]
+
+
+def test_revocation_clears_solo_marks():
+    worker = consumer(groups_handler=Mock())
+    worker.solo = frozenset({("changed", 1), ("changed", 2)})
+    worker._revoke(worker.client, [SimpleNamespace(topic="changed", partition=1)])
+    assert worker.solo == {("changed", 2)}
