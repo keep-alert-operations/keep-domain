@@ -14,6 +14,22 @@ from appchi.visibility.runtime import capture_profile
 from appchi.worker_health import WorkerHealth
 
 log = logging.getLogger(__name__)
+IDLE_WAIT_SECONDS = 0.01
+MAX_IDLE_WAIT_SECONDS = 1.0
+
+
+def idle_wait(transport, before_turn):
+    """Seconds to wait after a turn without progress.
+
+    A live transport's bounded poll already waits for, and wakes on, new input,
+    so the short pause is kept. Without one (a Kafka outage), only background
+    work remains: sleep until its next due time, if it reports one, bounded so
+    the transport is retried within a second. A stop request ends any wait.
+    """
+    idle_seconds = getattr(before_turn, "idle_seconds", None)
+    if transport is not None or idle_seconds is None:
+        return IDLE_WAIT_SECONDS
+    return min(MAX_IDLE_WAIT_SECONDS, max(IDLE_WAIT_SECONDS, idle_seconds()))
 
 
 def run(role, make_transport, *, before_turn=None, transport_optional=False):
@@ -88,7 +104,9 @@ def run(role, make_transport, *, before_turn=None, transport_optional=False):
                     raise SystemExit(1) from None
             if args.once:
                 return
-            health.wait(stopped, 1 if failed else 0 if progress else 0.01)
+            health.wait(
+                stopped, 1 if failed else 0 if progress else idle_wait(transport, before_turn)
+            )
     finally:
         health.publish(draining=True)
         try:
