@@ -18,6 +18,7 @@ from appchi.correlation import repository
 from appchi.correlation import runtime as correlation
 from appchi.maintenance import runtime as maintenance
 from appchi.serialization import wire
+from appchi.shared.errors import AppError
 
 NOW = datetime(2026, 10, 18, 12, tzinfo=UTC)
 RELEASE = NOW - timedelta(days=1)
@@ -369,3 +370,78 @@ def test_batched_rule_conditions_match_get_rule(native):
     assert len(statements) == 1
     assert repository.with_conditions(connection, tenant.id, []) == ()
     assert len(statements) == 1
+
+
+class WorkerTenant(Tenant):
+    """Answers a worker turn up to its evidence load; health changed after preparation."""
+
+    def __init__(self, *, revision=1):
+        super().__init__()
+        self.revision = revision
+
+    def respond(self, text, params):
+        if text.startswith("SELECT ready FROM capability_gates"):
+            return [{"ready": True}]
+        if "FROM tenant_work_state" in text:
+            return [{"tenant_id": self.id}]
+        if "UPDATE tenant_work_state" in text:
+            return [{"now": NOW, "admission_order": 1}]
+        if text.endswith(("ORDER BY id FOR UPDATE", "FOR UPDATE OF c")):
+            return []  # lock_contexts
+        if text.startswith("SELECT id,revision,health,blocked_reason FROM correlation_rules"):
+            return [
+                {
+                    "id": self.rule,
+                    "revision": self.revision,
+                    "health": "blocked",
+                    "blocked_reason": "condition_evaluation_failed",
+                }
+            ]
+        if "FROM correlation_consumer_state" in text:
+            return [{"kafka_sequence": 0, "change_order": 0}]
+        return super().respond(text, params)
+
+    def rule_row(self):
+        return dict(super().rule_row(), health="healthy", blocked_reason=None)
+
+
+class Loaded(Exception):
+    pass
+
+
+def test_worker_turn_refreshes_health_without_reloading_rules(native, monkeypatch):
+    tenant = WorkerTenant()
+    prepared = correlation.prepare_tenant(Database(tenant), tenant.id, QUALIFIED)
+    seen = []
+
+    def load(conn, current, *args, **kwargs):
+        seen.append(current)
+        raise Loaded
+
+    monkeypatch.setattr(correlation, "_load", load)
+    database = Database(tenant)
+    with pytest.raises(Loaded):
+        correlation.worker_turn(database, tenant.id, QUALIFIED, prepared_input=prepared, kafka=True)
+    # A rule blocked by an earlier turn stays blocked, as get_rule reported it.
+    (row,) = seen[0].rows
+    assert (row["health"], row["blocked_reason"]) == ("blocked", "condition_evaluation_failed")
+    assert {k: v for k, v in row.items() if k not in {"health", "blocked_reason"}} == {
+        k: v for k, v in prepared.rows[0].items() if k not in {"health", "blocked_reason"}
+    }
+    # The reusable prepared input is not mutated.
+    assert (prepared.rows[0]["health"], prepared.rows[0]["blocked_reason"]) == ("healthy", None)
+    # Health rides on the revision check; formerly two statements per enabled rule.
+    assert database.reads("FROM correlation_rules WHERE tenant_id=%s AND id=%s") == 0
+    assert database.reads("FROM correlation_conditions") == 0
+    assert database.reads("ORDER BY created_at,id") == 1
+
+
+def test_worker_turn_still_rejects_a_changed_revision(native, monkeypatch):
+    tenant = WorkerTenant(revision=2)
+    prepared = correlation.prepare_tenant(Database(tenant), tenant.id, QUALIFIED)
+    monkeypatch.setattr(correlation, "_load", lambda *args, **kwargs: pytest.fail("loaded"))
+    with pytest.raises(AppError) as raised:
+        correlation.worker_turn(
+            Database(tenant), tenant.id, QUALIFIED, prepared_input=prepared, kafka=True
+        )
+    assert raised.value.code == "correlation_compiled_revision_changed"

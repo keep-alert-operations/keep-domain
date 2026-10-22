@@ -845,7 +845,7 @@ def worker_turn(
             return 0
         lock_contexts(conn, tenant, targets=())
         current = conn.execute(
-            "SELECT id,revision FROM correlation_rules WHERE tenant_id=%s AND enabled AND NOT kafka_schema_blocked AND deleted_at IS NULL ORDER BY created_at,id",
+            "SELECT id,revision,health,blocked_reason FROM correlation_rules WHERE tenant_id=%s AND enabled AND NOT kafka_schema_blocked AND deleted_at IS NULL ORDER BY created_at,id",
             (tenant,),
         ).fetchall()
         if [(r["id"], r["revision"]) for r in current] != [
@@ -854,8 +854,14 @@ def worker_turn(
             raise unavailable("correlation_compiled_revision_changed")
         # Health is runtime state and can change without a configuration revision.
         # A second worker must never resurrect a rule blocked by the first turn.
+        # Equal revisions prove every other column and condition is unchanged, so
+        # only health is refreshed, on copies: callers reuse the prepared input.
         prepared = replace(
-            prepared, rows=tuple(repo.get_rule(conn, tenant, row["id"]) for row in current)
+            prepared,
+            rows=tuple(
+                dict(row, health=fresh["health"], blocked_reason=fresh["blocked_reason"])
+                for row, fresh in zip(prepared.rows, current)
+            ),
         )
         consumer = conn.execute(
             "SELECT * FROM correlation_consumer_state WHERE tenant_id=%s FOR UPDATE", (tenant,)
