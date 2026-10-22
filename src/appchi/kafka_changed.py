@@ -50,7 +50,19 @@ class PartitionRetries:
 
 
 class ChangedConsumer:
-    def __init__(self, db, settings, profile, role, handler, *, batch_handler=None, batch_size=50):
+    def __init__(
+        self,
+        db,
+        settings,
+        profile,
+        role,
+        handler,
+        *,
+        batch_handler=None,
+        batch_size=50,
+        commit_every=100,
+        commit_interval=0.1,
+    ):
         from confluent_kafka import Consumer
         from appchi.service_clients import kafka_options
 
@@ -60,6 +72,10 @@ class ChangedConsumer:
         self.batch_size = min(50, max(1, batch_size))
         self.pending = deque()
         self.closing = False
+        # Handled inputs whose PostgreSQL transactions committed but whose offsets
+        # are not committed yet. Replay of these inputs is idempotent.
+        self.commit_every, self.commit_interval = max(1, commit_every), commit_interval
+        self.uncommitted, self.uncommitted_count, self.uncommitted_since = {}, 0, None
         with db.transaction() as conn:
             self.control = conn.execute(
                 "SELECT * FROM kafka_pipeline_control WHERE singleton"
@@ -81,16 +97,79 @@ class ChangedConsumer:
             [f"appchi.{settings.environment}.alerts.changed"],
             on_assign=self._assign,
             on_revoke=self._revoke,
+            on_lost=self._lost,
         )
 
-    def _revoke(self, client, partitions):
+    def _revoke(self, client, partitions, *, lost=False):
         revoked = {(p.topic, p.partition) for p in partitions}
+        # A revoking generation still owns its partitions: commit what it handled.
+        # A lost (fenced) generation cannot commit; the next owner replays from the
+        # committed offset. Neither carries offsets into a later assignment.
+        if not lost:
+            try:
+                self.flush()
+            except Exception:
+                log.warning("changed_revoke_commit_failed", extra={"consumer": self.role})
+        self._forget(revoked)
         self.pending = deque(
             group
             for group in self.pending
             if (group[0].topic(), group[0].partition()) not in revoked
         )
         self.retries.revoke(partitions)
+
+    def _lost(self, client, partitions):
+        self._revoke(client, partitions, lost=True)
+
+    def _forget(self, keys):
+        for key in keys:
+            self.uncommitted.pop(key, None)
+        if not self.uncommitted:
+            self.uncommitted_count, self.uncommitted_since = 0, None
+
+    def _handled(self, message, count):
+        self.uncommitted[(message.topic(), message.partition())] = message
+        self.uncommitted_count += count
+        if self.uncommitted_since is None:
+            self.uncommitted_since = monotonic()
+        self._flush_due()
+
+    def _flush_due(self):
+        if self.uncommitted and (
+            self.uncommitted_count >= self.commit_every
+            or monotonic() - self.uncommitted_since >= self.commit_interval
+        ):
+            self.flush()
+
+    def flush(self):
+        """Commit handled offsets, then record them in one PostgreSQL statement.
+
+        Every handled input's PostgreSQL transaction has already committed, so a
+        broker offset never runs ahead of durable state. The recorded positions are
+        diagnostics and follow the broker commit.
+        """
+        if not self.uncommitted:
+            return
+        from confluent_kafka import TopicPartition
+
+        handled = list(self.uncommitted.values())
+        self.client.commit(
+            offsets=[TopicPartition(m.topic(), m.partition(), m.offset() + 1) for m in handled],
+            asynchronous=False,
+        )
+        self._forget(list(self.uncommitted))
+        with self.db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO kafka_consumer_positions(consumer,topic,partition,next_offset)
+                SELECT %s,* FROM unnest(%s::text[],%s::integer[],%s::bigint[])
+                ON CONFLICT(consumer,topic,partition) DO UPDATE SET next_offset=greatest(kafka_consumer_positions.next_offset,EXCLUDED.next_offset),updated_at=clock_timestamp()""",
+                (
+                    self.role,
+                    [m.topic() for m in handled],
+                    [m.partition() for m in handled],
+                    [m.offset() + 1 for m in handled],
+                ),
+            )
 
     def _assign(self, client, partitions):
         if self.closing:
@@ -151,6 +230,7 @@ class ChangedConsumer:
             else:
                 group.append(message)
         if not self.pending:
+            self._flush_due()
             return 0
         group = self.pending.popleft()
         try:
@@ -186,15 +266,12 @@ class ChangedConsumer:
                 "changed_partition_retry",
                 extra={"consumer": self.role, "partition": failed.partition()},
             )
+            # The failed partition's handled prefix and other partitions' progress
+            # must not wait behind the retry.
+            self.flush()
             return 0
         message = group[count - 1]
-        self.client.commit(message=message, asynchronous=False)
-        with self.db.transaction() as conn:
-            conn.execute(
-                """INSERT INTO kafka_consumer_positions(consumer,topic,partition,next_offset) VALUES(%s,%s,%s,%s)
-                ON CONFLICT(consumer,topic,partition) DO UPDATE SET next_offset=greatest(kafka_consumer_positions.next_offset,EXCLUDED.next_offset),updated_at=clock_timestamp()""",
-                (self.role, message.topic(), message.partition(), message.offset() + 1),
-            )
+        self._handled(message, count)
         if count < len(group):
             # Preserve partition append order while rotating healthy partitions.
             remainder = group[count:]
@@ -210,4 +287,10 @@ class ChangedConsumer:
 
     def close(self):
         self.closing = True
-        self.client.close()
+        try:
+            self.flush()
+        except Exception:
+            # Unflushed inputs replay from the committed offset.
+            log.warning("changed_close_commit_failed", extra={"consumer": self.role})
+        finally:
+            self.client.close()
