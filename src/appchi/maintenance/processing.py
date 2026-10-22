@@ -1037,10 +1037,38 @@ def derive_current(conn, current, at):
         LEFT JOIN maintenance_alert_input_heads h USING(tenant_id,alert_id) WHERE c.tenant_id=%s AND c.alert_id=%s""",
         (tenant, alert_id),
     ).fetchone()
+    _require_current_checkpoint(checkpoint)
+    return bool(current["suppressed"]), False
+
+
+def derive_current_many(conn, tenant, rows, at):
+    """derive_current for several alerts of one tenant in one statement.
+
+    Results follow ``rows`` order, and the first row without a current checkpoint
+    raises exactly as derive_current would. Empty input issues no statement.
+    """
+    rows = list(rows)
+    if not rows:
+        return []
+    checkpoints = {
+        str(checkpoint["alert_id"]): checkpoint
+        for checkpoint in conn.execute(
+            """SELECT c.*,h.input_revision AS head_revision FROM maintenance_alert_checkpoints c
+            LEFT JOIN maintenance_alert_input_heads h USING(tenant_id,alert_id) WHERE c.tenant_id=%s AND c.alert_id=ANY(%s::uuid[])""",
+            (tenant, sorted({str(row["id"]) for row in rows})),
+        )
+    }
+    result = []
+    for row in rows:
+        _require_current_checkpoint(checkpoints.get(str(row["id"])))
+        result.append((bool(row["suppressed"]), False))
+    return result
+
+
+def _require_current_checkpoint(checkpoint):
     if (
         not checkpoint
         or not checkpoint["complete"]
         or checkpoint["input_revision"] != checkpoint["head_revision"]
     ):
         raise MaintenanceProofError("maintenance_current_checkpoint_missing")
-    return bool(current["suppressed"]), False
