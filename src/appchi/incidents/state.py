@@ -1,10 +1,11 @@
 import hashlib
 import unicodedata
+from datetime import timedelta
 from uuid import uuid4
 from psycopg.types.json import Jsonb
 from appchi.alerts.repository import publish, store_alert
 from appchi.alerts.state import retained, pending, maintenance_adjust
-from appchi.correlation.runtime import lock_contexts, release_alert
+from appchi.correlation.runtime import lock_contexts, release_alert, resolve_context
 from appchi.shared.errors import AppError
 from appchi.serialization import wire
 
@@ -181,4 +182,53 @@ def linked_transition(conn, incidents, before, after, effective_at):
             None,
             "linked-alert-status",
             {"alert_id": after["id"], "before": before["status"], "after": after["status"]},
+        )
+
+
+def became_resolved(before, after):
+    return before is not None and before["status"] != "resolved" and after["status"] == "resolved"
+
+
+def resolve_when_alerts_resolved(conn, tenant, incidents, now, catalog=None):
+    """Resolve each active incident whose retained linked alerts are all resolved (REV-46).
+
+    Call after storing and publishing the transitioning alerts, under the tenant
+    coordinator and the incident locks from lock_linked_incidents. Empty incidents
+    and incidents holding only unavailable references stay active. Effects match
+    manual resolution: context reset, ownership release and per-alert boundaries.
+    """
+    for incident_id in sorted({incident["id"] for incident in incidents}):
+        row = get_incident(conn, tenant, incident_id, True)
+        if row["status"] == "resolved":
+            continue
+        alerts = conn.execute(
+            "SELECT a.* FROM alerts a JOIN alert_identities ai ON ai.id=a.id AND ai.tenant_id=a.tenant_id AND ai.retired_at IS NULL JOIN incident_alert_links l ON l.alert_id=a.id AND l.tenant_id=a.tenant_id WHERE l.tenant_id=%s AND l.incident_id=%s AND l.unlinked_at IS NULL ORDER BY a.id FOR UPDATE OF a",
+            (tenant, incident_id),
+        ).fetchall()
+        if not alerts or any(alert["status"] != "resolved" for alert in alerts):
+            continue
+        resolve_context(conn, row, now)
+        conn.execute(
+            "UPDATE incident_cycles SET resolved_at=%s,cause='alerts_resolved' WHERE incident_id=%s AND id=%s",
+            (now, incident_id, row["cycle_id"]),
+        )
+        conn.execute(
+            "UPDATE incidents SET status='resolved',resolved_at=%s,retention_at=%s WHERE tenant_id=%s AND id=%s",
+            (now, now + timedelta(days=90), tenant, incident_id),
+        )
+        conn.execute(
+            "DELETE FROM alert_active_ownership WHERE tenant_id=%s AND incident_id=%s",
+            (tenant, incident_id),
+        )
+        for alert in alerts:
+            boundary(conn, tenant, alert["id"], now)
+            alert_link_change(conn, alert, now, None, "incident-alerts-resolved", catalog)
+        activity(
+            conn,
+            row,
+            now,
+            None,
+            "alerts-resolved",
+            {"before": row["status"], "after": "resolved"},
+            qualifying=False,
         )

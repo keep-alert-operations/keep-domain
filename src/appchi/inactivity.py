@@ -14,6 +14,7 @@ from appchi.incidents.state import (
     get_incident,
     linked_transition,
     lock_linked_incidents,
+    resolve_when_alerts_resolved,
 )
 from appchi.maintenance.runtime import prepare_for_tenant, lock_catalog
 
@@ -44,6 +45,7 @@ def expire_alert(db, tenant, alert_id, profile=None):
             original_order=order,
             maintenance_input_recorded=True,
         )
+        resolve_when_alerts_resolved(conn, tenant, linked, now, catalog)
         return True
 
 

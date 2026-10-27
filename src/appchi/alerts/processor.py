@@ -91,7 +91,7 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None, coordinate
             catalog,
         )
         store_alert(conn, current, new=previous is None, identity_inserted=True)
-        from appchi.incidents.state import linked_transition
+        from appchi.incidents.state import became_resolved, linked_transition
 
         linked_transition(conn, linked, previous, current, item["received_at"])
         if previous is None:
@@ -137,6 +137,10 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None, coordinate
             original_order=item["admission_order"],
             maintenance_input_recorded=True,
         )
+        if became_resolved(previous, current):
+            from appchi.incidents.state import resolve_when_alerts_resolved
+
+            resolve_when_alerts_resolved(conn, tenant, linked, now, catalog)
         if supplied_item is None:
             link_source_result(
                 conn,
