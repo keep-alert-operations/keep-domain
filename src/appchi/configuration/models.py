@@ -36,6 +36,17 @@ COLUMNS = SORTABLE | {
     "acknowledged_at",
     "active_incident_id",
 }
+# REV-44; appchi.search.reader.GROUPABLE holds the same fields for execution.
+GROUPABLE = {
+    "severity",
+    "display_status",
+    "application",
+    "component",
+    "node_name",
+    "site",
+    "assignee_id",
+    "active_incident_id",
+}
 
 
 def name(value):
@@ -69,7 +80,15 @@ class PresetDefinition(StrictModel):
     cel: str
     sort: list[Sort] = Field(min_length=1, max_length=3)
     columns: list[str] = Field(min_length=1, max_length=30)
+    group_by: str | None = None
     _name = field_validator("name")(name)
+
+    @field_validator("group_by")
+    @classmethod
+    def grouping(cls, value):
+        if value is not None and value not in GROUPABLE:
+            raise ValueError("Unsupported grouping")
+        return value
 
     @field_validator("columns")
     @classmethod

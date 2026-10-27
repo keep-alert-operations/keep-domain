@@ -118,6 +118,15 @@ def enrich_alerts(conn, tenant, rows: list[dict]) -> list[dict]:
     ]
 
 
+def group_labels(conn, tenant, field: str, keys: Iterable) -> dict[str, str]:
+    """Names for assignee and incident group values; other values are their own label."""
+    if field == "assignee_id":
+        return principal_names(conn, keys)
+    if field == "active_incident_id":
+        return incident_titles(conn, tenant, keys)
+    return {}
+
+
 def enrich_assignees(conn, rows: list[dict]) -> list[dict]:
     names = principal_names(conn, [row.get("assignee_id") for row in rows])
     return [
@@ -230,6 +239,35 @@ class ActorDisplayNames(_Open):
 class AlertPage(_Open):
     data: list[AlertDisplayNames]
     next_cursor: str | None = None
+
+
+class AlertGroupNames(_Open):
+    key: str | None = Field(
+        description="The group's value of the grouping field; null groups alerts without one."
+    )
+    label: str | None = Field(
+        default=None,
+        description="Directory name or incident title for assignee and incident groups; null otherwise or when unknown.",
+    )
+    total: str | None = Field(
+        description="Exact alerts in the group as a decimal string; null when unavailable."
+    )
+    severity: dict[str, str] | None = Field(
+        default=None, description="Exact alerts per severity in the group; null when unavailable."
+    )
+    status: dict[str, str] | None = Field(
+        default=None,
+        description="Exact alerts per visible status, for severity groups only; null otherwise.",
+    )
+    data: list[AlertDisplayNames]
+    next_cursor: str | None = Field(
+        default=None, description="Continues this group's rows through the feed's group paging."
+    )
+
+
+class AlertGroupPage(_Open):
+    data: list[AlertGroupNames]
+    next_group_cursor: str | None = None
 
 
 class AlertDetailNames(AlertDisplayNames):

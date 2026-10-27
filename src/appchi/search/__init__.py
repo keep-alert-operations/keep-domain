@@ -1,14 +1,16 @@
 """Elasticsearch projection and immutable, authorized search snapshots."""
 
 from .projection import Projection, VisibilityProof, build_document, index_mapping
-from .reader import FeedPage, SearchReader, SearchScope, SearchState
+from .reader import AlertGroup, FeedPage, GroupPage, SearchReader, SearchScope, SearchState
 
 __all__ = [
     "Projection",
     "VisibilityProof",
     "build_document",
     "index_mapping",
+    "AlertGroup",
     "FeedPage",
+    "GroupPage",
     "SearchReader",
     "SearchScope",
     "SearchState",
