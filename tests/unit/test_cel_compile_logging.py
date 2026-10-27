@@ -14,40 +14,34 @@ def test_unavailable_logging_is_sanitized_and_preserves_public_error(monkeypatch
     private_source = 'message == "synthetic-private-source"'
     private_error = "synthetic-private-native-detail\nforged-log-event"
 
-    class Pipe:
-        def close(self):
-            pass
-
-        def poll(self, timeout):
-            assert timeout == compiler.COMPILE_TIMEOUT_SECONDS == 1
-            return reason != "deadline"
-
-        def recv(self):
-            if reason == "worker_crashed":
-                raise EOFError()
-            return ("unavailable", private_error)
-
     class Process:
-        exitcode = None if reason == "deadline" else 1
+        returncode = None if reason == "deadline" else 1
 
-        def start(self):
+        def __init__(self, command, **kwargs):
+            # The child imports only the compiler, never the caller's entrypoint.
+            assert command[1:] == [
+                "-c",
+                "from appchi.cel.compiler import _compile_child; _compile_child()",
+            ]
+            assert kwargs["stderr"] is compiler.subprocess.DEVNULL
+
+        def communicate(self, request=None, timeout=None):
+            if request is None:
+                return b"", b""
+            assert timeout == compiler.COMPILE_TIMEOUT_SECONDS == 1
+            if reason == "deadline":
+                raise compiler.subprocess.TimeoutExpired("compile", timeout)
+            if reason == "worker_crashed":
+                return b"", b""
+            return compiler.pickle.dumps(("unavailable", private_error)), b""
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
             pass
 
-        def join(self, timeout):
-            pass
-
-        def is_alive(self):
-            return False
-
-    class Context:
-        def Pipe(self, duplex):
-            assert duplex is False
-            return Pipe(), Pipe()
-
-        def Process(self, **kwargs):
-            return Process()
-
-    monkeypatch.setattr(compiler.multiprocessing, "get_context", lambda method: Context())
+    monkeypatch.setattr(compiler.subprocess, "Popen", Process)
     monkeypatch.setattr(compiler, "_checked_cache", compiler._CompileCache())
     with caplog.at_level(logging.WARNING, logger=compiler.__name__):
         with pytest.raises(AppError) as error:

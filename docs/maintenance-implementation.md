@@ -4,9 +4,11 @@ The implementation includes PostgreSQL-backed maintenance CRUD, schedule
 conversion, immutable revision/control/segment proof, protected deletion, a
 complete-history suppression adapter and fenced fan-out primitives. The normative
 contract remains [maintenance operations](https://github.com/appchi-alert-operations/appchi-design/blob/main/specs/spec-maintenance-operations.md).
-Capability `maintenance` remains false until shared transaction, worker,
-correlation and search visibility paths are integrated and qualified. Isolated
-component tests do not establish that the whole workflow is enabled.
+**REV-39 (2026-10-24):** maintenance is always on; there is no `maintenance`
+capability gate or activation command, and restore does not turn it off. Unset
+budgets are unlimited. Notes below that mention the gate or a qualified activation
+are history. Isolated component tests do not establish that the whole workflow is
+qualified.
 
 ## Configuration and API
 
@@ -64,7 +66,8 @@ not invent historical input for existing alerts. Missing baseline blocks reducti
    coordinator. Derived suppression/revisions do not affect the fingerprint.
 2. `prepare_catalog(database, tenant_id, max_work=..., max_inputs=...,
    max_segments=...)` reads a consistent catalog and compiles shared native CEL
-   outside write locks. Caller supplies qualified positive allocations. Generation
+   outside write locks. Caller supplies the allocations; `UNLIMITED` stands for an
+   unset budget. Generation
    mismatch causes retry; unknown profile/digest fails closed.
 3. `record_transition(..., catalog=...)` records/reduces and returns
    `(adjusted_after, Effects)`. `reconcile_alert(conn, current, processing_now,
@@ -118,9 +121,12 @@ latency/fairness. No network calls belong in callbacks.
 
 `runtime.py` supplies that local worker bridge with correlation context and linked
 incident locks, pending-source guard, common alert store and projection/live
-publisher. `prepare_for_tenant` requires a qualified profile with explicit positive
-integer `maintenance_max_work`, `maintenance_max_inputs` and
-`maintenance_max_segments`. `apply_transition` recomputes semantic revisions after
+publisher. `prepare_for_tenant` reads the optional `maintenance_max_work`,
+`maintenance_max_inputs` and `maintenance_max_segments` budgets through
+`appchi.shared.capacity`: a missing or null budget is unlimited, and a value other
+than an integer from 1 to `UNLIMITED` fails with `capacity_profile_invalid`. Every
+write prepares the catalog; a caller that supplies none fails with
+`maintenance_catalog_required`. `apply_transition` recomputes semantic revisions after
 reduction, preserving unchanged source repeats and independent note revisions.
 `Effects.input_suppressed` records original input-boundary eligibility separately
 from the current materialized boolean.
@@ -132,8 +138,9 @@ activation/withdrawal events with exact boundary snapshots, original order/time,
 scheduled flag, stable qualifier UUID and correction links. Its consumer must
 merge these events with `correlation_journal` by shared tenant `change_order` and
 recheck current authoritative state. History-only publication never fabricates a
-new source input at an old boundary. Closing the maintenance gate after a tenant
-has a retained timeline blocks unsafe writes instead of silently clearing causes.
+new source input at an old boundary. Since REV-39 there is no maintenance gate to
+close; an alert without a current checkpoint fails reads with
+`maintenance_proof_unavailable` instead of silently clearing causes.
 
 ## Executed checks and remaining gates
 
@@ -168,8 +175,8 @@ backend/.venv/Scripts/ruff.exe check backend/appchi/maintenance backend/tests/un
 Remaining before enablement: manual incident relationship hooks; hosted scheduler
 qualification; temporal correlation effect consumption and
 withdrawal; search/count suppression-generation proof; retention pins and cleanup;
-reviewed repair/import for existing alerts without baseline and qualified atomic
-activation after checkpoint warmup; frontend integration;
+reviewed repair/import for existing alerts without baseline (the local stack
+removes them after reporting them to the user); frontend integration;
 and measured capacity/latency acceptance. Input journals currently retain whole
 proof; allocation limits block rather than discard it. Safe compacted checkpoints
 and retention remain necessary for long-lived alerts. No company-service capacity
@@ -184,7 +191,7 @@ exact replay does neither. Reconciliation saves the complete head revision.
 Historical suppression and current reads reject incomplete or mismatched heads.
 
 `warmup.warmup_page(database, tenant, profile, cursor=None, limit=100)` compiles the
-qualified catalog outside write locks and reconciles retained alerts in separate
+catalog outside write locks and reconciles retained alerts in separate
 atomic transactions under the coordinator, context, incident and alert locks.
 It yields after 100 rows or 100 milliseconds between complete transactions and
 returns scanned/completed counts, a continuation cursor and blocked alert codes.
@@ -194,14 +201,15 @@ Derived changes use the ordinary activity/projection/effect publisher without
 inventing new source events or resetting inactivity.
 
 `warmup_status(database, tenant)` reports one SQL snapshot of retained, missing
-baseline, complete and pending counts. Neither function enables a capability.
-A qualified activation procedure must lock all affected tenant coordinators and
-verify current input heads/catalog generations atomically with the gate update;
-a prior status response alone is not sufficient authorization to enable it.
+baseline, complete and pending counts. With no gate (REV-39), alerts journaled
+before the upgrade are warmed once per tenant with
+`python -m appchi.worker maintenance-warmup --tenant <tenant UUID>` and inspected
+with `maintenance-proof`; see the delivery local runtime guide.
 
 Maintenance deletion verifies all external intent/final/cancel acknowledgments
 through the common recovery adapter. Immediately before logical deletion it
 rechecks the accepted actor's effective edit role under the identity guard and
-coordinator and locks/checks maintenance and recovery capability gates. Lost
+coordinator and locks/checks the `recovery` and `human_auth` capability gates
+(no longer `maintenance`, REV-39). Lost
 authorization cancels the prepared operation; a closed gate leaves it resumable.
 Completed durable receipts remain idempotent.

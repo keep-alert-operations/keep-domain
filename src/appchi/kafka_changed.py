@@ -123,7 +123,7 @@ class ChangedConsumer:
             try:
                 self.flush()
             except Exception:
-                log.warning("changed_revoke_commit_failed", extra={"consumer": self.role})
+                log.warning("changed_revoke_commit_failed consumer=%s", self.role)
         self._forget(revoked)
         self.solo = {key: offset for key, offset in self.solo.items() if key not in revoked}
         self.pending = deque(
@@ -300,7 +300,7 @@ class ChangedConsumer:
             ):
                 raise unavailable("changed_batch_progress_invalid")
         except Exception:
-            log.warning("changed_groups_batch_failed", extra={"consumer": self.role})
+            log.warning("changed_groups_batch_failed consumer=%s", self.role)
             # One lasting fault would fail every shared call. The head runs alone
             # now; each other partition runs alone until every input it had in
             # this call is handled (see _advance).
@@ -352,8 +352,7 @@ class ChangedConsumer:
                     (self.role, failed.topic(), failed.partition(), failed.offset()),
                 )
             log.warning(
-                "changed_partition_retry",
-                extra={"consumer": self.role, "partition": failed.partition()},
+                "changed_partition_retry consumer=%s partition=%d", self.role, failed.partition()
             )
             # The failed partition's handled prefix and other partitions' progress
             # must not wait behind the retry.
@@ -393,6 +392,6 @@ class ChangedConsumer:
             self.flush()
         except Exception:
             # Unflushed inputs replay from the committed offset.
-            log.warning("changed_close_commit_failed", extra={"consumer": self.role})
+            log.warning("changed_close_commit_failed consumer=%s", self.role)
         finally:
             self.client.close()

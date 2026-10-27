@@ -130,12 +130,10 @@ class Prepared:
     maintenance: object
 
 
-def prepare_tenant(
-    database, tenant, profile, *, allow_local_preview=False, maintenance_input=None, alert_ids=()
-):
+def prepare_tenant(database, tenant, profile, *, maintenance_input=None, alert_ids=()):
     from appchi.maintenance.runtime import prepare_for_tenant
 
-    limits = repo.limits(profile, allow_local_preview=allow_local_preview)
+    limits = repo.limits(profile)
     with database.transaction() as conn:
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         conn.execute("SELECT set_config('appchi.tenant_id',%s,true)", (str(tenant),))
@@ -193,12 +191,6 @@ def prepare_tenant(
             history_complete=maintenance.history_complete or maintenance_input.history_complete,
             replays={**(maintenance.replays or {}), **(maintenance_input.replays or {})},
         )
-    if maintenance is None:
-        with database.transaction(tenant) as conn:
-            if conn.execute(
-                "SELECT 1 FROM maintenance_segments WHERE tenant_id=%s LIMIT 1", (tenant,)
-            ).fetchone():
-                raise unavailable("correlation_maintenance_proof_required")
     return Prepared(UUID(str(tenant)), rows, programs, limits, maintenance)
 
 
@@ -838,34 +830,18 @@ def worker_turn(
     tenant,
     profile,
     *,
-    allow_local_preview=False,
     prepared_input=None,
     input_event=None,
     transaction=None,
     kafka=False,
 ):
-    with (
-        nullcontext(transaction)
-        if transaction is not None
-        else database.transaction(tenant) as conn
-    ):
-        gate = conn.execute(
-            "SELECT ready FROM capability_gates WHERE capability='correlation'"
-        ).fetchone()
-        if not gate or not gate["ready"]:
-            return 0
-    preview = {"allow_local_preview": True} if allow_local_preview else {}
-    prepared = prepared_input or prepare_tenant(database, tenant, profile, **preview)
+    prepared = prepared_input or prepare_tenant(database, tenant, profile)
     with (
         nullcontext(transaction)
         if transaction is not None
         else database.transaction(tenant) as conn
     ):
         _, now = coordinator(conn, tenant)
-        if not conn.execute(
-            "SELECT ready FROM capability_gates WHERE capability='correlation'"
-        ).fetchone()["ready"]:
-            return 0
         lock_contexts(conn, tenant, targets=())
         current = conn.execute(
             "SELECT id,revision,health,blocked_reason FROM correlation_rules WHERE tenant_id=%s AND enabled AND NOT kafka_schema_blocked AND deleted_at IS NULL ORDER BY created_at,id",

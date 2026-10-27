@@ -11,6 +11,7 @@ from psycopg.types.json import Jsonb
 from appchi.cel import CELUnavailableError, CELValidationError, compile_expression
 from appchi.cel.compiler import COST_MODEL, PROFILE
 from appchi.ingestion.native import canonical
+from appchi.shared.capacity import budget
 from appchi.shared.errors import AppError, unavailable
 from appchi.serialization import wire
 from .evidence import Boundary, Condition, EvidenceState, GroupKey, Rule, edit_rule, group_key
@@ -55,40 +56,16 @@ def compile_conditions(definition, *, reuse=False):
     return programs
 
 
-def limits(profile, *, allow_local_preview=False):
-    config = (profile or {}).get("correlation", {})
-    qualified = (profile or {}).get("qualified") is True
-    local_preview = (
-        allow_local_preview
-        and (profile or {}).get("qualified") is False
-        and (profile or {}).get("scope") == "local-development"
-        and (profile or {}).get("correlation_preview") is True
-    )
-    if (
-        not (qualified or local_preview)
-        or config.get("cost_model") != COST_MODEL
-        or any(type(config.get(key)) is not int or config[key] < 1 for key in BUDGETS)
-    ):
-        raise AppError(
-            "correlation_capacity_profile_required",
-            "Correlation rules require a qualified capacity profile or an enabled local preview.",
-            503,
-        )
-    return config
+def limits(profile):
+    """Configured correlation budgets; each unset budget is unlimited (REV-39)."""
+    config = (profile or {}).get("correlation") or {}
+    if config.get("cost_model", COST_MODEL) != COST_MODEL:
+        raise unavailable("correlation_cost_model_mismatch")
+    return {key: budget(config, key) for key in BUDGETS}
 
 
-def check_capacity(
-    conn,
-    tenant,
-    definition,
-    programs,
-    profile,
-    *,
-    rule_id=None,
-    enabled=True,
-    allow_local_preview=False,
-):
-    config = limits(profile, allow_local_preview=allow_local_preview)
+def check_capacity(conn, tenant, definition, programs, profile, *, rule_id=None, enabled=True):
+    config = limits(profile)
     costs = [programs[item["id"]].rule_cost_upper_bound for item in definition["conditions"]]
     if max(costs) > config["condition_cost"] or sum(costs) > config["rule_cost"]:
         raise AppError(
@@ -262,13 +239,8 @@ def persist(conn, tenant, actor, now, body, programs, command_id, *, previous=No
         conn.execute(
             "INSERT INTO correlation_rule_identities(id,tenant_id) VALUES(%s,%s)", (rule_id, tenant)
         )
-    ready = conn.execute(
-        "SELECT ready FROM capability_gates WHERE capability='correlation'"
-    ).fetchone()["ready"]
-    health = ("healthy" if ready else "blocked") if reset else previous["health"]
-    blocked = (
-        (None if ready else "consumer_not_integrated") if reset else previous["blocked_reason"]
-    )
+    health = "healthy" if reset else previous["health"]
+    blocked = None if reset else previous["blocked_reason"]
     cost = (
         sum(programs[item["id"]].rule_cost_upper_bound for item in body["conditions"])
         if programs
@@ -429,7 +401,7 @@ def persist(conn, tenant, actor, now, body, programs, command_id, *, previous=No
 def ensure_context(conn, row, key: GroupKey, *, max_bucket: int):
     """Caller holds tenant coordinator and rule lock; digest collisions are safe."""
     if type(max_bucket) is not int or max_bucket < 1:
-        raise unavailable("correlation_capacity_profile_required")
+        raise unavailable("capacity_profile_invalid")
     try:
         values = json.loads(key.canonical)
         fields = grouping(row["group_by"])

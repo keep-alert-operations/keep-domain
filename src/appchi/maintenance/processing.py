@@ -51,13 +51,12 @@ class Effects:
 class CatalogSnapshot:
     """Preparation reads from one REPEATABLE READ snapshot, taken before locks.
 
-    Writers revalidate the generation, gates, checkpoints and input heads under
+    Writers revalidate the generation, checkpoints and input heads under
     their own locks; nothing here substitutes for that proof.
     """
 
     tenant_id: UUID
     targets: tuple[str, ...]
-    maintenance_ready: bool
     correlation_enabled: bool
     state: dict | None = None
     at: datetime | None = None
@@ -126,7 +125,7 @@ def prepare_catalog(
 ):
     """Bounded DB snapshot followed by native CEL compilation outside locks."""
     if min(max_work, max_inputs, max_segments) < 1:
-        raise ValueError("explicit positive qualified work allocations are required")
+        raise ValueError("explicit positive work allocations are required")
     snapshot = read_catalog(
         database, tenant_id, alert_id=alert_id, effective_at=effective_at, alert_ids=alert_ids
     )
@@ -135,14 +134,11 @@ def prepare_catalog(
     )
 
 
-def read_catalog(
-    database, tenant_id, *, alert_id=None, effective_at=None, alert_ids=(), gated=False
-):
-    """Read gates, catalog state, target checkpoints and segments in one snapshot.
+def read_catalog(database, tenant_id, *, alert_id=None, effective_at=None, alert_ids=()):
+    """Read catalog state, target checkpoints and segments in one snapshot.
 
     The caller reuses the checkpoints and the snapshot clock instead of reading
-    them again. With gated=True, a closed maintenance gate ends the snapshot
-    before catalog reads, and the caller prepares nothing.
+    them again.
     """
     targets = tuple(
         dict.fromkeys([str(value) for value in alert_ids] + ([str(alert_id)] if alert_id else []))
@@ -153,20 +149,13 @@ def read_catalog(
         state = conn.execute(
             """SELECT v.maintenance_generation,clock_timestamp() AS prepared_at,
             (SELECT source_release_since FROM application_scope WHERE singleton) AS source_release_since,
-            coalesce((SELECT ready FROM capability_gates WHERE capability='maintenance'),false) AS maintenance_ready,
-            coalesce((SELECT ready FROM capability_gates WHERE capability='correlation') AND EXISTS(
-              SELECT 1 FROM correlation_rules WHERE tenant_id=%s AND enabled
-              AND NOT kafka_schema_blocked AND deleted_at IS NULL),false) AS correlation_enabled
+            EXISTS(SELECT 1 FROM correlation_rules WHERE tenant_id=%s AND enabled
+              AND NOT kafka_schema_blocked AND deleted_at IS NULL) AS correlation_enabled
             FROM (SELECT 1) AS scope LEFT JOIN tenant_view_state v ON v.tenant_id=%s""",
             (tenant_id, tenant_id),
         ).fetchone()
-        snapshot = CatalogSnapshot(
-            UUID(str(tenant_id)),
-            targets,
-            state["maintenance_ready"],
-            state["correlation_enabled"],
-        )
-        if (gated and not snapshot.maintenance_ready) or state["maintenance_generation"] is None:
+        snapshot = CatalogSnapshot(UUID(str(tenant_id)), targets, state["correlation_enabled"])
+        if state["maintenance_generation"] is None:
             return snapshot
         previous = (
             conn.execute(

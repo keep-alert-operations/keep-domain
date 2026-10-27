@@ -13,7 +13,7 @@ from appchi.shared.errors import AppError
 from appchi.shared.transactions import coordinator
 
 from .processing import reconcile_alert
-from .runtime import lock_catalog, prepare_qualified_catalog, publish_reconciliation
+from .runtime import lock_catalog, prepare_full_catalog, publish_reconciliation
 from .temporal import MaintenanceProofError
 
 
@@ -30,7 +30,7 @@ def warmup_page(database, tenant, profile, *, cursor=None, limit=100):
     if type(limit) is not int or not 1 <= limit <= 100:
         raise ValueError("Warmup page must contain 1..100 alerts")
     position = UUID(str(cursor)) if cursor else UUID(int=0)
-    catalog = prepare_qualified_catalog(database, tenant, profile)
+    catalog = prepare_full_catalog(database, tenant, profile)
     with database.transaction(tenant) as conn:
         rows = conn.execute(
             """SELECT a.id FROM alerts a JOIN alert_identities i USING(tenant_id,id)

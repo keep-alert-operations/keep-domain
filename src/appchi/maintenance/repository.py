@@ -8,7 +8,8 @@ from uuid import uuid4
 from psycopg.types.json import Jsonb
 
 from appchi.ingestion.native import canonical
-from appchi.shared.errors import AppError, unavailable
+from appchi.shared.capacity import budget
+from appchi.shared.errors import AppError
 from appchi.serialization import wire
 
 from .temporal import (
@@ -27,14 +28,6 @@ from .timezones import (
     validate_schedule,
     zone,
 )
-
-
-def require_ready(conn):
-    row = conn.execute(
-        "SELECT ready FROM capability_gates WHERE capability='maintenance'"
-    ).fetchone()
-    if not row or not row["ready"]:
-        raise unavailable("maintenance_processing_unready")
 
 
 def get_window(conn, tenant, window, *, lock=False, include_deleted=False):
@@ -164,15 +157,9 @@ def candidate(body, now, previous=None):
 
 
 def check_capacity(conn, tenant, candidate, profile, now, window=None):
-    limits = (profile or {}).get("maintenance", {})
-    max_overlap, max_bytes = limits.get("max_overlap"), limits.get("max_work_bytes")
-    if (
-        type(max_overlap) is not int
-        or max_overlap < 1
-        or type(max_bytes) is not int
-        or max_bytes < 1
-    ):
-        raise unavailable("maintenance_capacity_profile_required")
+    """Each unset maintenance budget is unlimited (REV-39)."""
+    limits = (profile or {}).get("maintenance")
+    max_overlap, max_bytes = budget(limits, "max_overlap"), budget(limits, "max_work_bytes")
     rows = conn.execute(
         "SELECT id,start_at,end_at,cel,reason FROM maintenance_windows WHERE tenant_id=%s AND deleted_at IS NULL AND end_at>%s AND id<>%s",
         (tenant, now, window or uuid4()),

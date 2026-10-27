@@ -18,14 +18,14 @@ from appchi.correlation import repository
 from appchi.correlation import runtime as correlation
 from appchi.maintenance import runtime as maintenance
 from appchi.serialization import wire
+from appchi.shared.capacity import UNLIMITED
 from appchi.shared.errors import AppError
 
 NOW = datetime(2026, 10, 18, 12, tzinfo=UTC)
 RELEASE = NOW - timedelta(days=1)
 SEGMENT_CEL = 'alert.message == "maintenance"'
 CONDITION_CEL = 'alert.severity == "critical"'
-QUALIFIED = {
-    "qualified": True,
+CONFIGURED = {
     "maintenance_max_work": 100,
     "maintenance_max_inputs": 10,
     "maintenance_max_segments": 5,
@@ -61,9 +61,9 @@ class Native:
 class Tenant:
     """Rows for one tenant: one checkpointed alert, one segment and one rule."""
 
-    def __init__(self, *, maintenance=True, correlation=True, supports=()):
+    def __init__(self, *, correlation=True, supports=()):
         self.id, self.alert = uuid4(), uuid4()
-        self.maintenance, self.correlation, self.supports = maintenance, correlation, supports
+        self.correlation, self.supports = correlation, supports
         self.rule, self.condition = uuid4(), uuid4()
         self.continuation = {
             "version": 2,
@@ -93,13 +93,12 @@ class Tenant:
     def respond(self, text, params):
         if text.startswith(("SET TRANSACTION", "SELECT set_config")):
             return []
-        if "AS maintenance_ready" in text:
+        if "AS correlation_enabled" in text:
             return [
                 {
                     "maintenance_generation": 3,
                     "prepared_at": NOW,
                     "source_release_since": RELEASE,
-                    "maintenance_ready": self.maintenance,
                     "correlation_enabled": self.correlation,
                 }
             ]
@@ -196,27 +195,21 @@ def native(monkeypatch):
     return stand_in
 
 
-def source_preparation(database, tenant, *, gate_ready=True):
+def source_preparation(database, tenant, profile=CONFIGURED):
     return maintenance.prepare_for_tenant(
-        database,
-        tenant.id,
-        QUALIFIED,
-        gate_ready=gate_ready,
-        alert_id=tenant.alert,
-        effective_at=NOW,
+        database, tenant.id, profile, alert_id=tenant.alert, effective_at=NOW
     )
 
 
-@pytest.mark.parametrize("gate_ready", [True, None])
-def test_inline_source_preparation_uses_two_snapshots(native, gate_ready):
+def test_inline_source_preparation_uses_two_snapshots(native):
     tenant = Tenant()
     database = Database(tenant)
-    catalog = source_preparation(database, tenant, gate_ready=gate_ready)
+    catalog = source_preparation(database, tenant)
     assert catalog.inline_correlation is not None and catalog.require_preparation
-    # Catalog snapshot (gates, correlation enablement, checkpoints, segments),
-    # then the correlation snapshot. Formerly 4, or 5 without a supplied gate.
+    # Catalog snapshot (correlation enablement, checkpoints, segments), then the
+    # correlation snapshot. Formerly 4, or 5 without a supplied gate.
     assert len(database.transactions) == 2
-    assert database.reads("FROM capability_gates") == 1
+    assert database.reads("FROM capability_gates") == 0
     assert database.reads("FROM maintenance_alert_checkpoints") == 1
     # Formerly one id query plus two statements per rule.
     assert database.reads("FROM correlation_rules WHERE tenant_id=%s AND id=%s") == 0
@@ -231,23 +224,16 @@ def test_disabled_correlation_needs_only_the_catalog_snapshot(native):
     assert len(database.transactions) == 1
 
 
-def test_closed_gate_ends_the_snapshot_before_catalog_reads(native):
-    tenant = Tenant(maintenance=False)
-    database = Database(tenant)
-    # A closed gate is decided before the capacity profile is required.
-    assert maintenance.prepare_for_tenant(database, tenant.id, None, alert_id=tenant.alert) is None
-    assert len(database.transactions) == 1
-    assert database.reads("FROM maintenance_alert_checkpoints") == 0
-    assert database.reads("FROM maintenance_segments") == 0
-    assert native.compiled == []
-
-
-def test_supplied_closed_gate_reads_nothing(native):
-    database = Database(Tenant())
-    assert maintenance.prepare_for_tenant(database, uuid4(), None, gate_ready=False) is None
-    assert database.transactions == []
-    with pytest.raises(ValueError):
-        maintenance.prepare_for_tenant(database, uuid4(), None, gate_ready=1)
+def test_preparation_without_a_profile_is_unlimited(native):
+    """Requirements: REV-39; system completion 23."""
+    tenant = Tenant()
+    catalog = source_preparation(Database(tenant), tenant, None)
+    assert (catalog.max_work, catalog.max_inputs) == (UNLIMITED, UNLIMITED)
+    assert catalog.inline_correlation.prepared.capacity == dict.fromkeys(
+        repository.BUDGETS, UNLIMITED
+    )
+    with pytest.raises(AppError, match="capacity_profile_invalid"):
+        source_preparation(Database(tenant), tenant, {"maintenance_max_work": 0})
 
 
 def test_decision_attachments_add_one_catalog_snapshot(native):
@@ -255,17 +241,17 @@ def test_decision_attachments_add_one_catalog_snapshot(native):
     database = Database(tenant)
     catalog = source_preparation(database, tenant)
     assert catalog.inline_correlation is not None
-    # The nested attachment catalog folds its gate read too (formerly 7 in all).
+    # The nested attachment catalog adds one snapshot (formerly 7 in all).
     assert len(database.transactions) == 3
 
 
 def test_correlation_consumer_preparation_uses_two_snapshots(native):
     tenant = Tenant()
     database = Database(tenant)
-    prepared = correlation.prepare_tenant(database, tenant.id, QUALIFIED, alert_ids=(tenant.alert,))
+    prepared = correlation.prepare_tenant(database, tenant.id, CONFIGURED, alert_ids=(tenant.alert,))
     assert prepared.maintenance is not None
     assert [row["id"] for row in prepared.rows] == [tenant.rule]
-    # Correlation snapshot plus one gated catalog snapshot (formerly 4).
+    # Correlation snapshot plus one catalog snapshot (formerly 4).
     assert len(database.transactions) == 2
 
 
@@ -380,8 +366,6 @@ class WorkerTenant(Tenant):
         self.revision = revision
 
     def respond(self, text, params):
-        if text.startswith("SELECT ready FROM capability_gates"):
-            return [{"ready": True}]
         if "FROM tenant_work_state" in text:
             return [{"tenant_id": self.id}]
         if "UPDATE tenant_work_state" in text:
@@ -411,7 +395,7 @@ class Loaded(Exception):
 
 def test_worker_turn_refreshes_health_without_reloading_rules(native, monkeypatch):
     tenant = WorkerTenant()
-    prepared = correlation.prepare_tenant(Database(tenant), tenant.id, QUALIFIED)
+    prepared = correlation.prepare_tenant(Database(tenant), tenant.id, CONFIGURED)
     seen = []
 
     def load(conn, current, *args, **kwargs):
@@ -421,7 +405,7 @@ def test_worker_turn_refreshes_health_without_reloading_rules(native, monkeypatc
     monkeypatch.setattr(correlation, "_load", load)
     database = Database(tenant)
     with pytest.raises(Loaded):
-        correlation.worker_turn(database, tenant.id, QUALIFIED, prepared_input=prepared, kafka=True)
+        correlation.worker_turn(database, tenant.id, CONFIGURED, prepared_input=prepared, kafka=True)
     # A rule blocked by an earlier turn stays blocked, as get_rule reported it.
     (row,) = seen[0].rows
     assert (row["health"], row["blocked_reason"]) == ("blocked", "condition_evaluation_failed")
@@ -438,11 +422,11 @@ def test_worker_turn_refreshes_health_without_reloading_rules(native, monkeypatc
 
 def test_worker_turn_still_rejects_a_changed_revision(native, monkeypatch):
     tenant = WorkerTenant(revision=2)
-    prepared = correlation.prepare_tenant(Database(tenant), tenant.id, QUALIFIED)
+    prepared = correlation.prepare_tenant(Database(tenant), tenant.id, CONFIGURED)
     monkeypatch.setattr(correlation, "_load", lambda *args, **kwargs: pytest.fail("loaded"))
     with pytest.raises(AppError) as raised:
         correlation.worker_turn(
-            Database(tenant), tenant.id, QUALIFIED, prepared_input=prepared, kafka=True
+            Database(tenant), tenant.id, CONFIGURED, prepared_input=prepared, kafka=True
         )
     assert raised.value.code == "correlation_compiled_revision_changed"
 
@@ -607,7 +591,7 @@ def test_worker_turn_reads_evidence_alerts_and_links_once(native, monkeypatch):
 
     tenant = EvidenceTenant()
     prepared = replace(
-        correlation.prepare_tenant(Database(tenant), tenant.id, QUALIFIED), maintenance=True
+        correlation.prepare_tenant(Database(tenant), tenant.id, CONFIGURED), maintenance=True
     )
     states = (
         SimpleNamespace(memberships=tuple(SimpleNamespace(alert_id=a) for a in tenant.alerts)),
@@ -627,7 +611,7 @@ def test_worker_turn_reads_evidence_alerts_and_links_once(native, monkeypatch):
     monkeypatch.setattr(correlation, "choose_decision", choose)
     database = Database(tenant)
     turn = correlation.worker_turn(
-        database, tenant.id, QUALIFIED, prepared_input=prepared, kafka=True
+        database, tenant.id, CONFIGURED, prepared_input=prepared, kafka=True
     )
     assert turn == 0
     # Formerly one checkpoint read per evidence alert and one link read per incident.

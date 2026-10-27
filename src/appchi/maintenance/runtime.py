@@ -9,6 +9,7 @@ from psycopg.types.json import Jsonb
 
 from appchi.alerts.lifecycle import SEMANTIC_FIELDS
 from appchi.cel.catalog import RULE_FIELDS
+from appchi.shared.capacity import budget
 from appchi.shared.errors import AppError, unavailable
 from appchi.serialization import wire
 
@@ -18,7 +19,6 @@ from .processing import (
     finish_failed_job,
     prepare_catalog,
     read_catalog,
-    record_input,
     record_transition,
     reconcile_alert,
     step_job,
@@ -43,27 +43,12 @@ def prepare_for_tenant(
     effective_at=None,
     source_item=None,
     alert_ids=(),
-    gate_ready=None,
 ):
-    # A caller may reuse a gate read from its immediately preceding guarded
-    # replay-precheck transaction. Mutation still rechecks the live gate under
-    # its normal writer scope; this is not a cache or an authorization bypass.
-    if gate_ready is not None and type(gate_ready) is not bool:
-        raise ValueError("gate_ready must be an observed boolean")
-    if gate_ready is False:
-        return None
-    # One snapshot supplies the gates, the catalog and the target checkpoints.
+    # One snapshot supplies the catalog and the target checkpoints.
     snapshot = read_catalog(
-        database,
-        tenant,
-        alert_id=alert_id,
-        effective_at=effective_at,
-        alert_ids=alert_ids,
-        gated=gate_ready is None,
+        database, tenant, alert_id=alert_id, effective_at=effective_at, alert_ids=alert_ids
     )
-    if gate_ready is None and not snapshot.maintenance_ready:
-        return None
-    catalog = compile_catalog(snapshot, **_qualified_budget(profile))
+    catalog = compile_catalog(snapshot, **_budget(profile))
     targets, at = snapshot.targets, snapshot.at
     if targets:
         from .preparation import prepare_replay
@@ -82,7 +67,7 @@ def prepare_for_tenant(
             )
             if needs_replay:
                 if not catalog.history_complete:
-                    catalog = prepare_qualified_catalog(database, tenant, profile)
+                    catalog = prepare_full_catalog(database, tenant, profile)
                 replay = prepare_replay(database, catalog, target, source_item=source_item)
                 if replay is not None:
                     replays[UUID(target)] = replay
@@ -95,12 +80,7 @@ def prepare_for_tenant(
             from appchi.correlation.runtime import prepare_tenant
 
             prepared = prepare_tenant(
-                database,
-                tenant,
-                profile,
-                maintenance_input=catalog,
-                alert_ids=targets,
-                allow_local_preview=bool(profile and profile.get("correlation_preview")),
+                database, tenant, profile, maintenance_input=catalog, alert_ids=targets
             )
             catalog = replace(
                 prepared.maintenance,
@@ -109,32 +89,25 @@ def prepare_for_tenant(
     return catalog
 
 
-def prepare_qualified_catalog(
-    database, tenant, profile, *, alert_id=None, effective_at=None, alert_ids=()
-):
-    """Compile with a qualified budget, including offline proof warmup."""
+def prepare_full_catalog(database, tenant, profile, *, alert_id=None, effective_at=None, alert_ids=()):
+    """Compile the whole catalog within the configured budget, including proof warmup."""
     return prepare_catalog(
         database,
         tenant,
-        **_qualified_budget(profile),
+        **_budget(profile),
         alert_id=alert_id,
         effective_at=effective_at,
         alert_ids=alert_ids,
     )
 
 
-def _qualified_budget(profile):
-    names = ("maintenance_max_work", "maintenance_max_inputs", "maintenance_max_segments")
-    if (
-        not isinstance(profile, dict)
-        or profile.get("qualified") is not True
-        or any(type(profile.get(name)) is not int or profile[name] < 1 for name in names)
-    ):
-        raise unavailable("maintenance_capacity_profile_required")
+def _budget(profile):
+    """Configured maintenance work budgets; each unset budget is unlimited (REV-39)."""
+    profile = profile if isinstance(profile, dict) else None
     return {
-        "max_work": profile["maintenance_max_work"],
-        "max_inputs": profile["maintenance_max_inputs"],
-        "max_segments": profile["maintenance_max_segments"],
+        "max_work": budget(profile, "maintenance_max_work"),
+        "max_inputs": budget(profile, "maintenance_max_inputs"),
+        "max_segments": budget(profile, "maintenance_max_segments"),
     }
 
 
@@ -168,9 +141,8 @@ def lock_catalog(conn, catalog, *, targets=(), incidents=()):
         and catalog.inline_requested
         and catalog.inline_correlation is None
         and conn.execute(
-            """SELECT 1 FROM capability_gates g WHERE g.capability='correlation' AND g.ready
-        AND EXISTS(SELECT 1 FROM correlation_rules WHERE tenant_id=%s AND enabled
-            AND NOT kafka_schema_blocked AND deleted_at IS NULL)""",
+            """SELECT 1 FROM correlation_rules WHERE tenant_id=%s AND enabled
+            AND NOT kafka_schema_blocked AND deleted_at IS NULL LIMIT 1""",
             (tenant,),
         ).fetchone()
     ):
@@ -202,25 +174,14 @@ def _apply_transition(conn, before, after, when, order, cause, now, catalog):
     Recompute revisions from actual content, undoing apply_source's temporary
     source-only suppression comparison. Every source increments projection once.
     """
-    gate = conn.execute(
-        "SELECT ready FROM capability_gates WHERE capability='maintenance'"
-    ).fetchone()
-    if bool(gate and gate["ready"]) != (catalog is not None):
-        raise unavailable("maintenance_gate_changed")
+    if catalog is None:
+        raise unavailable("maintenance_catalog_required")
     needs_input = (
         cause == "source"
         or before is None
         or any(before[field] != after[field] for field in RULE_FIELDS)
     )
-    if catalog is None:
-        if conn.execute(
-            "SELECT 1 FROM maintenance_segments WHERE tenant_id=%s LIMIT 1", (after["tenant_id"],)
-        ).fetchone():
-            raise unavailable("maintenance_gate_closed_with_timeline")
-        if needs_input:
-            record_input(conn, before, after, when, order, cause, now)
-        adjusted, effects = dict(after), None
-    elif needs_input:
+    if needs_input:
         adjusted, effects = record_transition(
             conn, before, after, when, order, cause, now, catalog=catalog
         )
@@ -433,10 +394,6 @@ def _apply_inline_effects(conn, current):
         return
     if transaction != conn.execute("SELECT pg_current_xact_id()::text AS id").fetchone()["id"]:
         return
-    if not conn.execute(
-        "SELECT ready FROM capability_gates WHERE capability='correlation'"
-    ).fetchone()["ready"]:
-        return
     from appchi.correlation.runtime import maintenance_input, worker_turn as correlation_turn
 
     effects = conn.execute(
@@ -497,24 +454,15 @@ def worker_turn(database, tenant, profile):
 
     Publication uses correlation contexts, linked incidents and source fences.
     """
-    catalog = prepare_for_tenant(database, tenant, profile)
-    if catalog is None:
-        return 0
+    prepare_for_tenant(database, tenant, profile)
     lease = claim_due(database, tenant)
     if lease is None:
         return 0
     catalog = prepare_for_tenant(database, tenant, profile)
-    if catalog is None:
-        finish_failed_job(database, lease, proof_blocked=False)
-        return 0
     from appchi.alerts.state import pending, retained
     from appchi.incidents.state import lock_linked_incidents
 
     def lock(conn, tenant_id, alert_id):
-        if not conn.execute(
-            "SELECT ready FROM capability_gates WHERE capability='maintenance'"
-        ).fetchone()["ready"]:
-            raise unavailable("maintenance_gate_changed")
         lock_catalog(conn, catalog, targets=[alert_id])
         if not catalog.inline_correlation:
             lock_linked_incidents(conn, tenant_id, alert_id)

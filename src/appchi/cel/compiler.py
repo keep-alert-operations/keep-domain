@@ -1,7 +1,9 @@
 """Native CEL AST -> restricted typed IR -> guarded CEL and parameterized ES.
 
 Parsing and checked compilation run in a disposable process with a one-second
-wall-clock deadline. No parsed-only expression is ever evaluated.
+wall-clock deadline. No parsed-only expression is ever evaluated. The process
+imports only this module, never the caller's entrypoint, so a worker whose own
+imports are slow cannot exhaust the deadline before compilation starts.
 """
 
 from __future__ import annotations
@@ -14,9 +16,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import logging
-import multiprocessing
 import os
+import pickle
 import re
+import subprocess
+import sys
 from time import monotonic
 from typing import Any
 from uuid import UUID
@@ -466,6 +470,37 @@ def _compile_worker(connection, source: str, rule: bool):
         connection.close()
 
 
+class _StreamConnection:
+    """The compile child's single-reply channel to its parent over stdout."""
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def send(self, message):
+        pickle.dump(message, self.stream)
+
+    def close(self):
+        self.stream.flush()
+
+
+def _compile_child():
+    """Disposable compile process: one pickled request on stdin, one reply on stdout."""
+    source, rule = pickle.load(sys.stdin.buffer)
+    _compile_worker(_StreamConnection(sys.stdout.buffer), source, rule)
+
+
+def _child_command():
+    """Interpreter and environment for a compile child that shares this sys.path."""
+    executable, env = sys.executable, dict(os.environ)
+    base = getattr(sys, "_base_executable", executable)
+    if os.name == "nt" and base and os.path.normcase(base) != os.path.normcase(executable):
+        # As multiprocessing does (bpo-35797): skip the venv redirector process.
+        executable, env["__PYVENV_LAUNCHER__"] = base, sys.executable
+    env["PYTHONPATH"] = os.pathsep.join(path for path in sys.path if path)
+    code = "from appchi.cel.compiler import _compile_child; _compile_child()"
+    return [executable, "-c", code], env
+
+
 def time_bound(ir: IR, evaluated_at: datetime) -> Any:
     value = ir.value + epoch_us(evaluated_at) if ir.op in {"now", "bound"} else ir.value
     if ir.kind == "time" and not MIN_TIME <= value <= MAX_TIME:
@@ -819,19 +854,31 @@ def _compile_checked(source: str, rule: bool):
 
 def _compile_native(source: str, rule: bool):
     started = monotonic()
-    context = multiprocessing.get_context("spawn")
-    receive, send = context.Pipe(duplex=False)
-    process = context.Process(target=_compile_worker, args=(send, source, rule), daemon=True)
-    process.start()
-    send.close()
-    reason = "child_unavailable"
+    reason, process, exit_code = "child_unavailable", None, None
     try:
-        if not receive.poll(COMPILE_TIMEOUT_SECONDS):
-            reason = "deadline"
-            raise CELUnavailableError("CEL compiler exceeded one-second deadline")
+        command, env = _child_command()
         try:
-            message = receive.recv()
-        except EOFError as exc:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+        except OSError as exc:
+            raise CELUnavailableError("CEL compiler process could not start") from exc
+        try:
+            output, _ = process.communicate(
+                pickle.dumps((source, rule)), timeout=COMPILE_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired as exc:
+            reason, exit_code = "deadline", process.poll()
+            raise CELUnavailableError("CEL compiler exceeded one-second deadline") from exc
+        exit_code = process.returncode
+        try:
+            message = pickle.loads(output)
+        except Exception as exc:
+            # No reply (or a truncated one) means the child died before answering.
             reason = "worker_crashed"
             raise CELUnavailableError("CEL compiler worker crashed") from exc
         if message[0] == "invalid":
@@ -848,12 +895,14 @@ def _compile_native(source: str, rule: bool):
             reason,
             round((monotonic() - started) * 1000),
             rule,
-            process.exitcode,
+            exit_code,
         )
         raise
     finally:
-        receive.close()
-        process.join(timeout=0.02)
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=0.1)
+        if process is not None and process.poll() is None:
+            process.kill()
+            try:
+                # Reap the killed child and close its pipes.
+                process.communicate(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                pass

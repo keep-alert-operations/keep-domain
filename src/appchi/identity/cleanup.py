@@ -161,9 +161,7 @@ def cleanup_assignments(database, *, profile=None, limit=100, cursor=None, tenan
             if error.code not in (
                 "source_updates_pending",
                 "maintenance_catalog_changed",
-                "maintenance_gate_changed",
                 "maintenance_proof_unavailable",
-                "maintenance_gate_closed_with_timeline",
             ):
                 raise
             pending_rows.append((str(row["tenant_id"]), row["kind"], str(row["id"])))

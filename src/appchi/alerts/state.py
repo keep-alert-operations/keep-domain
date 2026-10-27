@@ -40,21 +40,12 @@ def current_command_result(conn, result):
 def derived_read(conn, row):
     row = with_current_assignee(conn, row)
     row = dict(row, display_status=display_status(row))
-    gate = conn.execute(
-        "SELECT ready FROM capability_gates WHERE capability='maintenance'"
-    ).fetchone()
-    if gate and gate["ready"]:
-        now = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
-        try:
-            suppressed, updating = derive_current(conn, row, now)
-        except MaintenanceProofError:
-            raise unavailable("maintenance_proof_unavailable") from None
-        return dict(row, suppressed=suppressed, maintenance_updating=updating)
-    if conn.execute(
-        "SELECT 1 FROM maintenance_segments WHERE tenant_id=%s LIMIT 1", (row["tenant_id"],)
-    ).fetchone():
-        raise unavailable("maintenance_gate_closed_with_timeline")
-    return row
+    now = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
+    try:
+        suppressed, updating = derive_current(conn, row, now)
+    except MaintenanceProofError:
+        raise unavailable("maintenance_proof_unavailable") from None
+    return dict(row, suppressed=suppressed, maintenance_updating=updating)
 
 
 def retained(conn, tenant, alert_id, lock=False):

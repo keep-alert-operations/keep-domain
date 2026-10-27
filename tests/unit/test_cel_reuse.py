@@ -14,7 +14,7 @@ from appchi.correlation import runtime as correlation
 from test_preparation_transactions import (
     CONDITION_CEL,
     NOW,
-    QUALIFIED,
+    CONFIGURED,
     SEGMENT_CEL,
     Database,
     Native,
@@ -36,7 +36,7 @@ def test_repeated_correlation_turns_never_recompile_or_rebuild(counted):
     tenants = [Tenant(), Tenant()]
     prepared = [
         correlation.prepare_tenant(
-            Database(tenant), tenant.id, QUALIFIED, alert_ids=(tenant.alert,)
+            Database(tenant), tenant.id, CONFIGURED, alert_ids=(tenant.alert,)
         )
         for _ in range(5)
         for tenant in tenants

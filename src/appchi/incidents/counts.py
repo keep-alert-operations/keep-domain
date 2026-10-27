@@ -5,9 +5,8 @@ from appchi.shared.errors import unavailable
 
 def linked_counts(conn, tenant, incident):
     state = conn.execute(
-        """SELECT v.maintenance_generation,g.ready,clock_timestamp() AS now
-        FROM tenant_view_state v CROSS JOIN capability_gates g
-        WHERE v.tenant_id=%s AND g.capability='maintenance'""",
+        """SELECT maintenance_generation,clock_timestamp() AS now
+        FROM tenant_view_state WHERE tenant_id=%s""",
         (tenant,),
     ).fetchone()
     counts = conn.execute(
@@ -27,15 +26,13 @@ def linked_counts(conn, tenant, incident):
         LEFT JOIN maintenance_alert_checkpoints cp ON cp.tenant_id=a.tenant_id AND cp.alert_id=a.id
         WHERE l.tenant_id=%s AND l.incident_id=%s AND l.unlinked_at IS NULL)
         SELECT count(*) AS total_linked,count(*) FILTER(WHERE id IS NULL) AS unavailable,
-            count(*) FILTER(WHERE id IS NOT NULL AND CASE WHEN %s THEN derived_suppressed ELSE stored_suppressed END) AS suppressed,
+            count(*) FILTER(WHERE id IS NOT NULL AND derived_suppressed) AS suppressed,
             coalesce(bool_or(id IS NOT NULL AND complete IS DISTINCT FROM true),false) AS missing_proof,
             coalesce(bool_or(id IS NOT NULL AND (catalog_generation IS DISTINCT FROM %s OR
                 stored_suppressed IS DISTINCT FROM derived_suppressed OR current_suppressed IS DISTINCT FROM derived_suppressed)),false) AS maintenance_updating
         FROM current_links""",
-        (state["now"], tenant, incident, state["ready"], state["maintenance_generation"]),
+        (state["now"], tenant, incident, state["maintenance_generation"]),
     ).fetchone()
-    if state["ready"] and counts.pop("missing_proof"):
+    if counts.pop("missing_proof"):
         raise unavailable("maintenance_proof_unavailable")
-    counts.pop("missing_proof", None)
-    counts["maintenance_updating"] = state["ready"] and counts["maintenance_updating"]
     return counts
