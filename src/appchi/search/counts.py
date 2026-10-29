@@ -1,13 +1,13 @@
 """Bounded exact count batches sharing one PIT and one database query clock."""
 
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 import time
 from typing import Callable
 from uuid import uuid4
 
 from appchi.cel import CompiledExpression
-from appchi.cel.compiler import PROFILE
+from appchi.cel.compiler import PROFILE, epoch_us
 from appchi.shared.errors import AppError, unavailable
 from .projection import assert_complete
 from .text import query_tokens
@@ -50,6 +50,7 @@ class CountBatch:
     observed: dict
     updating: bool
     updating_suppression: bool
+    next_change_at: str | None = None
 
 
 class CountReader:
@@ -104,6 +105,7 @@ class CountReader:
                     unique[context] = query
                 positions[key] = list(unique).index(context)
             totals = []
+            changes = []
             if unique:
                 opened = client().open_point_in_time(
                     index=self.index,
@@ -121,8 +123,15 @@ class CountReader:
                     scoped = query.expression.scoped_query(
                         tenant_id, evaluated_at, include_suppressed=query.include_suppressed
                     )
-                    scoped["bool"]["filter"].extend(
-                        {"term": {"search_tokens": term}} for term in query_tokens(query.q)
+                    tokens = [{"term": {"search_tokens": term}} for term in query_tokens(query.q)]
+                    scoped["bool"]["filter"].extend(tokens)
+                    # The next dismissal end among matching rows, hidden ones included,
+                    # so a count view can refresh when an alert returns (REV-49).
+                    changing = query.expression.scoped_query(
+                        tenant_id, evaluated_at, include_suppressed=True
+                    )
+                    changing["bool"]["filter"].extend(
+                        [*tokens, {"range": {"dismissed_until": {"gt": epoch_us(evaluated_at)}}}]
                     )
                     searches.extend(
                         [
@@ -133,6 +142,19 @@ class CountReader:
                                 "track_total_hits": True,
                                 "timeout": f"{max(1, int(remaining() * 1000))}ms",
                                 "query": scoped,
+                                "aggs": {
+                                    "next_change": {
+                                        "global": {},
+                                        "aggs": {
+                                            "scoped": {
+                                                "filter": changing,
+                                                "aggs": {
+                                                    "at": {"min": {"field": "dismissed_until"}}
+                                                },
+                                            }
+                                        },
+                                    }
+                                },
                             },
                         ]
                     )
@@ -166,6 +188,15 @@ class CountReader:
                     ):
                         raise unavailable("search_total_inexact")
                     totals.append(total["value"])
+                    at = (
+                        result.get("aggregations", {})
+                        .get("next_change", {})
+                        .get("scoped", {})
+                        .get("at", {})
+                        .get("value")
+                    )
+                    if at is not None:
+                        changes.append(int(round(at)))
             remaining()
             observed = revalidate()
             if before.consistency() != observed.consistency():
@@ -181,6 +212,11 @@ class CountReader:
                 asdict(observed),
                 before.searchable_seq < observed.committed_seq,
                 before.maintenance_pending,
+                (
+                    datetime(1970, 1, 1, tzinfo=UTC) + timedelta(microseconds=min(changes))
+                ).isoformat()
+                if changes
+                else None,
             )
         except AppError:
             raise

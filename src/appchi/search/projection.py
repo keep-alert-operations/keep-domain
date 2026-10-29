@@ -55,6 +55,8 @@ def index_mapping() -> dict:
     properties.update(
         {
             "deleted": {"type": "boolean"},
+            # Timed dismissal end (REV-49); queries compare it with evaluated_at.
+            "dismissed_until": {"type": "long"},
             "projection_version": {"type": "long"},
             "content_digest": {"type": "keyword", "ignore_above": 64},
             "severity_clear_last": {"type": "boolean"},
@@ -129,6 +131,11 @@ def build_document(item: Projection) -> dict:
             result[name] = value
         if spec.nullable:
             result["missing_" + name] = value is None
+    until = snapshot.get("dismissed_until")
+    if until is not None:
+        # Omitted when absent, so documents without a dismissal keep their digest.
+        result["dismissed_until"] = epoch_us(until) if isinstance(until, datetime) else timestamp(until)
+        display["dismissed_until"] = until.isoformat() if isinstance(until, datetime) else until
     display["timestamp"] = display["last_received_at"]
     display["projection_version"] = item.version
     if "revision" in snapshot:
