@@ -123,8 +123,8 @@ class Panel(StrictModel):
     title: str | None = None
     x: int = Field(ge=0)
     y: int = Field(ge=0)
-    w: Literal[3, 4, 6, 12]
-    h: Literal[2, 3, 4]
+    w: int = Field(ge=3, le=12)
+    h: int = Field(ge=2)
     thresholds: list[Threshold] = Field(default_factory=list, max_length=3)
     _id = field_validator("id", "preset_id")(uuid_string)
 
