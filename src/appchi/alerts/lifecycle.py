@@ -1,6 +1,7 @@
 from datetime import timedelta
 from uuid import UUID, uuid4
 
+from appchi.alerts.dismissal import apply_dismissal, clear_dismissal, dismissal_recorded, expire_dismissal
 from appchi.ingestion.native import native_time
 from appchi.shared.errors import AppError
 
@@ -20,6 +21,7 @@ SEMANTIC_FIELDS = (
     "acknowledged_by",
     "acknowledged_at",
     "assignee_id",
+    "dismissed_until",
 )
 
 
@@ -90,10 +92,12 @@ def apply_source(previous, item):
         else:
             current["resolved_at"] = when
             current["retention_at"] = when + timedelta(days=90)
+    # The first source input at or after a dismissal's end clears it (REV-49).
+    expire_dismissal(current, when)
     current["timestamp"] = max(current["timestamp"], when)
     current["last_source_activity"] = max(current["last_source_activity"], when)
     current["history_id"] = item["id"]
-    changed = any(current[f] != previous[f] for f in SEMANTIC_FIELDS)
+    changed = any(current.get(f) != previous.get(f) for f in SEMANTIC_FIELDS)
     current["revision"] += int(changed)
     current["projection_version"] += 1
     return current, changed
@@ -111,12 +115,17 @@ def open_occurrence(current, when):
         acknowledged_at=None,
         assignee_id=None,
     )
+    # A new occurrence ends a dismissal early.
+    if dismissal_recorded(current):
+        clear_dismissal(current)
 
 
 def apply_command(current, kind, value, actor, when):
-    if kind not in {"set_status", "set_assignee"}:
+    if kind not in {"set_status", "set_assignee", "set_dismissal"}:
         raise AppError("invalid_command", "Use assignment to acknowledge an alert.", 422)
     result = dict(current)
+    # A command applied at or after a dismissal's end records that it ended.
+    expire_dismissal(result, when)
     if kind == "set_status" and result["status"] != value:
         result["status"] = value
         if value == "firing":
@@ -126,7 +135,9 @@ def apply_command(current, kind, value, actor, when):
             result.update(resolved_at=when, retention_at=when + timedelta(days=90))
     elif kind == "set_assignee":
         result["assignee_id"] = UUID(value) if value is not None else None
-    changed = any(result[f] != current[f] for f in SEMANTIC_FIELDS)
+    elif kind == "set_dismissal":
+        apply_dismissal(result, value, actor, when)
+    changed = any(result.get(f) != current.get(f) for f in SEMANTIC_FIELDS)
     if changed:
         result["revision"] += 1
         result["projection_version"] += 1

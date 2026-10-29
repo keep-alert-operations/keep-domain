@@ -26,6 +26,7 @@ from typing import Any
 from uuid import UUID
 
 from .catalog import FIELDS, RULE_FIELDS, storage_name
+from appchi.alerts.dismissal import effective_suppressed
 from appchi.alerts.presentation import display_status
 from appchi.request_budget import remaining
 
@@ -512,11 +513,26 @@ def negate(query: dict) -> dict:
     return {"bool": {"must_not": [query]}}
 
 
+def suppressed_query(evaluated_at: datetime) -> dict:
+    """Effective suppression: stored causes or a dismissal still running (REV-49)."""
+    return {
+        "bool": {
+            "should": [
+                {"term": {"suppressed": True}},
+                {"range": {"dismissed_until": {"gt": epoch_us(evaluated_at)}}},
+            ],
+            "minimum_should_match": 1,
+        }
+    }
+
+
 def elastic(ir: IR, evaluated_at: datetime) -> dict:
     op = ir.op
     if op == "literal":
         return {"match_all" if ir.value else "match_none": {}}
     if op == "field":
+        if ir.value == "suppressed":
+            return suppressed_query(evaluated_at)
         return {"term": {storage_name(ir.value): True}}
     if op == "has":
         return {
@@ -563,6 +579,9 @@ def elastic(ir: IR, evaluated_at: datetime) -> dict:
                 }
             }
         return negate(query) if op == "ne" else query
+    if left.value == "suppressed" and op in {"eq", "ne"} and isinstance(value, bool):
+        query = suppressed_query(evaluated_at)
+        return query if (op == "eq") == value else negate(query)
     if op in {"eq", "ne"}:
         query = negate({"exists": {"field": name}}) if value is None else {"term": {name: value}}
         return negate(query) if op == "ne" else query
@@ -633,6 +652,8 @@ class CompiledExpression:
             value = (
                 display_status(alert)
                 if name == "display_status"
+                else effective_suppressed(alert, evaluated_at)
+                if name == "suppressed" and "suppressed" in alert
                 else alert.get(name, alert.get(storage_name(name)))
             )
             if value is None and not spec.nullable:
@@ -694,7 +715,7 @@ class CompiledExpression:
             self.to_elasticsearch(evaluated_at),
         ]
         if not include_suppressed:
-            filters.append({"term": {"suppressed": False}})
+            filters.append(negate(suppressed_query(evaluated_at)))
         return {"bool": {"filter": filters}}
 
 

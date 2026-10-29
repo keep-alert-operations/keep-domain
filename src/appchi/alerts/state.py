@@ -1,3 +1,4 @@
+from appchi.alerts.dismissal import dismissal_active, dismissal_view
 from appchi.alerts.presentation import display_status, present_command_result
 from appchi.cel.catalog import RULE_FIELDS
 from appchi.maintenance.runtime import apply_transition
@@ -45,7 +46,19 @@ def derived_read(conn, row):
         suppressed, updating = derive_current(conn, row, now)
     except MaintenanceProofError:
         raise unavailable("maintenance_proof_unavailable") from None
-    return dict(row, suppressed=suppressed, maintenance_updating=updating)
+    # A dismissal is evaluated against this read's clock (REV-49).
+    dismissal = dismissal_view(row, now)
+    if dismissal and dismissal["dismissed_by"] is not None:
+        named = conn.execute(
+            "SELECT display_name FROM principals WHERE id=%s", (dismissal["dismissed_by"],)
+        ).fetchone()
+        dismissal["dismissed_by_display_name"] = named["display_name"] if named else None
+    return dict(
+        row,
+        suppressed=suppressed or dismissal_active(row, now),
+        maintenance_updating=updating,
+        dismissal=dismissal,
+    )
 
 
 def retained(conn, tenant, alert_id, lock=False):

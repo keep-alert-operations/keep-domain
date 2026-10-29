@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     kafka_bootstrap: str | None = None
     global_tenant_id: UUID | None = None
     kafka_admission_enabled: bool = False
+    # Timed alert dismissal (REV-49) stays off until every writer runs this release.
+    alert_dismissal_enabled: bool = False
     clock_health_file: Path | None = None
     database_clock_health_file: Path | None = None
     kafka_security_protocol: Literal["PLAINTEXT", "SSL", "SASL_SSL"] = "PLAINTEXT"

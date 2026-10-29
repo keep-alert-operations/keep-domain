@@ -211,6 +211,19 @@ class AlertDisplayNames(_Open):
         default=None,
         description="Title of the retained same-tenant active incident; null otherwise.",
     )
+    dismissed_until: str | None = Field(
+        default=None,
+        description="End of the alert's timed dismissal (REV-49); `suppressed` already reflects it at the response's clock.",
+    )
+
+
+class AlertDismissal(_Open):
+    until: str = Field(description="UTC end of the dismissal; it stops suppressing the alert then.")
+    dismissed_at: str
+    dismissed_by: str | None = None
+    state: Literal["active", "expired"] = Field(
+        description="Expired once the end has passed but before a write recorded that it ended."
+    )
 
 
 class IncidentDisplayNames(_Open):
@@ -274,6 +287,9 @@ class AlertDetailNames(AlertDisplayNames):
     active_incident_id: str | None = Field(
         default=None,
         description="Retained same-tenant active owning incident (PG ownership); null otherwise.",
+    )
+    dismissal: AlertDismissal | None = Field(
+        default=None, description="The alert's timed dismissal (REV-49); null when none is stored."
     )
 
 

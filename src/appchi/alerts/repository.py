@@ -2,6 +2,7 @@ from uuid import uuid4
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
+from appchi.alerts.dismissal import correlation_suppressed, dismissal_recorded
 from appchi.serialization import wire
 
 
@@ -57,7 +58,15 @@ def publish(
             from appchi.correlation.runtime import release_alert
 
             release_alert(conn, tenant, after["id"], now)
-        elif after["suppressed"]:
+        elif dismissal_recorded(after) and after.get("dismissed_until") != before.get(
+            "dismissed_until"
+        ):
+            # Dismissing (or changing one) releases correlation like a manual
+            # resolution: evidence is removed and cannot restart before this time.
+            from appchi.correlation.runtime import release_alert
+
+            release_alert(conn, tenant, after["id"], now)
+        elif correlation_suppressed(after):
             conn.execute(
                 "DELETE FROM correlation_evidence WHERE tenant_id=%s AND alert_id=%s",
                 (tenant, after["id"]),

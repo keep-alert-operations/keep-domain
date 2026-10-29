@@ -7,6 +7,7 @@ from uuid import UUID, uuid5
 
 from psycopg.types.json import Jsonb
 
+from appchi.alerts.dismissal import correlation_suppressed
 from appchi.alerts.lifecycle import SEMANTIC_FIELDS
 from appchi.cel.catalog import RULE_FIELDS
 from appchi.shared.capacity import budget
@@ -189,7 +190,7 @@ def _apply_transition(conn, before, after, when, order, cause, now, catalog):
         adjusted, effects = reconcile_alert(conn, after, now, catalog=catalog)
     changed = (
         before is None
-        or any(before[field] != adjusted[field] for field in SEMANTIC_FIELDS)
+        or any(before.get(field) != adjusted.get(field) for field in SEMANTIC_FIELDS)
         or (cause != "source" and after["revision"] > before["revision"])
     )
     if before is None:
@@ -235,7 +236,7 @@ def persist_effects(conn, current, effects, now):
     tenant, alert_id = current["tenant_id"], UUID(str(current["id"]))
     actions = [(identity, "activate", at) for identity, at in effects.qualifiers]
     actions.extend((identity, "withdraw", None) for identity in effects.withdrawn_qualifiers)
-    if current["suppressed"]:
+    if correlation_suppressed(current):
         conn.execute(
             "DELETE FROM correlation_evidence WHERE tenant_id=%s AND alert_id=%s",
             (tenant, alert_id),

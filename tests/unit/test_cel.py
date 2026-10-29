@@ -127,7 +127,22 @@ def test_literal_wildcard_escaping_and_scope():
     filters = compiled.scoped_query("tenant", NOW)["bool"]["filter"]
     assert {"term": {"tenant_id": "tenant"}} in filters
     assert {"term": {"deleted": False}} in filters
-    assert {"term": {"suppressed": False}} in filters
+    # Requirements: REV-49; alert operations 29. A running dismissal also hides the row.
+    assert {
+        "bool": {
+            "must_not": [
+                {
+                    "bool": {
+                        "should": [
+                            {"term": {"suppressed": True}},
+                            {"range": {"dismissed_until": {"gt": 1790078400000000}}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                }
+            ]
+        }
+    } in filters
 
 
 def test_limits_and_relative_overflow():

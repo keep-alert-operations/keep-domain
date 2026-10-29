@@ -12,6 +12,7 @@ from uuid import UUID, uuid4, uuid5
 
 from psycopg.types.json import Jsonb
 
+from appchi.alerts.dismissal import correlation_suppressed, dismissal_recorded
 from appchi.cel.catalog import CORRELATION_FIELDS as RULE_FIELDS
 from appchi.shared.errors import AppError, unavailable
 from appchi.shared.transactions import coordinator
@@ -211,7 +212,9 @@ def _snapshot(row, owner=None):
         int(row["revision"]),
         _fields(row),
         row["status"],
-        row["suppressed"],
+        # A recorded dismissal holds like a stored maintenance cause until a
+        # source input or command clears it (REV-49).
+        correlation_suppressed(row),
         owner,
     )
 
@@ -464,15 +467,19 @@ def _event(conn, event, current, owner, prepared):
     kind = "source" if event["cause"] == "source" else "manual" if source_order else "bookkeeping"
     if event["cause"] == "maintenance-materialization":
         kind = "bookkeeping"
-    if _fields(after) == _fields(current) and after["suppressed"] == current["suppressed"]:
+    if _fields(after) == _fields(current) and correlation_suppressed(
+        after
+    ) == correlation_suppressed(current):
         after = dict(after, revision=current["revision"])
     if prepared.maintenance and source_order and kind != "bookkeeping":
         from appchi.maintenance.processing import suppression_at
 
         proof = suppression_at(conn, tenant, event["alert_id"], event["effective_at"], source_order)
-        before = dict(before, suppressed=proof.before) if before else None
-        after = dict(after, suppressed=proof.after)
-        if after["suppressed"] and not current["suppressed"]:
+        before = (
+            dict(before, suppressed=proof.before or dismissal_recorded(before)) if before else None
+        )
+        after = dict(after, suppressed=proof.after or dismissal_recorded(after))
+        if after["suppressed"] and not correlation_suppressed(current):
             release = conn.execute(
                 """SELECT q.*,i.original_order FROM maintenance_qualifier_effects q
                 JOIN maintenance_alert_inputs i ON i.tenant_id=q.tenant_id AND i.alert_id=q.alert_id AND i.id=q.origin_input_id
@@ -535,10 +542,11 @@ def maintenance_input(conn, effect, current, owner, sequence, consuming_order=No
     ):
         return None
     if (
-        current["suppressed"]
+        correlation_suppressed(current)
         or current["status"] != "firing"
         or _fields(proof["after_snapshot"]) != _fields(current)
     ):
+        # A maintenance release during an active dismissal creates no qualifier.
         return None
     before = _snapshot(dict(current, suppressed=True), owner)
     after = _snapshot(current, owner)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 from copy import deepcopy
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
 import math
@@ -11,12 +11,15 @@ from typing import Callable, NamedTuple
 
 from appchi.cel import CompiledExpression, compile_expression
 from appchi.cel.catalog import FIELDS, storage_name
-from appchi.cel.compiler import PROFILE
+from appchi.cel.compiler import PROFILE, epoch_us
+from appchi.alerts.dismissal import effective_suppressed
 from appchi.alerts.presentation import present_alert
 from appchi.shared.crypto import EnvelopeCipher
 from appchi.shared.errors import AppError, unavailable
 from .projection import SORTABLE, assert_complete, canonical
 from .text import query_tokens
+
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 # REV-44 grouping vocabulary; appchi.configuration.models.GROUPABLE matches it.
 GROUPABLE = (
@@ -145,6 +148,7 @@ class FeedPage:
     observed: dict
     updating: bool
     close_token: str | None = None
+    next_change_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -168,6 +172,7 @@ class GroupPage:
     observed: dict
     updating: bool
     close_token: str | None = None
+    next_change_at: str | None = None
 
 
 def sort_spec(name: str, direction: str) -> list[dict]:
@@ -307,15 +312,49 @@ class SearchReader:
             raise AppError("cursor_expired", "Search snapshot expired; restart pagination", 409)
         return f"{remaining_ms}ms"
 
-    def _rows(self, hits, retained, scope) -> list[dict]:
+    def _rows(self, hits, retained, scope, query_time) -> list[dict]:
         rows = []
         for hit in hits:
             document = hit["_source"]
             if document.get("tenant_id") != scope.tenant_id or document.get("deleted") is not False:
                 raise unavailable("search_scope_mismatch")
             if hit["_id"] in retained:
-                rows.append(present_alert(document["display"]))
+                row = present_alert(document["display"])
+                # A dismissal counts as suppression at this snapshot's clock (REV-49).
+                if "suppressed" in row:
+                    row["suppressed"] = effective_suppressed(row, query_time)
+                rows.append(row)
         return rows
+
+    @staticmethod
+    def _next_change_aggregation(query) -> dict:
+        """Earliest dismissal end after the snapshot among rows the query matches,
+        ignoring the suppression filter, so a view can refresh when an alert returns.
+        A global aggregation escapes the page query within the same request."""
+        return {
+            "global": {},
+            "aggs": {"scoped": {"filter": query, "aggs": {"at": {"min": {"field": "dismissed_until"}}}}},
+        }
+
+    @staticmethod
+    def _next_change(response) -> str | None:
+        value = (
+            response.get("aggregations", {})
+            .get("next_change", {})
+            .get("scoped", {})
+            .get("at", {})
+            .get("value")
+        )
+        if value is None:
+            return None
+        return (EPOCH + timedelta(microseconds=int(round(value)))).isoformat()
+
+    def _change_query(self, expression, scope, query_time, terms, extra=()):
+        query = expression.scoped_query(scope.tenant_id, query_time, include_suppressed=True)
+        query["bool"]["filter"].extend({"term": {"search_tokens": term}} for term in terms)
+        query["bool"]["filter"].extend(extra)
+        query["bool"]["filter"].append({"range": {"dismissed_until": {"gt": epoch_us(query_time)}}})
+        return query
 
     def page(
         self,
@@ -403,9 +442,23 @@ class SearchReader:
             }
             if snapshot["after"] is not None:
                 arguments["search_after"] = snapshot["after"]
+            if newly_opened:
+                arguments["aggs"] = {
+                    "next_change": self._next_change_aggregation(
+                        self._change_query(
+                            expression,
+                            scope,
+                            query_time,
+                            terms,
+                            [group_filter(group[0], group[1], query_time)] if group else (),
+                        )
+                    )
+                }
             response = self.client.search(**arguments)
             assert_complete(response)
             current_pit = response.get("pit_id", current_pit)
+            if newly_opened:
+                snapshot["next_change_at"] = self._next_change(response)
             hits = response["hits"]["hits"]
             total = response["hits"]["total"]
             if total.get("relation") != "eq":
@@ -421,7 +474,7 @@ class SearchReader:
                 len(retained.intersection(ids)) != len(ids)
                 or observed.purge_generation != snapshot["watermark"]["purge_generation"]
             )
-            rows = self._rows(hits, retained, scope)
+            rows = self._rows(hits, retained, scope, query_time)
             snapshot["pit"] = current_pit
             snapshot["seen"] += len(hits)
             next_cursor = None
@@ -447,6 +500,7 @@ class SearchReader:
                 asdict(observed),
                 purged or snapshot["watermark"]["searchable_seq"] < observed.committed_seq,
                 close_token,
+                snapshot.get("next_change_at"),
             )
         except AppError:
             if current_pit and newly_opened:
@@ -514,16 +568,23 @@ class SearchReader:
             )
             query["bool"]["filter"].extend({"term": {"search_tokens": term}} for term in terms)
             keep_alive = self._keep_alive(snapshot)
+            aggregations = {"groups": _group_aggregation(group_by, query_time)}
+            if newly_opened:
+                aggregations["next_change"] = self._next_change_aggregation(
+                    self._change_query(expression, scope, query_time, terms)
+                )
             response = self.client.search(
                 pit={"id": current_pit, "keep_alive": keep_alive},
                 query=query,
                 size=0,
                 track_total_hits=True,
                 allow_partial_search_results=False,
-                aggs={"groups": _group_aggregation(group_by, query_time)},
+                aggs=aggregations,
             )
             assert_complete(response)
             current_pit = response.get("pit_id", current_pit)
+            if newly_opened:
+                snapshot["next_change_at"] = self._next_change(response)
             total = response["hits"]["total"]
             if total.get("relation") != "eq":
                 raise unavailable("search_total_inexact")
@@ -610,7 +671,7 @@ class SearchReader:
                         None if purged else bucket.count,
                         None if purged else bucket.severity,
                         None if purged else bucket.status,
-                        self._rows(hits, retained, scope),
+                        self._rows(hits, retained, scope, query_time),
                         next_cursor,
                     )
                 )
@@ -637,6 +698,7 @@ class SearchReader:
                 asdict(observed),
                 purged or snapshot["watermark"]["searchable_seq"] < observed.committed_seq,
                 close_token,
+                snapshot.get("next_change_at"),
             )
         except AppError:
             if current_pit and newly_opened:
