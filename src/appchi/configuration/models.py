@@ -10,6 +10,7 @@ SORTABLE = {
     "node_name",
     "site",
     "operator",
+    "name",
     "severity",
     "status",
     "time_created",
@@ -44,6 +45,7 @@ GROUPABLE = {
     "component",
     "node_name",
     "site",
+    "name",
     "assignee_id",
     "active_incident_id",
 }

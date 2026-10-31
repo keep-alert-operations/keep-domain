@@ -274,6 +274,10 @@ def _snapshot(value):
     if not RULE_FIELDS.issubset(value):
         raise MaintenanceProofError("maintenance_rule_snapshot_incomplete")
     snapshot = {key: value[key] for key in sorted(RULE_FIELDS)}
+    if snapshot["name"] is None:
+        # Implied by key_field (REV-54); proof recorded before names existed
+        # stays byte-identical for continuity, replay digests and checkpoints.
+        del snapshot["name"]
     created = snapshot["time_created"]
     if isinstance(created, str):
         try:

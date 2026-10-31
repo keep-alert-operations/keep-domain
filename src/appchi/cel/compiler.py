@@ -25,7 +25,7 @@ from time import monotonic
 from typing import Any
 from uuid import UUID
 
-from .catalog import FIELDS, RULE_FIELDS, storage_name
+from .catalog import FIELDS, RULE_FIELDS, alert_name, storage_name
 from appchi.alerts.dismissal import effective_suppressed
 from appchi.alerts.presentation import display_status
 from appchi.request_budget import remaining
@@ -654,6 +654,8 @@ class CompiledExpression:
                 if name == "display_status"
                 else effective_suppressed(alert, evaluated_at)
                 if name == "suppressed" and "suppressed" in alert
+                else alert_name(alert)
+                if name == "name"
                 else alert.get(name, alert.get(storage_name(name)))
             )
             if value is None and not spec.nullable:

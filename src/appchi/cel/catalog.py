@@ -28,6 +28,7 @@ FIELDS.update(
         for name in (
             "node_name",
             "site",
+            "name",
             "occurrence_id",
             "acknowledged_by",
             "assignee_id",
@@ -78,6 +79,7 @@ RULE_FIELDS = frozenset(
         "impact",
         "runbook_url",
         "message",
+        "name",
         "severity",
         "status",
         "time_created",
@@ -94,6 +96,18 @@ CORRELATION_FIELDS = RULE_FIELDS - {"assignee_id"}
 INDEX_FIELDS = dict(FIELDS)
 LEGACY_ACK_FIELDS = frozenset({"acknowledged", "acknowledged_by", "acknowledged_at"})
 FIELDS["display_status"] = Field("enum", values=("firing", "acknowledged", "resolved"))
+
+
+def alert_name(alert: dict) -> str | None:
+    """Effective name (REV-54): the supplied name, else a v2 alert's key_field.
+
+    Only a supplied name is stored, so records written before names existed and
+    proof snapshots that omit an absent name all read the same way. V1 has none.
+    """
+    name = alert.get("name")
+    if name is None and alert.get("schema_version") == "v2":
+        return alert.get("key_field")
+    return name
 
 
 def storage_name(name: str) -> str:

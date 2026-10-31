@@ -13,7 +13,7 @@ import json
 from typing import Literal, Protocol
 from uuid import UUID
 
-from appchi.cel.catalog import FIELDS, CORRELATION_FIELDS as RULE_FIELDS
+from appchi.cel.catalog import FIELDS, CORRELATION_FIELDS as RULE_FIELDS, alert_name
 
 
 class CorrelationProofError(RuntimeError):
@@ -70,7 +70,7 @@ def validate_group_fields(fields: tuple[GroupField, ...]):
 def group_key(fields: tuple[GroupField, ...], snapshot: dict) -> GroupKey | None:
     values = []
     for field in fields:
-        value = snapshot.get(field.name)
+        value = alert_name(snapshot) if field.name == "name" else snapshot.get(field.name)
         if field.kind == "string":
             valid = isinstance(value, str) and bool(value.strip())
         elif field.kind == "int":
