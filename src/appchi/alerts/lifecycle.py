@@ -50,6 +50,8 @@ def apply_source(previous, item):
             "impact": source.get("impact"),
             "runbook_url": source.get("runbook_url"),
             "message": source["message"],
+            # Part of the v2 identity, so later deliveries never change it (REV-54).
+            "name": source.get("name"),
             "severity": severity,
             "status": status,
             "source_suppressed": source_suppressed,

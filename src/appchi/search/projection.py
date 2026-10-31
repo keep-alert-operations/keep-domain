@@ -5,7 +5,7 @@ from datetime import datetime
 from hashlib import sha256
 import json
 
-from appchi.cel.catalog import INDEX_FIELDS as FIELDS, storage_name
+from appchi.cel.catalog import INDEX_FIELDS as FIELDS, alert_name, storage_name
 from appchi.cel.compiler import PROFILE, epoch_us, timestamp
 from appchi.shared.errors import AppError, unavailable
 from .text import TOKENIZER_PROFILE, max_query_token_bytes, source_tokens
@@ -17,6 +17,7 @@ SORTABLE = frozenset(
         "node_name",
         "site",
         "operator",
+        "name",
         "severity",
         "status",
         "time_created",
@@ -110,8 +111,12 @@ def build_document(item: Projection) -> dict:
     for name, spec in FIELDS.items():
         if name == "timestamp":
             continue
-        value = snapshot.get(
-            name, snapshot.get("timestamp") if name == "last_received_at" else None
+        value = (
+            alert_name(snapshot)
+            if name == "name"
+            else snapshot.get(
+                name, snapshot.get("timestamp") if name == "last_received_at" else None
+            )
         )
         if value is None and not spec.nullable:
             if name == "incident_ids":
@@ -147,7 +152,9 @@ def build_document(item: Projection) -> dict:
     result["search_tokens"] = (
         list(item.tokens)
         if item.tokens is not None
-        else source_tokens([snapshot["message"], snapshot.get("impact") or "", *notes])
+        else source_tokens(
+            [snapshot["message"], snapshot.get("impact") or "", alert_name(snapshot) or "", *notes]
+        )
     )
     result["severity_clear_last"] = snapshot["severity"] == "clear"
     result["severity_rank"] = {"critical": 0, "high": 1, "warning": 2, "clear": 3}[

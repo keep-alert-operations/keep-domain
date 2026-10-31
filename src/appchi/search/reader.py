@@ -29,6 +29,7 @@ GROUPABLE = (
     "component",
     "node_name",
     "site",
+    "name",
     "assignee_id",
     "active_incident_id",
 )
