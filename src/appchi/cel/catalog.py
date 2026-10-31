@@ -42,6 +42,9 @@ FIELDS.update(
         "message": Field("string", max_bytes=32768),
         "impact": Field("string", True, 16384),
         "runbook_url": Field("string", True, 8192),
+        # REV-55: system-derived, outside RULE_FIELDS; see alert_provider().
+        "provider": Field("enum", True, values=("api", "grafana")),
+        "alert_rule_url": Field("string", True, 8192),
         "schema_version": Field("enum", values=("v1", "v2")),
         "severity": Field("enum", values=("critical", "high", "warning", "clear")),
         "status": Field("enum", values=("firing", "resolved")),
@@ -108,6 +111,18 @@ def alert_name(alert: dict) -> str | None:
     if name is None and alert.get("schema_version") == "v2":
         return alert.get("key_field")
     return name
+
+
+def alert_provider(alert: dict) -> str | None:
+    """Provider (REV-55): the stored value, else api for v1, whose only route is native.
+
+    Rows and snapshots written before REV-55 hold no provider; a v2 one reads as
+    none until the provider backfill stores the value of its latest delivery.
+    """
+    provider = alert.get("provider")
+    if provider is None and alert.get("schema_version") == "v1":
+        return "api"
+    return provider
 
 
 def storage_name(name: str) -> str:

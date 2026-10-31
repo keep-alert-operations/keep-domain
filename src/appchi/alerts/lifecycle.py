@@ -3,6 +3,7 @@ from uuid import UUID, uuid4
 
 from appchi.alerts.dismissal import apply_dismissal, clear_dismissal, dismissal_recorded, expire_dismissal
 from appchi.ingestion.native import native_time
+from appchi.operators.grafana import rule_url
 from appchi.shared.errors import AppError
 
 SEVERITY = {"error": "critical", "major": "high", "warning": "warning", "clear": "clear"}
@@ -25,10 +26,23 @@ SEMANTIC_FIELDS = (
 )
 
 
+def delivery_provider(item):
+    """Provider and Grafana alert rule URL of one delivery (REV-55).
+
+    Only the Grafana adapter records an adapter version, and its retained
+    original member carries the rule URL. Native v1 and v2 are api, with none.
+    """
+    if not item.get("adapter_version"):
+        return "api", None
+    raw = item.get("raw_json")
+    return "grafana", rule_url(bytes(raw)) if raw is not None else None
+
+
 def apply_source(previous, item):
     source = item["payload"]
     when = item["received_at"]
     v1 = item["version"] == "v1"
+    provider, alert_rule_url = delivery_provider(item)
     status = (
         ("resolved" if source["severity"] == "clear" else "firing")
         if v1
@@ -49,6 +63,9 @@ def apply_source(previous, item):
             "site": source.get("site"),
             "impact": source.get("impact"),
             "runbook_url": source.get("runbook_url"),
+            # Follow the latest delivery, outside the identity and revision (REV-55).
+            "provider": provider,
+            "alert_rule_url": alert_rule_url,
             "message": source["message"],
             # Part of the v2 identity, so later deliveries never change it (REV-54).
             "name": source.get("name"),
@@ -82,6 +99,8 @@ def apply_source(previous, item):
             raise AppError("identity_conflict", "Fixed severity differs.", 409)
         current["severity"] = severity
     current["message"] = source["message"]
+    current["provider"] = provider
+    current["alert_rule_url"] = alert_rule_url
     current["source_suppressed"] = source_suppressed
     current["suppressed"] = (
         source_suppressed  # maintenance reducer must run before publication when enabled

@@ -30,6 +30,8 @@ COLUMNS = SORTABLE | {
     "key_field",
     "impact",
     "runbook_url",
+    "provider",
+    "alert_rule_url",
     "message",
     "suppressed",
     "occurrence_id",

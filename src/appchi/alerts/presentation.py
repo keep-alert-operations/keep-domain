@@ -17,10 +17,13 @@ def present_alert(alert):
     result = {key: value for key, value in alert.items() if key not in LEGACY_ACK_FIELDS}
     result["display_status"] = display_status(alert)
     if "key_field" in alert:
-        from appchi.cel.catalog import alert_name  # appchi.cel imports this module
+        from appchi.cel.catalog import alert_name, alert_provider  # appchi.cel imports this module
 
         # Stored and replayed rows hold only a supplied name (REV-54).
         result["name"] = alert_name(alert)
+        # Rows from before REV-55 hold no provider; v1 reads as api.
+        result["provider"] = alert_provider(alert)
+        result.setdefault("alert_rule_url", None)
     return result
 
 
