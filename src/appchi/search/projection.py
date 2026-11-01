@@ -5,7 +5,7 @@ from datetime import datetime
 from hashlib import sha256
 import json
 
-from appchi.cel.catalog import INDEX_FIELDS as FIELDS, alert_name, storage_name
+from appchi.cel.catalog import INDEX_FIELDS as FIELDS, alert_name, alert_provider, storage_name
 from appchi.cel.compiler import PROFILE, epoch_us, timestamp
 from appchi.shared.errors import AppError, unavailable
 from .text import TOKENIZER_PROFILE, max_query_token_bytes, source_tokens
@@ -114,6 +114,8 @@ def build_document(item: Projection) -> dict:
         value = (
             alert_name(snapshot)
             if name == "name"
+            else alert_provider(snapshot)
+            if name == "provider"
             else snapshot.get(
                 name, snapshot.get("timestamp") if name == "last_received_at" else None
             )
