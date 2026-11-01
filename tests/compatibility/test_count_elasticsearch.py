@@ -1,20 +1,42 @@
 """Opt-in real ES count/PIT check; service absence is a skip, never a count."""
 
 from datetime import UTC, datetime, timedelta
+import os
 from uuid import uuid4
 
+from elasticsearch import Elasticsearch
 import pytest
 
 from appchi.cel import compile_expression
 from appchi.cel.compiler import epoch_us
+from appchi.search import index_mapping
 from appchi.search.counts import CountReader, CountState
-from test_search_elasticsearch import real_search  # noqa: F401 -- isolated real service fixture
 
 pytestmark = pytest.mark.compatibility
 
 
-def test_real_count_batch_native_parity_and_post_pit_insert(request):
-    client, index = request.getfixturevalue("real_search")
+@pytest.fixture
+def real_search():
+    endpoint = os.environ.get("APPCHI_TEST_ELASTICSEARCH_URL")
+    if not endpoint:
+        pytest.skip("Set APPCHI_TEST_ELASTICSEARCH_URL to an isolated real Elasticsearch service")
+    ca = os.environ.get("APPCHI_TEST_ELASTICSEARCH_CA")
+    api_key = os.environ.get("APPCHI_TEST_ELASTICSEARCH_API_KEY")
+    client = Elasticsearch(
+        endpoint,
+        request_timeout=10,
+        **({"ca_certs": ca} if ca else {}),
+        **({"api_key": api_key} if api_key else {}),
+    )
+    index = "appchi-test-counts-" + uuid4().hex
+    client.indices.create(index=index, mappings=index_mapping())
+    yield client, index
+    client.indices.delete(index=index)
+    client.close()
+
+
+def test_real_count_batch_native_parity_and_post_pit_insert(real_search):
+    client, index = real_search
     now = datetime(2026, 9, 22, 12, tzinfo=UTC)
     tenant, other = str(uuid4()), str(uuid4())
     documents = [
