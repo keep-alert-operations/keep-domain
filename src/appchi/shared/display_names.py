@@ -238,6 +238,19 @@ class IncidentDisplayNames(_Open):
         default=None,
         description="Current name of the originating rule; null when deleted or unknown.",
     )
+    total_linked: str | None = Field(
+        default=None,
+        description="Current linked alert references, each counted once, including unavailable ones.",
+    )
+    suppressed: str | None = Field(
+        default=None,
+        description="Retained linked alerts suppressed by maintenance or dismissal now; null in a "
+        "list row whose maintenance proof is not yet current (REV-56).",
+    )
+    unavailable: str | None = Field(
+        default=None,
+        description="Current linked references whose alert is no longer retained.",
+    )
 
 
 class ActorDisplayNames(_Open):
