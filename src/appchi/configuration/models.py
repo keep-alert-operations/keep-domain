@@ -85,6 +85,8 @@ class PresetDefinition(StrictModel):
     sort: list[Sort] = Field(min_length=1, max_length=3)
     columns: list[str] = Field(min_length=1, max_length=30)
     group_by: str | None = None
+    # Sound the alarm while the results page has alerts (REV-58).
+    noisy: bool = False
     _name = field_validator("name")(name)
 
     @field_validator("group_by")
