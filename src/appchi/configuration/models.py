@@ -1,7 +1,8 @@
 import unicodedata
-from typing import Literal
-from pydantic import Field, field_validator, model_validator
+from typing import Annotated, Literal
+from pydantic import Discriminator, Field, Tag, field_validator, model_validator
 
+from appchi.configuration import html
 from appchi.models import StrictModel, Command, uuid_string
 
 SORTABLE = {
@@ -123,24 +124,19 @@ class Threshold(StrictModel):
         return value
 
 
-class Panel(StrictModel):
+class PanelLayout(StrictModel):
     id: str
-    preset_id: str
     title: str | None = None
     x: int = Field(ge=0)
     y: int = Field(ge=0)
     w: int = Field(ge=3, le=12)
     h: int = Field(ge=2)
-    thresholds: list[Threshold] = Field(default_factory=list, max_length=3)
-    _id = field_validator("id", "preset_id")(uuid_string)
+    _id = field_validator("id")(uuid_string)
 
     @model_validator(mode="after")
     def valid_layout(self):
         if self.x + self.w > 12 or self.y + self.h > 100:
             raise ValueError("Panel exceeds grid")
-        bounds = [int(item.lower_bound) for item in self.thresholds]
-        if sorted(set(bounds)) != bounds:
-            raise ValueError("Thresholds must increase strictly")
         if self.title is not None:
             self.title = name(self.title)
             if len(self.title) > 120:
@@ -148,9 +144,66 @@ class Panel(StrictModel):
         return self
 
 
+class Panel(PanelLayout):
+    """A preset count panel; a panel without ``type`` is one (REV-57)."""
+
+    type: Literal["count"] = "count"
+    preset_id: str
+    thresholds: list[Threshold] = Field(default_factory=list, max_length=3)
+    _preset = field_validator("preset_id")(uuid_string)
+
+    @model_validator(mode="after")
+    def increasing(self):
+        bounds = [int(item.lower_bound) for item in self.thresholds]
+        if sorted(set(bounds)) != bounds:
+            raise ValueError("Thresholds must increase strictly")
+        return self
+
+
+class HtmlPanel(PanelLayout):
+    """A panel showing HTML; it references no preset (REV-57).
+
+    Validation bounds only the raw size. Callers sanitize with ``sanitize_panels``
+    after authorizing the request, so unauthenticated bodies are never parsed.
+    """
+
+    type: Literal["html"]
+    html: str = Field(max_length=65_536)
+
+
+def sanitize_panels(panels):
+    """Sanitize HTML panels in place and return what sanitizing removed."""
+    removed = []
+    for panel in panels:
+        if panel.type != "html":
+            continue
+        removed += [{"panel_id": panel.id, **item} for item in html.removals(panel.html)]
+        panel.html = html.sanitize(panel.html)
+        if len(panel.html) > html.MAX_HTML:
+            raise ValueError(f"HTML content exceeds {html.MAX_HTML:,} characters")
+    return removed
+
+
+def panel_type(value):
+    if isinstance(value, dict):
+        return value.get("type", "count")
+    return getattr(value, "type", "count")
+
+
+AnyPanel = Annotated[
+    Annotated[Panel, Tag("count")] | Annotated[HtmlPanel, Tag("html")],
+    Discriminator(panel_type),
+]
+
+
+def presets_of(panels):
+    """Preset IDs referenced by count panels, in first-use order."""
+    return list(dict.fromkeys(p.preset_id for p in panels if p.type == "count"))
+
+
 class DashboardDefinition(StrictModel):
     name: str
-    panels: list[Panel] = Field(max_length=24)
+    panels: list[AnyPanel] = Field(max_length=24)
     _name = field_validator("name")(name)
 
     @model_validator(mode="after")
