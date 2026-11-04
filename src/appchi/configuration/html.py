@@ -25,7 +25,7 @@ ATTRIBUTES = {
 }
 SCHEMES = {"http", "https", "mailto"}
 STYLES = {
-    "color", "background-color", "font-weight", "font-style", "text-align",
+    "color", "background-color", "font-size", "font-weight", "font-style", "text-align",
     "text-decoration", "border-radius",
     "padding", "padding-top", "padding-right", "padding-bottom", "padding-left",
     "margin", "margin-top", "margin-right", "margin-bottom", "margin-left",

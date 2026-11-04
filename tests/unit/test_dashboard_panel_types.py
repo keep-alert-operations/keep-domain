@@ -84,6 +84,8 @@ def test_layout_and_title_rules_apply_to_html_panels():
             '<p style="color: red">Hi</p>',
         ),
         ('<p style="position: fixed">Hi</p>', "<p>Hi</p>"),
+        ('<p style="font-size: 20px">Hi</p>', '<p style="font-size: 20px">Hi</p>'),
+        ('<p style="font-size: url(x)">Hi</p>', "<p>Hi</p>"),
     ],
 )
 def test_sanitizing_keeps_only_the_allowlist(raw, clean):
