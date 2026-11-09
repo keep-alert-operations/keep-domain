@@ -59,8 +59,8 @@ pydantic = ">=2.8,<3"
 [package.source]
 type = "git"
 url = "https://github.com/appchi-alert-operations/appchi-contracts.git"
-reference = "319700818ce83672446b54e60e9c1d7fedfef87f"
-resolved_reference = "319700818ce83672446b54e60e9c1d7fedfef87f"
+reference = "c864904ec13661f2ad60aa67812243f37e3ba756"
+resolved_reference = "c864904ec13661f2ad60aa67812243f37e3ba756"
 
 [[package]]
 name = "authlib"
@@ -1423,4 +1423,4 @@ runtime = ["authlib", "cel-expr-python", "confluent-kafka", "elasticsearch", "ld
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13,<3.14"
-content-hash = "ce982065f0d8b03af7cb3b1079b4a72b48858f8c31b235283809c5ff2a96867f"
+content-hash = "05e011f95bb613c00089a09e384dd9610307bbc4d4ef2f8fade6f3bd20ce4999"
