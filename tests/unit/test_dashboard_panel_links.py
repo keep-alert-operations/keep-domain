@@ -10,6 +10,7 @@ PANELS = {
     "table": {"type": "table", "preset_id": PRESET},
     "html": {"type": "html", "html": "<p>Handover</p>"},
     "image": {"type": "image", "image_id": IMAGE},
+    "servicenow": {"type": "servicenow", "team": "Payments"},
 }
 
 
@@ -29,7 +30,7 @@ def board(kind="count", **link):
 
 @pytest.mark.parametrize("kind", sorted(PANELS))
 def test_every_panel_type_keeps_its_link(kind):
-    """Requirements: REV-66; dashboard operations 2, 3."""
+    """Requirements: REV-66 (with REV-65 ServiceNow panels); dashboard operations 2, 3."""
     saved = board(kind, url="https://runbooks.example/payments", label="Runbook")
     assert saved.panels[0].model_dump()["link"] == {
         "url": "https://runbooks.example/payments",
