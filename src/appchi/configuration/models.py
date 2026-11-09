@@ -113,9 +113,27 @@ class PresetDefinition(StrictModel):
         return self
 
 
+# REV-64: a palette name (eight hues in five shades; the middle shade is the hue
+# alone) or a custom #RRGGBB color, stored upper case.
+THRESHOLD_HUES = ("red", "orange", "amber", "green", "teal", "blue", "purple", "gray")
+THRESHOLD_SHADES = ("lightest-", "light-", "", "dark-", "darkest-")
+THRESHOLD_PALETTE = frozenset(
+    shade + hue for hue in THRESHOLD_HUES for shade in THRESHOLD_SHADES
+)
+THRESHOLD_COLOR = (
+    r"^(#[0-9A-Fa-f]{6}|((lightest|light|dark|darkest)-)?"
+    r"(red|orange|amber|green|teal|blue|purple|gray))$"
+)
+
+
 class Threshold(StrictModel):
     lower_bound: str
-    color: Literal["blue", "green", "amber", "red"]
+    color: Annotated[str, Field(pattern=THRESHOLD_COLOR)]
+
+    @field_validator("color")
+    @classmethod
+    def canonical_color(cls, value):
+        return value.upper() if value.startswith("#") else value
 
     @field_validator("lower_bound")
     @classmethod
