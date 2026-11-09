@@ -171,6 +171,19 @@ class HtmlPanel(PanelLayout):
     html: str = Field(max_length=65_536)
 
 
+class TablePanel(PanelLayout):
+    """A panel listing its preset's latest alerts, newest first (REV-63).
+
+    It references a preset like a count panel and shows ``rows`` alerts in the
+    preset's saved columns; it has no thresholds and is never counted.
+    """
+
+    type: Literal["table"]
+    preset_id: str
+    rows: int = Field(default=10, ge=1, le=50)
+    _preset = field_validator("preset_id")(uuid_string)
+
+
 def sanitize_panels(panels):
     """Sanitize HTML panels in place and return what sanitizing removed."""
     removed = []
@@ -191,14 +204,21 @@ def panel_type(value):
 
 
 AnyPanel = Annotated[
-    Annotated[Panel, Tag("count")] | Annotated[HtmlPanel, Tag("html")],
+    Annotated[Panel, Tag("count")]
+    | Annotated[HtmlPanel, Tag("html")]
+    | Annotated[TablePanel, Tag("table")],
     Discriminator(panel_type),
 ]
 
 
 def presets_of(panels):
-    """Preset IDs referenced by count panels, in first-use order."""
+    """Preset IDs counted by count panels, in first-use order."""
     return list(dict.fromkeys(p.preset_id for p in panels if p.type == "count"))
+
+
+def referenced_presets_of(panels):
+    """Preset IDs any panel references (count and table panels), in first-use order."""
+    return list(dict.fromkeys(p.preset_id for p in panels if p.type in ("count", "table")))
 
 
 class DashboardDefinition(StrictModel):
