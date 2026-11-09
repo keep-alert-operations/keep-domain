@@ -63,6 +63,13 @@ class Settings(BaseSettings):
     operator_probe_token: SecretStr | None = None
     recovery_binding: Path | None = None
     recovery_credential: SecretStr | None = None
+    # REV-65: the ticket counting service address, a deployment secret mounted only
+    # into the product API. It may carry an access key in its query string, so it is
+    # never logged or returned. An absent, empty or invalid address means ServiceNow
+    # ticket panels are not connected; the API checks it at startup.
+    ticket_count_url: SecretStr | None = None
+    # Optional CA bundle that alone verifies the counting service's TLS certificate.
+    ticket_count_ca_file: str | None = None
     worker_health_path: Path | None = None
 
     @model_validator(mode="after")
