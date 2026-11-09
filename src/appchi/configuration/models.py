@@ -173,10 +173,15 @@ class Panel(PanelLayout):
 
     @model_validator(mode="after")
     def increasing(self):
-        bounds = [int(item.lower_bound) for item in self.thresholds]
-        if sorted(set(bounds)) != bounds:
-            raise ValueError("Thresholds must increase strictly")
-        return self
+        return increasing_thresholds(self)
+
+
+def increasing_thresholds(panel):
+    """Require a panel's threshold lower bounds to increase strictly."""
+    bounds = [int(item.lower_bound) for item in panel.thresholds]
+    if sorted(set(bounds)) != bounds:
+        raise ValueError("Thresholds must increase strictly")
+    return panel
 
 
 class HtmlPanel(PanelLayout):
@@ -261,6 +266,41 @@ class TablePanel(PanelLayout):
     _preset = field_validator("preset_id")(uuid_string)
 
 
+def ticket_team(value):
+    """A ServiceNow team name: trimmed NFC text on one line, 1–200 characters (REV-65)."""
+    value = unicodedata.normalize("NFC", value.strip())
+    if not 1 <= len(value) <= 200 or any(
+        unicodedata.category(c) in ("Cc", "Cf", "Cs", "Zl", "Zp") for c in value
+    ):
+        raise ValueError("Use a single-line team name of 1–200 characters")
+    return value
+
+
+TicketState = Literal["open", "in_progress", "both"]
+TicketDetection = Literal["hamal", "direct", "all"]
+
+
+class ServiceNowPanel(PanelLayout):
+    """A panel showing a team's ServiceNow ticket count (REV-65).
+
+    The API server asks the deployment's ticket counting service for the count of
+    ``team``'s tickets in ``ticket_state`` found by ``detection``. It references no
+    preset and is never part of a count batch; ``thresholds`` color the count like
+    a count panel's.
+    """
+
+    type: Literal["servicenow"]
+    team: str
+    ticket_state: TicketState = "open"
+    detection: TicketDetection = "hamal"
+    thresholds: list[Threshold] = Field(default_factory=list, max_length=3)
+    _team = field_validator("team")(ticket_team)
+
+    @model_validator(mode="after")
+    def increasing(self):
+        return increasing_thresholds(self)
+
+
 def sanitize_panels(panels):
     """Sanitize HTML panels in place and return what sanitizing removed."""
     removed = []
@@ -284,7 +324,8 @@ AnyPanel = Annotated[
     Annotated[Panel, Tag("count")]
     | Annotated[HtmlPanel, Tag("html")]
     | Annotated[ImagePanel, Tag("image")]
-    | Annotated[TablePanel, Tag("table")],
+    | Annotated[TablePanel, Tag("table")]
+    | Annotated[ServiceNowPanel, Tag("servicenow")],
     Discriminator(panel_type),
 ]
 
