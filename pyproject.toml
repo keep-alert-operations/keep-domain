@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Shared transactional business rules, CEL semantics, authorization primitives and recovery fences."
 requires-python = ">=3.13,<3.14"
 dependencies = [
-  "appchi-contracts @ git+https://github.com/appchi-alert-operations/appchi-contracts.git@ee9ae716618bd666dbe87a2db2323005662d77e4",
+  "appchi-contracts @ git+https://github.com/appchi-alert-operations/appchi-contracts.git@31778e7d2ba99635bb8d545474e7f3ad12a73e56",
   "fastapi>=0.115,<1",
   "pydantic-settings>=2.8,<3",
   "cryptography>=44,<47",
