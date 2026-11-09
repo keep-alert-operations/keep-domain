@@ -1,5 +1,6 @@
 import unicodedata
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 from pydantic import Discriminator, Field, Tag, field_validator, model_validator
 
 from appchi.configuration import html
@@ -171,6 +172,64 @@ class HtmlPanel(PanelLayout):
     html: str = Field(max_length=65_536)
 
 
+class ImagePanel(PanelLayout):
+    """A panel showing an uploaded image or an https image address (REV-62)."""
+
+    type: Literal["image"]
+    image_id: str | None = None
+    url: str | None = Field(default=None, max_length=2048)
+    fit: Literal["contain", "cover"] = "contain"
+    alt: str | None = None
+
+    @field_validator("image_id")
+    @classmethod
+    def image(cls, value):
+        return None if value is None else uuid_string(value)
+
+    @field_validator("url")
+    @classmethod
+    def address(cls, value):
+        if value is None:
+            return None
+        if not value.isascii() or any(c.isspace() or not c.isprintable() for c in value):
+            raise ValueError("Use an image address without spaces or control characters")
+        try:
+            parts = urlsplit(value)
+            parts.port
+        except ValueError:
+            raise ValueError("Use a valid https image address") from None
+        if parts.scheme != "https" or not parts.hostname:
+            raise ValueError("Use an address that starts with https://")
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("Image addresses cannot contain a user name or password")
+        return value
+
+    @field_validator("alt")
+    @classmethod
+    def description(cls, value):
+        if value is None:
+            return None
+        value = unicodedata.normalize("NFC", value.strip())
+        if not value:
+            return None
+        if len(value) > 300 or any(
+            unicodedata.category(c) in ("Cc", "Cf", "Cs", "Zl", "Zp") for c in value
+        ):
+            raise ValueError("Use a single-line description of up to 300 characters")
+        return value
+
+    @model_validator(mode="after")
+    def one_source(self):
+        if (self.image_id is None) == (self.url is None):
+            raise ValueError("An image panel needs exactly one of image_id or url")
+        return self
+
+
+def images_of(panels):
+    """Uploaded image IDs referenced by image panels, in first-use order (REV-62)."""
+    return list(dict.fromkeys(p.image_id for p in panels if p.type == "image" and p.image_id))
+
+
 class TablePanel(PanelLayout):
     """A panel listing its preset's latest alerts, newest first (REV-63).
 
@@ -206,6 +265,7 @@ def panel_type(value):
 AnyPanel = Annotated[
     Annotated[Panel, Tag("count")]
     | Annotated[HtmlPanel, Tag("html")]
+    | Annotated[ImagePanel, Tag("image")]
     | Annotated[TablePanel, Tag("table")],
     Discriminator(panel_type),
 ]

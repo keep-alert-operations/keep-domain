@@ -9,6 +9,19 @@ from appchi.clock_health import ClockEvidenceCache
 from appchi.ingestion.native import parse_json
 from appchi.shared.errors import AppError, unavailable
 from appchi.request_budget import request_budget
+from appchi.configuration.images import MAX_BYTES as IMAGE_LIMIT, MEDIA_TYPES as IMAGE_TYPES
+
+
+def is_image_read(path):
+    """One served dashboard image, /api/tenants/{tenant_id}/dashboard-images/{image_id}."""
+    parts = path.split("/")
+    return len(parts) == 6 and parts[1:3] == ["api", "tenants"] and parts[4] == "dashboard-images"
+
+
+def is_image_upload(path):
+    """The dashboard image upload route, /api/tenants/{tenant_id}/dashboard-images."""
+    parts = path.split("/")
+    return len(parts) == 5 and parts[1:3] == ["api", "tenants"] and parts[4] == "dashboard-images"
 
 
 def create_http_app(lifespan, *, product=False):
@@ -139,6 +152,12 @@ def create_http_app(lifespan, *, product=False):
                 "Cache-Control": (
                     "private, no-store, no-transform"
                     if response.headers.get("content-type", "").split(";")[0] == "text/event-stream"
+                    # Served dashboard images revalidate with their ETag on every
+                    # view, so access is still checked each time (REV-62).
+                    else "private, no-cache"
+                    if request.method == "GET"
+                    and response.status_code in (200, 304)
+                    and is_image_read(request.url.path)
                     else "private, no-store"
                 ),
                 "X-Content-Type-Options": "nosniff",
@@ -188,10 +207,17 @@ def create_http_app(lifespan, *, product=False):
                     "Compressed request bodies are not accepted.",
                     415,
                 )
-            if request.headers.get("content-type", "").split(";")[0].lower() != "application/json":
+            media = request.headers.get("content-type", "").split(";")[0].strip().lower()
+            # Image uploads are the one product body that is not JSON (REV-62).
+            upload = request.method == "POST" and is_image_upload(request.url.path)
+            if upload and media not in IMAGE_TYPES:
+                raise AppError("unsupported_media_type", "Use a PNG, JPEG, GIF or WebP image.", 415)
+            if not upload and media != "application/json":
                 raise AppError("unsupported_media_type", "Use application/json.", 415)
             limit = (
-                4 * 1024 * 1024
+                IMAGE_LIMIT
+                if upload
+                else 4 * 1024 * 1024
                 if "/ingest/" in request.url.path
                 else 512 * 1024
                 if request.url.path.endswith("/alerts/counts")
@@ -211,7 +237,8 @@ def create_http_app(lifespan, *, product=False):
             request._body = b"".join(chunks)
             request.state.receipt_started = monotonic()
             # Validated once here; handlers reuse the value instead of parsing again.
-            request.state.json_body = parse_json(request._body)
+            if not upload:
+                request.state.json_body = parse_json(request._body)
         return await call_next(request)
 
     @app.get("/livez", tags=["health"])
