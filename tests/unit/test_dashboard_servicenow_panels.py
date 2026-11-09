@@ -47,6 +47,7 @@ def test_servicenow_panels_default_to_open_hamal_tickets_and_reference_no_preset
         "y": 0,
         "w": 3,
         "h": 2,
+        "link": None,
         "type": "servicenow",
         "team": "Network Ops",
         "ticket_state": "open",

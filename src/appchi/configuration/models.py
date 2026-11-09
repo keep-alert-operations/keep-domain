@@ -143,6 +143,43 @@ class Threshold(StrictModel):
         return value
 
 
+class PanelLink(StrictModel):
+    """A panel's link button: an http(s) address and optional button text (REV-66)."""
+
+    url: str = Field(max_length=2048)
+    label: str | None = None
+
+    @field_validator("url")
+    @classmethod
+    def address(cls, value):
+        if not value.isascii() or any(c.isspace() or not c.isprintable() for c in value):
+            raise ValueError("Use a link without spaces or control characters")
+        try:
+            parts = urlsplit(value)
+            parts.port
+        except ValueError:
+            raise ValueError("Use a valid link address") from None
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError("Use a full link that starts with https:// or http://")
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("Links cannot contain a user name or password")
+        return value
+
+    @field_validator("label")
+    @classmethod
+    def text(cls, value):
+        if value is None:
+            return None
+        value = unicodedata.normalize("NFC", value.strip())
+        if not value:
+            return None
+        if len(value) > 40 or any(
+            unicodedata.category(c) in ("Cc", "Cf", "Cs", "Zl", "Zp") for c in value
+        ):
+            raise ValueError("Use single-line button text of up to 40 characters")
+        return value
+
+
 class PanelLayout(StrictModel):
     id: str
     title: str | None = None
@@ -150,6 +187,8 @@ class PanelLayout(StrictModel):
     y: int = Field(ge=0)
     w: int = Field(ge=3, le=12)
     h: int = Field(ge=2)
+    # Every panel type may have a link button (REV-66).
+    link: PanelLink | None = None
     _id = field_validator("id")(uuid_string)
 
     @model_validator(mode="after")

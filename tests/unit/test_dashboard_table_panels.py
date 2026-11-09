@@ -41,6 +41,7 @@ def test_table_panels_reference_a_preset_and_default_to_ten_rows():
         "y": 0,
         "w": 3,
         "h": 2,
+        "link": None,
         "type": "table",
         "preset_id": OTHER,
         "rows": 10,
