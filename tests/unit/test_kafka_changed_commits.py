@@ -7,8 +7,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from appchi import kafka_changed
-from appchi.kafka_changed import ChangedConsumer, PartitionRetries
+from keep import kafka_changed
+from keep.kafka_changed import ChangedConsumer, PartitionRetries
 
 
 def message(partition, offset):

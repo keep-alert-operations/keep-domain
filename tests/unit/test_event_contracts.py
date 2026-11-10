@@ -5,8 +5,8 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from appchi.events import received, changed
-from appchi.event_models import ReceivedEnvelope, ChangedEnvelope
+from keep.events import received, changed
+from keep.event_models import ReceivedEnvelope, ChangedEnvelope
 
 
 def test_exact_decimal_counter_and_reference_integrity():

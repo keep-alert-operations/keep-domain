@@ -2,16 +2,16 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from appchi.ingestion.native import canonical
-from appchi.shared.errors import AppError
-from appchi.visibility.models import (
+from keep.ingestion.native import canonical
+from keep.shared.errors import AppError
+from keep.visibility.models import (
     ChangeView,
     RegisterView,
     decode_acknowledgements,
     decode_model,
 )
-from appchi.visibility.limits import RegistryLimits
-from appchi.visibility.sampling import selected
+from keep.visibility.limits import RegistryLimits
+from keep.visibility.sampling import selected
 
 
 def acknowledgement():

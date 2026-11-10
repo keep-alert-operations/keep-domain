@@ -3,17 +3,17 @@ from uuid import uuid4
 
 import pytest
 
-from appchi.alerts.dismissal import (
+from keep.alerts.dismissal import (
     correlation_suppressed,
     dismissal_active,
     dismissal_reason,
     dismissal_view,
     effective_suppressed,
 )
-from appchi.alerts.lifecycle import apply_command, apply_source
-from appchi.cel import compile_expression
-from appchi.search.projection import Projection, build_document
-from appchi.shared.errors import AppError
+from keep.alerts.lifecycle import apply_command, apply_source
+from keep.cel import compile_expression
+from keep.search.projection import Projection, build_document
+from keep.shared.errors import AppError
 
 NOW = datetime(2026, 10, 28, 12, 30, tzinfo=UTC)
 ACTOR = uuid4()
@@ -171,7 +171,7 @@ def test_cel_suppressed_is_evaluated_at_the_query_clock(firing):
 
 def test_projection_carries_the_end_only_when_present(firing):
     """Requirements: REV-49; alert operations 29."""
-    from appchi.serialization import wire
+    from keep.serialization import wire
 
     snapshot = dict(wire(firing), live=True, notes=[], incident_ids=[], active_incident_id=None)
     snapshot["last_received_at"] = snapshot["timestamp"]

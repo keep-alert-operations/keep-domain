@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from appchi.identity.directory import (
+from keep.identity.directory import (
     AcceptedDirectory,
     DirectoryObject,
     DirectoryUnavailable,

@@ -5,7 +5,7 @@ from threading import Event
 
 import pytest
 
-import appchi.cel.compiler as compiler
+import keep.cel.compiler as compiler
 
 
 def test_identical_cold_requests_compile_once_without_blocking_unrelated_cache_hits(monkeypatch):
@@ -89,8 +89,8 @@ def test_pending_bookkeeping_is_bounded_without_blocking_existing_hits():
 
 @pytest.mark.parametrize("key", ["same", "other"])
 def test_expired_http_waiter_releases_thread_without_cancelling_owner(key):
-    from appchi.request_budget import request_budget
-    from appchi.shared.errors import AppError
+    from keep.request_budget import request_budget
+    from keep.shared.errors import AppError
 
     cache = compiler._CompileCache(capacity=1)
     started, release = Event(), Event()
@@ -120,8 +120,8 @@ def test_expired_http_waiter_releases_thread_without_cancelling_owner(key):
 
 @pytest.mark.parametrize("completion", ["checked", "expired"])
 def test_early_follower_wakeup_reuses_original_deadline(monkeypatch, completion):
-    import appchi.request_budget as budget
-    from appchi.shared.errors import AppError
+    import keep.request_budget as budget
+    from keep.shared.errors import AppError
 
     clock = [0.0]
     monkeypatch.setattr(budget, "monotonic", lambda: clock[0])

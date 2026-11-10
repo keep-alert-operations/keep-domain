@@ -4,7 +4,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from appchi.correlation.evidence import (
+from keep.correlation.evidence import (
     Boundary,
     Budgets,
     Condition,
@@ -337,7 +337,7 @@ def test_missing_before_is_not_a_false_baseline_and_replay_preserves_start():
 
 
 def test_native_cel_condition_is_used_without_a_second_evaluator():
-    from appchi.cel import compile_expression
+    from keep.cel import compile_expression
 
     compiled = compile_expression('alert.message == "match"', rule=True)
     state = EvidenceState(replace(rule(), conditions=(Condition(uuid4(), "native", compiled),)))

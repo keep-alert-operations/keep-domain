@@ -8,9 +8,9 @@ import httpx
 import pytest
 from fastapi import Request
 
-import appchi.clock_health as clock_health
-import appchi.http as protocol
-from appchi.request_budget import deadline
+import keep.clock_health as clock_health
+import keep.http as protocol
+from keep.request_budget import deadline
 
 
 def application(clock):
@@ -111,7 +111,7 @@ async def test_clock_offload_propagates_budget(monkeypatch):
         observed.append((deadline.get(), get_ident()))
         assert cache is app.state.clock_evidence
 
-    monkeypatch.setattr("appchi.clock_health.require_clock_health", clock_check)
+    monkeypatch.setattr("keep.clock_health.require_clock_health", clock_check)
     app = application(None)
 
     @app.post("/api/tenants/test/probe")
@@ -155,7 +155,7 @@ async def test_queued_check_uses_current_evidence_time_without_changing_received
         return await asyncio.to_thread(function, *args, **kwargs)
 
     monkeypatch.setattr(protocol, "datetime", AdmissionClock)
-    monkeypatch.setattr("appchi.clock_health.datetime", CheckClock)
+    monkeypatch.setattr("keep.clock_health.datetime", CheckClock)
     monkeypatch.setattr(
         protocol,
         "asyncio",

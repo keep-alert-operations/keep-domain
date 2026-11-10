@@ -7,9 +7,9 @@ import random
 from types import SimpleNamespace
 from uuid import uuid4
 
-from appchi.maintenance.incremental import advance, checkpoint
-from appchi.maintenance.temporal import AlertTransition, Boundary, Segment, reduce_alert
-from appchi.serialization import wire
+from keep.maintenance.incremental import advance, checkpoint
+from keep.maintenance.temporal import AlertTransition, Boundary, Segment, reduce_alert
+from keep.serialization import wire
 
 
 BASE = datetime(2026, 10, 6, tzinfo=UTC)
@@ -166,8 +166,8 @@ def test_exact_replay_work_budget_is_per_input_not_lifetime():
 
 
 def test_evidence_persistence_does_not_rewrite_unchanged_memberships():
-    from appchi.correlation.evidence import Context, GroupKey, Membership
-    from appchi.correlation.runtime import EvidenceSnapshot, _persist
+    from keep.correlation.evidence import Context, GroupKey, Membership
+    from keep.correlation.runtime import EvidenceSnapshot, _persist
 
     tenant, rule, context_id, condition, alert, qualifier = [uuid4() for _ in range(6)]
     context = Context(tenant, rule, 1, GroupKey(b"[]"))
@@ -209,7 +209,7 @@ def test_evidence_persistence_does_not_rewrite_unchanged_memberships():
 
 
 def test_prepared_source_relabels_only_new_cause_and_qualifier_provenance():
-    from appchi.maintenance.preparation import PreparedReplay, bind_source
+    from keep.maintenance.preparation import PreparedReplay, bind_source
     from uuid import UUID, uuid5
 
     alert = uuid4()

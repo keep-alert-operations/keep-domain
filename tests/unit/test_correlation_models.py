@@ -2,11 +2,11 @@ from uuid import uuid4
 
 import pytest
 
-from appchi.cel.compiler import COST_MODEL
-from appchi.correlation import repository
-from appchi.correlation.models import Definition, display_name, name_key
-from appchi.shared.capacity import UNLIMITED
-from appchi.shared.errors import AppError
+from keep.cel.compiler import COST_MODEL
+from keep.correlation import repository
+from keep.correlation.models import Definition, display_name, name_key
+from keep.shared.capacity import UNLIMITED
+from keep.shared.errors import AppError
 
 
 def definition():

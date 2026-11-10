@@ -11,14 +11,14 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from appchi import db as database_module
-from appchi.alerts import processor, repository
-from appchi.alerts.lifecycle import apply_source
-from appchi.events import changed
-from appchi.incidents.state import lock_linked_incidents
-from appchi.request_budget import request_budget
-from appchi.shared.errors import AppError
-from appchi.shared.transactions import advance_clock, coordinator
+from keep import db as database_module
+from keep.alerts import processor, repository
+from keep.alerts.lifecycle import apply_source
+from keep.events import changed
+from keep.incidents.state import lock_linked_incidents
+from keep.request_budget import request_budget
+from keep.shared.errors import AppError
+from keep.shared.transactions import advance_clock, coordinator
 
 BASE = datetime(2026, 10, 18, tzinfo=UTC)
 
@@ -190,7 +190,7 @@ def v1_item(tenant, **extra):
 @pytest.fixture
 def body(monkeypatch):
     """Run _apply_one with maintenance/publication collaborators stubbed."""
-    from appchi.maintenance import runtime
+    from keep.maintenance import runtime
 
     calls = {"lock_catalog": [], "publish": []}
 
@@ -245,14 +245,14 @@ def test_new_alert_is_inserted_once_after_transition_without_second_coordinator(
 
 def test_grafana_adapter_version_is_part_of_the_source_event_insert(body):
     tenant = uuid4()
-    item = v1_item(tenant, adapter_version="appchi-grafana-v1")
+    item = v1_item(tenant, adapter_version="keep-grafana-v1")
     conn = FakeConn([("FROM alert_key_claims", [])])
     processor._apply_one(
         conn, tenant, None, None, supplied_item=item, coordinated=(work_row(tenant), BASE)
     )
     ((text, params, _),) = conn.matching("INSERT INTO alert_source_events")
     assert "occurrence_id,adapter_version)" in text
-    assert params[-1] == "appchi-grafana-v1"
+    assert params[-1] == "keep-grafana-v1"
     assert not conn.matching("UPDATE alert_source_events")
 
 
@@ -348,7 +348,7 @@ def publish_conn(tenant, incident):
 
 @pytest.fixture
 def inline(monkeypatch):
-    from appchi.maintenance import runtime
+    from keep.maintenance import runtime
 
     seen = []
     monkeypatch.setattr(runtime, "publish_inline_effects", lambda conn, after: seen.append(conn))
@@ -409,7 +409,7 @@ def test_non_semantic_source_skips_history_rows(inline):
 
 
 def test_manual_publication_remembers_envelope_after_the_pipeline(inline, monkeypatch):
-    from appchi import alert_notifications
+    from keep import alert_notifications
 
     tenant, actor = uuid4(), uuid4()
     after = alert_row(tenant)

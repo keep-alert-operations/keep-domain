@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from appchi.kafka_changed import ChangedConsumer
+from keep.kafka_changed import ChangedConsumer
 from test_restore_guard_transaction import (
     CONTROL,
     SESSION_LOCK,

@@ -4,19 +4,19 @@ from uuid import uuid4
 
 import pytest
 
-from appchi.alerts.lifecycle import apply_source, delivery_provider
-from appchi.alerts.presentation import present_alert
-from appchi.cel import compile_expression
-from appchi.cel.catalog import CORRELATION_FIELDS, FIELDS, RULE_FIELDS, alert_provider
-from appchi.configuration.models import COLUMNS, GROUPABLE, SORTABLE
-from appchi.ingestion.native import identity
-from appchi.maintenance.processing import _snapshot
-from appchi.search.projection import Projection, build_document, index_mapping
-from appchi.serialization import wire
+from keep.alerts.lifecycle import apply_source, delivery_provider
+from keep.alerts.presentation import present_alert
+from keep.cel import compile_expression
+from keep.cel.catalog import CORRELATION_FIELDS, FIELDS, RULE_FIELDS, alert_provider
+from keep.configuration.models import COLUMNS, GROUPABLE, SORTABLE
+from keep.ingestion.native import identity
+from keep.maintenance.processing import _snapshot
+from keep.search.projection import Projection, build_document, index_mapping
+from keep.serialization import wire
 
 NOW = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
 OPERATOR = uuid4()
-GRAFANA = "appchi-grafana-v1"
+GRAFANA = "keep-grafana-v1"
 RULE = "https://grafana.example.org/alerting/grafana/cpu-rule/view?orgId=1"
 
 

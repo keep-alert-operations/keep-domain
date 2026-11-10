@@ -6,8 +6,8 @@ import httpx
 import pytest
 from fastapi import Request
 
-import appchi.http as protocol
-from appchi.ingestion.native import parse_json
+import keep.http as protocol
+from keep.ingestion.native import parse_json
 
 
 @pytest.fixture

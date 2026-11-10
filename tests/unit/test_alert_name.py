@@ -4,18 +4,18 @@ from uuid import uuid4
 
 import pytest
 
-from appchi.alerts.lifecycle import apply_source
-from appchi.alerts.presentation import present_alert
-from appchi.cel import compile_expression
-from appchi.cel.catalog import FIELDS, RULE_FIELDS, alert_name
-from appchi.configuration.models import COLUMNS, GROUPABLE, SORTABLE
-from appchi.correlation.evidence import GroupField, group_key
-from appchi.correlation.runtime import _fields
-from appchi.ingestion.native import canonical, identity
-from appchi.maintenance.processing import _snapshot
-from appchi.search import reader
-from appchi.search.projection import Projection, build_document, index_mapping
-from appchi.serialization import wire
+from keep.alerts.lifecycle import apply_source
+from keep.alerts.presentation import present_alert
+from keep.cel import compile_expression
+from keep.cel.catalog import FIELDS, RULE_FIELDS, alert_name
+from keep.configuration.models import COLUMNS, GROUPABLE, SORTABLE
+from keep.correlation.evidence import GroupField, group_key
+from keep.correlation.runtime import _fields
+from keep.ingestion.native import canonical, identity
+from keep.maintenance.processing import _snapshot
+from keep.search import reader
+from keep.search.projection import Projection, build_document, index_mapping
+from keep.serialization import wire
 
 NOW = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
 OPERATOR = uuid4()

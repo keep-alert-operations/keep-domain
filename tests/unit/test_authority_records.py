@@ -8,7 +8,7 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from appchi.recovery.authority_records import (
+from keep.recovery.authority_records import (
     AuthorityAttempt,
     AuthorityRecord,
     CoverageDescriptor,
@@ -37,10 +37,10 @@ WHEN = datetime(2026, 9, 23, 12, 0, 0, 123456, tzinfo=UTC)
 def attempt(**changes):
     return (
         dict(
-            version="appchi-authority-attempt-v1",
+            version="keep-authority-attempt-v1",
             attempt_id=ATTEMPT,
             producer_epoch=EPOCH,
-            producer_version="appchi-authority-producer-v1",
+            producer_version="keep-authority-producer-v1",
             tenant_id=TENANT,
             resource_id=TENANT,
             base_revision="1",
@@ -112,9 +112,9 @@ def permission(**changes):
 def coverage(**changes):
     return (
         dict(
-            version="appchi-authority-coverage-descriptor-v1",
+            version="keep-authority-coverage-descriptor-v1",
             producer_epoch=EPOCH,
-            producer_version="appchi-authority-producer-v1",
+            producer_version="keep-authority-producer-v1",
             tenant_id=TENANT,
             families=("credential", "operator", "permission"),
             marker={"kind": "baseline", "heads_count": "0", "heads_digest": "a" * 64},

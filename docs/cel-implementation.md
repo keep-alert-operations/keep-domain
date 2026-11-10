@@ -1,7 +1,7 @@
 # CEL implementation evidence
 
-The implementation in `backend/appchi/cel` uses `cel-expr-python==0.1.3`
-and `protobuf==6.33.5`. It implements `appchi-cel-v1` via native parsed protobuf
+The implementation in `backend/keep/cel` uses `cel-expr-python==0.1.3`
+and `protobuf==6.33.5`. It implements `keep-cel-v1` via native parsed protobuf
 AST inspection, a restricted typed IR, presence lowering, native checked CEL
 compilation and native evaluation. Elasticsearch predicates derive from the same
 typed IR. There is no Python expression evaluator or alternate CEL runtime.
@@ -58,7 +58,7 @@ identity and enforce its qualified memory allocation.
 
 ## Compilation caches and reuse
 
-Two least-recently-used caches, each bounded by `APPCHI_CEL_CACHE_ENTRIES`
+Two least-recently-used caches, each bounded by `KEEP_CEL_CACHE_ENTRIES`
 (default 4096, accepted 1–65536):
 
 - Checked data, per process: the compiler child's output for `(source, rule)`.
@@ -138,7 +138,7 @@ compilation process" of 2026-10-21.
 
 `rule_cost_upper_bound` exposes deterministic AST-plus-comparison work with
 catalog maximum string bytes and conservative substring work, versioned as
-`appchi-cel-cost-v1`. It does not establish a qualified budget. Automatic-query
+`keep-cel-cost-v1`. It does not establish a qualified budget. Automatic-query
 readiness must remain disabled until the separate measured expression and
 aggregate rule/group/evidence budgets are supplied and enforced by the caller.
 No live service throughput, fault-recovery or production readiness is claimed.

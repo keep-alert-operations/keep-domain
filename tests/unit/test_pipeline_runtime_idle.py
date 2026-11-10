@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from appchi import pipeline_runtime
-from appchi.pipeline_runtime import IDLE_WAIT_SECONDS, MAX_IDLE_WAIT_SECONDS, idle_wait
+from keep import pipeline_runtime
+from keep.pipeline_runtime import IDLE_WAIT_SECONDS, MAX_IDLE_WAIT_SECONDS, idle_wait
 
 
 class Background:

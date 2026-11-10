@@ -1,7 +1,7 @@
 from pydantic import ValidationError
 import pytest
 
-from appchi.configuration.models import (
+from keep.configuration.models import (
     DashboardDefinition,
     HtmlPanel,
     Panel,

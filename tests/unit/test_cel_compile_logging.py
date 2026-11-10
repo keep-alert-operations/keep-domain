@@ -4,9 +4,9 @@ import logging
 
 import pytest
 
-from appchi.cel import compiler
-from appchi.correlation import repository
-from appchi.shared.errors import AppError
+from keep.cel import compiler
+from keep.correlation import repository
+from keep.shared.errors import AppError
 
 
 @pytest.mark.parametrize("reason", ["deadline", "worker_crashed", "child_unavailable"])
@@ -21,7 +21,7 @@ def test_unavailable_logging_is_sanitized_and_preserves_public_error(monkeypatch
             # The child imports only the compiler, never the caller's entrypoint.
             assert command[1:] == [
                 "-c",
-                "from appchi.cel.compiler import _compile_child; _compile_child()",
+                "from keep.cel.compiler import _compile_child; _compile_child()",
             ]
             assert kwargs["stderr"] is compiler.subprocess.DEVNULL
 

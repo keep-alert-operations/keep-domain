@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from appchi.cel import CELValidationError, compile_expression
+from keep.cel import CELValidationError, compile_expression
 
 NOW = datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc)
 

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from appchi import clock_health, pipeline_runtime
+from keep import clock_health, pipeline_runtime
 
 
 class Health:
