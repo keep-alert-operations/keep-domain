@@ -1,8 +1,8 @@
 from pydantic import ValidationError
 import pytest
 
-from appchi.configuration.html import MAX_HTML, removals, sanitize
-from appchi.configuration.models import (
+from keep.configuration.html import MAX_HTML, removals, sanitize
+from keep.configuration.models import (
     DashboardDefinition,
     HtmlPanel,
     Panel,

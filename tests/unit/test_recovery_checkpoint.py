@@ -11,15 +11,15 @@ from uuid import UUID
 import httpx
 import pytest
 
-from appchi.recovery import evidence as module
-from appchi.recovery.evidence import (
+from keep.recovery import evidence as module
+from keep.recovery.evidence import (
     Evidence,
     EvidenceBinding,
     HttpEvidenceStore,
     PAGED_CHECKPOINT_VERSION,
     collect_checkpoint,
 )
-from appchi.shared.errors import AppError
+from keep.shared.errors import AppError
 
 
 def record(index):

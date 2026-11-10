@@ -1,7 +1,7 @@
 from pydantic import ValidationError
 import pytest
 
-from appchi.configuration.models import DashboardDefinition, PanelLink
+from keep.configuration.models import DashboardDefinition, PanelLink
 
 PRESET = "00000000-0000-4000-8000-000000000002"
 IMAGE = "00000000-0000-4000-8000-000000000003"

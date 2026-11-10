@@ -4,8 +4,8 @@ from contextlib import contextmanager
 
 import pytest
 
-from appchi.recovery.guard import runtime_guard
-from appchi.shared.errors import AppError
+from keep.recovery.guard import runtime_guard
+from keep.shared.errors import AppError
 
 
 class Connection:

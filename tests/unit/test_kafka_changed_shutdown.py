@@ -1,6 +1,6 @@
 """librdkafka may invoke assignment callbacks while closing a consumer."""
 
-from appchi.kafka_changed import ChangedConsumer
+from keep.kafka_changed import ChangedConsumer
 
 
 def test_close_does_not_restart_assignment_or_retention_checks():

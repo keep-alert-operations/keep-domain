@@ -88,7 +88,7 @@ or `qualified` flag is required, rules are created `healthy`, and the API no
 longer returns `processing_ready`. The `correlation` keys `enabled_rules_per_tenant`,
 `live_groups_per_rule`, `live_evidence_per_rule`, `live_evidence_per_tenant`,
 `condition_cost`, `rule_cost`, `tenant_cost` and `digest_bucket` are optional and
-read through `appchi.shared.capacity`: a missing or null key is unlimited, and a
+read through `keep.shared.capacity`: a missing or null key is unlimited, and a
 value other than an integer from 1 to `UNLIMITED` (2^53-1) fails with
 `capacity_profile_invalid`. An optional `cost_model` must equal the CEL cost model
 (`correlation_cost_model_mismatch`). Maintenance work/input/segment bounds follow

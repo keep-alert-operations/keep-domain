@@ -4,9 +4,9 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from appchi.shared.crypto import EnvelopeCipher
-from appchi.shared.cursors import Cursor
-from appchi.shared.errors import AppError
+from keep.shared.crypto import EnvelopeCipher
+from keep.shared.cursors import Cursor
+from keep.shared.errors import AppError
 
 
 def test_rewrap_preserves_payload_and_secret_with_old_version_overlap():

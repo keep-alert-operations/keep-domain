@@ -1,9 +1,9 @@
 from datetime import UTC, datetime
 from uuid import uuid4
 import pytest
-from appchi.ingestion.native import canonical, identity, parse_json, validate_native
-from appchi.alerts.lifecycle import apply_source, apply_command
-from appchi.shared.errors import AppError
+from keep.ingestion.native import canonical, identity, parse_json, validate_native
+from keep.alerts.lifecycle import apply_source, apply_command
+from keep.shared.errors import AppError
 
 
 @pytest.mark.parametrize(

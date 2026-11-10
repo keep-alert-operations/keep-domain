@@ -1,7 +1,7 @@
 from pydantic import ValidationError
 import pytest
 
-from appchi.configuration.models import PresetCreate, PresetDefinition
+from keep.configuration.models import PresetCreate, PresetDefinition
 
 BASE = {
     "name": "Night on-call",

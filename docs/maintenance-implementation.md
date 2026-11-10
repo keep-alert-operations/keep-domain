@@ -3,7 +3,7 @@
 The implementation includes PostgreSQL-backed maintenance CRUD, schedule
 conversion, immutable revision/control/segment proof, protected deletion, a
 complete-history suppression adapter and fenced fan-out primitives. The normative
-contract remains [maintenance operations](https://github.com/appchi-alert-operations/appchi-design/blob/main/specs/spec-maintenance-operations.md).
+contract remains [maintenance operations](https://github.com/keep-alert-operations/keep-design/blob/main/specs/spec-maintenance-operations.md).
 **REV-39 (2026-10-24):** maintenance is always on; there is no `maintenance`
 capability gate or activation command, and restore does not turn it off. Unset
 budgets are unlimited. Notes below that mention the gate or a qualified activation
@@ -12,7 +12,7 @@ qualified.
 
 ## Configuration and API
 
-Mount `appchi.maintenance.routes.router`. Routes use ordinary authenticated
+Mount `keep.maintenance.routes.router`. Routes use ordinary authenticated
 sessions, current tenant authorization, Origin/CSRF checks for POST/PATCH/DELETE,
 strict models, expected revisions, command receipts and the tenant coordinator.
 There is no maintenance-specific login or authorization bypass.
@@ -123,7 +123,7 @@ latency/fairness. No network calls belong in callbacks.
 incident locks, pending-source guard, common alert store and projection/live
 publisher. `prepare_for_tenant` reads the optional `maintenance_max_work`,
 `maintenance_max_inputs` and `maintenance_max_segments` budgets through
-`appchi.shared.capacity`: a missing or null budget is unlimited, and a value other
+`keep.shared.capacity`: a missing or null budget is unlimited, and a value other
 than an integer from 1 to `UNLIMITED` fails with `capacity_profile_invalid`. Every
 write prepares the catalog; a caller that supplies none fails with
 `maintenance_catalog_required`. `apply_transition` recomputes semantic revisions after
@@ -167,9 +167,9 @@ Run against an isolated PostgreSQL cluster with a test identity permitted to
 create/drop dedicated test databases:
 
 ```powershell
-$env:APPCHI_MAINTENANCE_TEST_ADMIN_URL = '<isolated PostgreSQL test admin DSN>'
+$env:KEEP_MAINTENANCE_TEST_ADMIN_URL = '<isolated PostgreSQL test admin DSN>'
 backend/.venv/Scripts/python.exe -m pytest backend/tests/unit/test_maintenance_timezones.py backend/tests/unit/test_maintenance_temporal.py backend/tests/unit/test_maintenance_repository.py backend/tests/unit/test_maintenance_processing.py backend/tests/unit/test_maintenance_warmup.py -q
-backend/.venv/Scripts/ruff.exe check backend/appchi/maintenance backend/tests/unit/test_maintenance*.py
+backend/.venv/Scripts/ruff.exe check backend/keep/maintenance backend/tests/unit/test_maintenance*.py
 ```
 
 Remaining before enablement: manual incident relationship hooks; hosted scheduler
@@ -203,7 +203,7 @@ inventing new source events or resetting inactivity.
 `warmup_status(database, tenant)` reports one SQL snapshot of retained, missing
 baseline, complete and pending counts. With no gate (REV-39), alerts journaled
 before the upgrade are warmed once per tenant with
-`python -m appchi.worker maintenance-warmup --tenant <tenant UUID>` and inspected
+`python -m keep.worker maintenance-warmup --tenant <tenant UUID>` and inspected
 with `maintenance-proof`; see the delivery local runtime guide.
 
 Maintenance deletion verifies all external intent/final/cancel acknowledgments

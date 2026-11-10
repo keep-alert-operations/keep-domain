@@ -1,8 +1,8 @@
-# appchi-domain
+# keep-domain
 
 Shared transactional business rules, CEL semantics, authorization primitives and recovery fences.
 
-See [system design](https://github.com/appchi-alert-operations/appchi-design), [workspace setup](https://github.com/appchi-alert-operations/appchi-delivery) and [source provenance](SOURCE.md).
+See [system design](https://github.com/keep-alert-operations/keep-design), [workspace setup](https://github.com/keep-alert-operations/keep-delivery) and [source provenance](SOURCE.md).
 
 ## Development
 
@@ -17,7 +17,7 @@ poetry run pytest
 poetry build --format wheel
 ```
 
-Shared `appchi` modules use namespace packaging; each module has exactly one owning
+Shared `keep` modules use namespace packaging; each module has exactly one owning
 distribution. Dependencies resolve immutable Git revisions in Python dependency metadata and `poetry.lock`.
 For coordinated local edits use the delivery workspace setup, which installs local
 packages without changing release dependency pins.

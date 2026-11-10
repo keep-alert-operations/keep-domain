@@ -7,8 +7,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from appchi import kafka_changed
-from appchi.kafka_changed import MAX_BATCH, ChangedConsumer, PartitionRetries
+from keep import kafka_changed
+from keep.kafka_changed import MAX_BATCH, ChangedConsumer, PartitionRetries
 
 
 def message(partition, offset):
@@ -226,7 +226,7 @@ def test_batch_size_is_capped_at_the_writer_document_limit(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "confluent_kafka", SimpleNamespace(Consumer=Consumer))
     monkeypatch.setitem(
-        sys.modules, "appchi.service_clients", SimpleNamespace(kafka_options=lambda _: {})
+        sys.modules, "keep.service_clients", SimpleNamespace(kafka_options=lambda _: {})
     )
 
     class Db:

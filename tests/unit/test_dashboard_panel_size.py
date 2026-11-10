@@ -1,7 +1,7 @@
 from pydantic import ValidationError
 import pytest
 
-from appchi.configuration.models import Panel
+from keep.configuration.models import Panel
 
 BASE = {
     "id": "00000000-0000-4000-8000-000000000001",

@@ -7,7 +7,7 @@ import httpx
 import pytest
 from authlib.jose import JsonWebKey, JsonWebToken
 
-from appchi.identity.oidc import (
+from keep.identity.oidc import (
     LOGOUT_EVENT,
     OIDCClient,
     OIDCConfig,
@@ -18,7 +18,7 @@ from appchi.identity.oidc import (
 )
 
 NOW = 1800000000
-ISSUER = "https://identity.example/realms/appchi"
+ISSUER = "https://identity.example/realms/keep"
 
 
 @pytest.fixture
@@ -30,7 +30,7 @@ def claims(**overrides):
     result = {
         "iss": ISSUER,
         "sub": "subject",
-        "aud": "appchi-web",
+        "aud": "keep-web",
         "sid": "provider-session",
         "iat": NOW,
         "exp": NOW + 300,
@@ -52,7 +52,7 @@ def make_client(key, token_response=None, required_amr=("pwd",)):
     seen = []
     config = OIDCConfig(
         ISSUER,
-        "appchi-web",
+        "keep-web",
         "secret",
         "https://app.example/auth/callback",
         "https://app.example/signed-out",
@@ -106,7 +106,7 @@ def test_signed_identity_binding_and_rs256(signing_key):
     [
         {"iss": "https://attacker.example"},
         {"aud": "other"},
-        {"aud": ["appchi-web", "other"]},
+        {"aud": ["keep-web", "other"]},
         {"azp": "other"},
         {"nonce": "replay"},
         {"exp": NOW - 31},
@@ -174,7 +174,7 @@ def test_logout_requires_purpose_sid_replay_identifier_and_time(signing_key):
     client, _ = make_client(signing_key)
     logout = {
         "iss": ISSUER,
-        "aud": "appchi-web",
+        "aud": "keep-web",
         "iat": NOW,
         "sid": "provider-session",
         "jti": "event-1",

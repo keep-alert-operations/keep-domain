@@ -3,9 +3,9 @@ from datetime import UTC, datetime
 from pydantic import ValidationError
 import pytest
 
-from appchi.configuration.models import GROUPABLE, PresetDefinition
-from appchi.search import reader
-from appchi.shared.errors import AppError
+from keep.configuration.models import GROUPABLE, PresetDefinition
+from keep.search import reader
+from keep.shared.errors import AppError
 
 BASE = {
     "name": "Payments",

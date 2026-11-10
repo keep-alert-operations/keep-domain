@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from appchi.maintenance.timezones import (
+from keep.maintenance.timezones import (
     ScheduleError,
     local_to_utc,
     render_endpoint,

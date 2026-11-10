@@ -4,7 +4,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from appchi.config import Settings
+from keep.config import Settings
 
 
 def configuration(**values):
@@ -12,8 +12,8 @@ def configuration(**values):
 
 
 def test_keyring_settings_accept_overlap_and_reload_atomic_file_rotation(tmp_path, monkeypatch):
-    monkeypatch.delenv("APPCHI_WRAPPING_KEY", raising=False)
-    monkeypatch.delenv("APPCHI_WRAPPING_KEYRING", raising=False)
+    monkeypatch.delenv("KEEP_WRAPPING_KEY", raising=False)
+    monkeypatch.delenv("KEEP_WRAPPING_KEYRING", raising=False)
     old = base64.b64encode(b"o" * 32).decode()
     new = base64.b64encode(b"n" * 32).decode()
     path = tmp_path / "keyring.json"

@@ -9,8 +9,8 @@ from threading import Thread
 
 import pytest
 
-import appchi.cel.compiler as compiler
-from appchi.correlation import runtime as correlation
+import keep.cel.compiler as compiler
+from keep.correlation import runtime as correlation
 from test_preparation_transactions import (
     CONDITION_CEL,
     NOW,
@@ -75,7 +75,7 @@ def test_checked_evictions_warn_once_per_interval_without_source(counted, caplog
     assert cache.evictions.count == 2
     records = [record for record in caplog.records if record.name == compiler.__name__]
     assert [record.getMessage() for record in records] == [
-        "cel_cache_evicting cache=checked capacity=1 evictions=1 setting=APPCHI_CEL_CACHE_ENTRIES"
+        "cel_cache_evicting cache=checked capacity=1 evictions=1 setting=KEEP_CEL_CACHE_ENTRIES"
     ]
     assert "synthetic-private" not in caplog.text
 

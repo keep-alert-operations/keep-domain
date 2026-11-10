@@ -1,0 +1,933 @@
+"""Native CEL AST -> restricted typed IR -> guarded CEL and parameterized ES.
+
+Parsing and checked compilation run in a disposable process with a one-second
+wall-clock deadline. No parsed-only expression is ever evaluated. The process
+imports only this module, never the caller's entrypoint, so a worker whose own
+imports are slow cannot exhaust the deadline before compilation starts.
+"""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+from concurrent.futures import Future
+from threading import Condition, Lock, local
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+import json
+import logging
+import os
+import pickle
+import re
+import subprocess
+import sys
+from time import monotonic
+from typing import Any
+from uuid import UUID
+
+from .catalog import FIELDS, RULE_FIELDS, alert_name, alert_provider, storage_name
+from keep.alerts.dismissal import effective_suppressed
+from keep.alerts.presentation import display_status
+from keep.request_budget import remaining
+
+PROFILE = "keep-cel-v1"
+COST_MODEL = "keep-cel-cost-v1"
+MAX_SOURCE_BYTES = 16384
+MAX_AST_NODES = 256
+MAX_DEPTH = 32
+MAX_LIST_MEMBERS = 100
+COMPILE_TIMEOUT_SECONDS = 1.0
+BOOLEAN_OPERATORS = {"_&&_": "and", "_||_": "or", "!_": "not"}
+COMPARISON_OPERATORS = {
+    "_==_": "eq",
+    "_!=_": "ne",
+    "_<_": "lt",
+    "_<=_": "le",
+    "_>_": "gt",
+    "_>=_": "ge",
+}
+TIME_OPERATORS = {"_+_": "+", "_-_": "-"}
+MEMBERSHIP_OPERATOR = "@in"
+STRING_METHODS = ("startsWith", "endsWith", "contains")
+TIME_LITERAL_FUNCTIONS = ("timestamp", "duration")
+NOW_FUNCTION = "now"
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+MAX_PENDING_COMPILES = 256
+log = logging.getLogger(__name__)
+
+
+def _cache_entries() -> int:
+    try:
+        entries = int(os.environ.get("KEEP_CEL_CACHE_ENTRIES", "4096"))
+    except ValueError:
+        entries = 0
+    if not 1 <= entries <= 65536:
+        raise ValueError("KEEP_CEL_CACHE_ENTRIES must be an integer from 1 to 65536")
+    return entries
+
+
+# Distinct expressions retained: checked data per process and reusable programs
+# per thread. Size it above a worker's working set (maintenance segments plus
+# enabled correlation conditions of its tenants); a checked-data miss starts a
+# compiler process, and a cyclic working set larger than an LRU always misses.
+# Preparation recompiles every enabled expression of a tenant on each turn, so an
+# undersized cache misses on every turn. docs/cel-implementation.md gives the
+# sizing formula and measured per-entry memory; evictions log a warning.
+CACHE_ENTRIES = _cache_entries()
+EVICTION_LOG_INTERVAL_SECONDS = 60.0
+
+
+class _Evictions:
+    """Count LRU evictions of one cache kind and warn at most once a minute.
+
+    An eviction means the working set exceeded KEEP_CEL_CACHE_ENTRIES. The
+    warning has fixed text and counts only; it never includes expression source.
+    """
+
+    def __init__(self, kind: str):
+        self.kind = kind
+        self.count = 0
+        self.next_log = 0.0
+        self.lock = Lock()
+
+    def record(self, capacity: int) -> None:
+        with self.lock:
+            self.count += 1
+            count = self.count
+            now = monotonic()
+            if now < self.next_log:
+                return
+            self.next_log = now + EVICTION_LOG_INTERVAL_SECONDS
+        log.warning(
+            "cel_cache_evicting cache=%s capacity=%d evictions=%d setting=KEEP_CEL_CACHE_ENTRIES",
+            self.kind,
+            capacity,
+            count,
+        )
+
+
+class CELValidationError(ValueError):
+    def __init__(self, message: str, position: int | None = None):
+        super().__init__(message)
+        self.position = position
+
+
+class CELUnavailableError(RuntimeError):
+    """Runtime/compiler unavailable; never interpret this as a nonmatch."""
+
+
+@dataclass(frozen=True)
+class IR:
+    op: str
+    kind: str
+    value: Any = None
+    args: tuple[IR, ...] = ()
+    position: int | None = None
+
+
+def epoch_us(value: datetime) -> int:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise CELValidationError("Query timestamps must be timezone-aware datetimes")
+    try:
+        delta = value.astimezone(timezone.utc) - EPOCH
+    except (OverflowError, ValueError) as exc:
+        raise CELValidationError("Timestamp outside years 0001–9999") from exc
+    return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def timestamp(text: str) -> int:
+    if not re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})",
+        text,
+    ):
+        raise CELValidationError(
+            "Timestamp requires RFC3339 with explicit offset and microsecond precision"
+        )
+    if text[-1] != "Z" and (int(text[-5:-3]) > 23 or int(text[-2:]) > 59):
+        raise CELValidationError("Invalid timestamp offset")
+    try:
+        return epoch_us(datetime.fromisoformat(text.replace("Z", "+00:00")))
+    except (ValueError, OverflowError) as exc:
+        raise CELValidationError("Invalid timestamp") from exc
+
+
+MIN_TIME = epoch_us(datetime.min.replace(tzinfo=timezone.utc))
+MAX_TIME = epoch_us(datetime.max.replace(tzinfo=timezone.utc))
+
+
+def duration(text: str) -> int:
+    match = re.fullmatch(r"(?:([0-9]+)h)?(?:([0-9]+)m)?(?:([0-9]+)(?:\.([0-9]{1,6}))?s)?", text)
+    if not match or not text:
+        raise CELValidationError("Duration must be nonnegative literal hours/minutes/seconds")
+    hours, minutes, seconds, fraction = match.groups()
+    total = (int(hours or 0) * 3600 + int(minutes or 0) * 60 + int(seconds or 0)) * 1_000_000
+    total += int((fraction or "").ljust(6, "0"))
+    if total > 3652500 * 86400 * 1_000_000:
+        raise CELValidationError("Duration exceeds 3,652,500 days")
+    return total
+
+
+class Builder:
+    def __init__(self, positions: dict, rule: bool):
+        self.positions, self.rule, self.nodes = positions, rule, 0
+
+    def build(self, expr, depth: int = 1) -> IR:
+        self.nodes += 1
+        pos = self.positions.get(expr.id)
+        if self.nodes > MAX_AST_NODES or depth > MAX_DEPTH:
+            raise CELValidationError("Expression exceeds 256 nodes or depth 32", pos)
+
+        def sub(child):
+            return self.build(child, depth + 1)
+
+        kind = expr.WhichOneof("expr_kind")
+        if kind == "const_expr":
+            const = expr.const_expr
+            selected = const.WhichOneof("constant_kind")
+            types = {
+                "string_value": "string",
+                "int64_value": "int",
+                "bool_value": "bool",
+                "null_value": "null",
+            }
+            if selected not in types:
+                raise CELValidationError(
+                    "Only signed integers, strings, booleans and null are literals", pos
+                )
+            value = None if selected == "null_value" else getattr(const, selected)
+            return IR("literal", types[selected], value, position=pos)
+        if kind == "ident_expr":
+            name = expr.ident_expr.name
+            if name not in FIELDS or (self.rule and name not in RULE_FIELDS):
+                raise CELValidationError("Only approved alert fields may be referenced", pos)
+            return IR("field", FIELDS[name].kind, name, position=pos)
+        if kind == "select_expr":
+            sel = expr.select_expr
+            self.nodes += 1  # the namespace or bare-field identifier is an AST node too
+            if self.nodes > MAX_AST_NODES or depth + 1 > MAX_DEPTH:
+                raise CELValidationError("Expression exceeds 256 nodes or depth 32", pos)
+            if sel.operand.WhichOneof("expr_kind") != "ident_expr":
+                raise CELValidationError("Only direct approved field references are allowed", pos)
+            operand = sel.operand.ident_expr.name
+            # `alert.field` remains accepted for saved expressions. Bare fields
+            # are the current syntax; CEL's has() macro represents has(field)
+            # as a test-only select over an identifier with an empty field.
+            if operand == "alert":
+                name = sel.field
+            elif sel.test_only and not sel.field and operand in FIELDS:
+                name = operand
+            else:
+                raise CELValidationError("Only direct approved field references are allowed", pos)
+            if name not in FIELDS or (self.rule and name not in RULE_FIELDS):
+                raise CELValidationError(f"Unsupported field: {name}", pos)
+            if sel.test_only and FIELDS[name].kind == "ids":
+                raise CELValidationError("has() requires a scalar field", pos)
+            return IR(
+                "has" if sel.test_only else "field",
+                "bool" if sel.test_only else FIELDS[name].kind,
+                name,
+                position=pos,
+            )
+        if kind == "list_expr":
+            if len(expr.list_expr.elements) > MAX_LIST_MEMBERS or expr.list_expr.optional_indices:
+                raise CELValidationError(
+                    "Lists permit at most 100 nonoptional literal members", pos
+                )
+            args = tuple(sub(x) for x in expr.list_expr.elements)
+            if (
+                any(x.op != "literal" for x in args)
+                or len({x.kind for x in args if x.kind != "null"}) > 1
+            ):
+                raise CELValidationError(
+                    "Membership lists must contain homogeneous scalar literals", pos
+                )
+            return IR("list", "list", args=args, position=pos)
+        if kind != "call_expr":
+            raise CELValidationError("Unsupported CEL construct", pos)
+        call = expr.call_expr
+        args = tuple(sub(x) for x in call.args)
+        target = sub(call.target) if call.HasField("target") else None
+        fn = call.function
+        if fn == "has" and target is None and len(args) == 1 and args[0].op == "field":
+            if args[0].kind == "ids":
+                raise CELValidationError("has() requires a scalar field", pos)
+            return IR("has", "bool", args[0].value, args=(args[0],), position=pos)
+        if target:
+            if (
+                fn not in STRING_METHODS
+                or target.op != "field"
+                or target.kind != "string"
+                or len(args) != 1
+                or args[0].op != "literal"
+                or args[0].kind != "string"
+            ):
+                raise CELValidationError("Unsupported string method or argument", pos)
+            return IR(fn, "bool", args=(target, *args), position=pos)
+        if fn in BOOLEAN_OPERATORS:
+            if len(args) != (1 if fn == "!_" else 2) or any(x.kind != "bool" for x in args):
+                raise CELValidationError("Boolean operators require booleans", pos)
+            return IR(BOOLEAN_OPERATORS[fn], "bool", args=args, position=pos)
+        if (
+            fn in TIME_LITERAL_FUNCTIONS
+            and len(args) == 1
+            and args[0].op == "literal"
+            and args[0].kind == "string"
+        ):
+            return IR(
+                "literal",
+                "time" if fn == "timestamp" else "duration",
+                (timestamp if fn == "timestamp" else duration)(args[0].value),
+                position=pos,
+            )
+        if fn == NOW_FUNCTION and not args and not self.rule:
+            return IR("now", "time", 0, position=pos)
+        if (
+            fn in TIME_OPERATORS
+            and len(args) == 2
+            and args[0].kind == "time"
+            and args[0].op in {"literal", "now"}
+            and args[1].kind == "duration"
+            and args[1].op == "literal"
+        ):
+            if (
+                call.args[0].WhichOneof("expr_kind") == "call_expr"
+                and call.args[0].call_expr.function in TIME_OPERATORS
+            ):
+                raise CELValidationError("Nested time arithmetic is not supported", pos)
+            offset = args[1].value * (1 if fn == "_+_" else -1)
+            result = IR(
+                "bound" if args[0].op == "now" else "literal",
+                "time",
+                args[0].value + offset,
+                position=pos,
+            )
+            if result.op == "literal" and not MIN_TIME <= result.value <= MAX_TIME:
+                raise CELValidationError("Time arithmetic outside supported years", pos)
+            return result
+        if fn == MEMBERSHIP_OPERATOR and len(args) == 2:
+            left, right = args
+            if (
+                right.op == "field"
+                and right.kind == "ids"
+                and left.op == "literal"
+                and left.kind == "string"
+            ):
+                try:
+                    UUID(left.value)
+                except ValueError as exc:
+                    raise CELValidationError(
+                        "Incident membership requires a UUID literal", pos
+                    ) from exc
+                return IR("member", "bool", args=args, position=pos)
+            if left.op != "field" or left.kind == "ids" or right.op != "list":
+                raise CELValidationError("Membership requires a scalar field and literal list", pos)
+            for item in right.args:
+                self.compatible(left, item)
+            return IR("in", "bool", args=args, position=pos)
+        comparisons = COMPARISON_OPERATORS
+        if fn in comparisons and len(args) == 2:
+            left, right = args
+            op = comparisons[fn]
+            if left.op == right.op == "literal":
+                if left.kind != right.kind and "null" not in {left.kind, right.kind}:
+                    raise CELValidationError("Constant comparison types differ", pos)
+                if op in {"eq", "ne"}:
+                    equal = left.kind == right.kind and left.value == right.value
+                    return IR("literal", "bool", equal if op == "eq" else not equal, position=pos)
+                if left.kind == right.kind and left.kind in {"int", "time"}:
+                    result = {
+                        "lt": left.value < right.value,
+                        "le": left.value <= right.value,
+                        "gt": left.value > right.value,
+                        "ge": left.value >= right.value,
+                    }[op]
+                    return IR("literal", "bool", result, position=pos)
+                raise CELValidationError("Unsupported ordered constant comparison", pos)
+            if left.op != "field" and right.op == "field":
+                left, right = right, left
+                op = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le"}.get(op, op)
+            if left.op != "field" or right.op not in {"literal", "now", "bound"}:
+                raise CELValidationError(
+                    "Comparisons require a scalar field and compatible literal", pos
+                )
+            self.compatible(left, right)
+            if op not in {"eq", "ne"} and (
+                left.kind not in {"int", "time"} or right.kind == "null"
+            ):
+                raise CELValidationError("Ordered comparisons require integers or timestamps", pos)
+            return IR(op, "bool", args=(left, right), position=pos)
+        raise CELValidationError(f"Unsupported function or operator: {fn}", pos)
+
+    @staticmethod
+    def compatible(left: IR, right: IR):
+        spec = FIELDS[left.value]
+        if right.kind == "null":
+            if not spec.nullable:
+                raise CELValidationError(
+                    "Null comparison requires a nullable field", right.position
+                )
+            return
+        if left.kind == "enum":
+            if right.kind != "string" or right.value not in spec.values:
+                raise CELValidationError("Invalid enum literal", right.position)
+        elif left.kind != right.kind or left.kind == "ids":
+            raise CELValidationError("Literal does not match field type", right.position)
+
+
+def walk(ir: IR):
+    yield ir
+    for child in ir.args:
+        yield from walk(child)
+
+
+def literal(value: Any) -> str:
+    # CEL Unicode escapes represent scalar values, so do not emit JSON's
+    # surrogate-pair escapes for supplementary characters.
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def lower(ir: IR, bounds: list[int]) -> str:
+    op = ir.op
+    if op == "field":
+        return "v_" + ir.value
+    if op == "has":
+        return "p_" + ir.value
+    if op == "literal":
+        return literal(ir.value)
+    if op in {"now", "bound"}:
+        bounds.append(ir.value)
+        return f"clock_{len(bounds) - 1}"
+    if op in {"and", "or"}:
+        return f"({lower(ir.args[0], bounds)} {'&&' if op == 'and' else '||'} {lower(ir.args[1], bounds)})"
+    if op == "not":
+        return f"!({lower(ir.args[0], bounds)})"
+    if op == "member":
+        return f"({lower(ir.args[0], bounds)} in {lower(ir.args[1], bounds)})"
+    left, right = ir.args
+    present = "p_" + left.value
+    if op == "in":
+        parts = [lower(IR("eq", "bool", args=(left, item)), bounds) for item in right.args]
+        return "(" + " || ".join(parts) + ")" if parts else "false"
+    if right.kind == "null":
+        return ("!" if op == "eq" else "") + present
+    a, b = lower(left, bounds), lower(right, bounds)
+    if op in {"startsWith", "endsWith", "contains"}:
+        return f"({present} && {a}.{op}({b}))"
+    comparison = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}[op]
+    if op == "ne":
+        return f"(!{present} || {a} != {b})"
+    return f"({present} && {a} {comparison} {b})"
+
+
+def environment(fields: tuple[str, ...], bound_count: int):
+    from cel_expr_python import cel
+
+    types = {
+        "string": cel.Type.STRING,
+        "enum": cel.Type.STRING,
+        "bool": cel.Type.BOOL,
+        "int": cel.Type.INT,
+        "time": cel.Type.INT,
+        "ids": cel.Type.List(cel.Type.STRING),
+    }
+    variables = {"v_" + name: types[FIELDS[name].kind] for name in fields}
+    variables.update({"p_" + name: cel.Type.BOOL for name in fields})
+    variables.update({f"clock_{i}": cel.Type.INT for i in range(bound_count)})
+    return cel.NewEnv(variables=variables)
+
+
+def _compile_worker(connection, source: str, rule: bool):
+    try:
+        from cel_expr_python import cel
+        from google.protobuf.any_pb2 import Any as ProtoAny
+        from .syntax_pb2 import ParsedExpr
+
+        # This parse-only object is inspected and discarded; eval is never called.
+        parsed = ProtoAny.FromString(cel.NewEnv().compile(source, disable_check=True).serialize())
+        if parsed.type_url != "type.googleapis.com/cel.expr.ParsedExpr":
+            raise CELUnavailableError("Unexpected native parsed expression envelope")
+        ast = ParsedExpr.FromString(parsed.value)
+        builder = Builder(dict(ast.source_info.positions), rule)
+        ir = builder.build(ast.expr)
+        if ir.kind != "bool":
+            raise CELValidationError("Expression must return bool", ir.position)
+        fields = tuple(sorted({x.value for x in walk(ir) if x.op in {"field", "has"}}))
+        bounds: list[int] = []
+        lowered = lower(ir, bounds)
+        program = environment(fields, len(bounds)).compile(lowered)
+        if program.return_type() != cel.Type.BOOL:
+            raise CELUnavailableError("Checked program result is not bool")
+        checked = program.serialize()
+        if ProtoAny.FromString(checked).type_url != "type.googleapis.com/cel.expr.CheckedExpr":
+            raise CELUnavailableError("Native compiler did not return a checked expression")
+        connection.send(("ok", ir, fields, tuple(bounds), checked, builder.nodes, lowered))
+    except CELValidationError as exc:
+        connection.send(("invalid", str(exc), exc.position))
+    except (ImportError, CELUnavailableError) as exc:
+        connection.send(("unavailable", str(exc)))
+    except Exception as exc:
+        connection.send(("invalid", str(exc), None))
+    finally:
+        connection.close()
+
+
+class _StreamConnection:
+    """The compile child's single-reply channel to its parent over stdout."""
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def send(self, message):
+        pickle.dump(message, self.stream)
+
+    def close(self):
+        self.stream.flush()
+
+
+def _compile_child():
+    """Disposable compile process: one pickled request on stdin, one reply on stdout."""
+    source, rule = pickle.load(sys.stdin.buffer)
+    _compile_worker(_StreamConnection(sys.stdout.buffer), source, rule)
+
+
+def _child_command():
+    """Interpreter and environment for a compile child that shares this sys.path."""
+    executable, env = sys.executable, dict(os.environ)
+    base = getattr(sys, "_base_executable", executable)
+    if os.name == "nt" and base and os.path.normcase(base) != os.path.normcase(executable):
+        # As multiprocessing does (bpo-35797): skip the venv redirector process.
+        executable, env["__PYVENV_LAUNCHER__"] = base, sys.executable
+    env["PYTHONPATH"] = os.pathsep.join(path for path in sys.path if path)
+    code = "from keep.cel.compiler import _compile_child; _compile_child()"
+    return [executable, "-c", code], env
+
+
+def time_bound(ir: IR, evaluated_at: datetime) -> Any:
+    value = ir.value + epoch_us(evaluated_at) if ir.op in {"now", "bound"} else ir.value
+    if ir.kind == "time" and not MIN_TIME <= value <= MAX_TIME:
+        raise CELValidationError("Resulting time bound outside supported years", ir.position)
+    return value
+
+
+def negate(query: dict) -> dict:
+    return {"bool": {"must_not": [query]}}
+
+
+def suppressed_query(evaluated_at: datetime) -> dict:
+    """Effective suppression: stored causes or a dismissal still running (REV-49)."""
+    return {
+        "bool": {
+            "should": [
+                {"term": {"suppressed": True}},
+                {"range": {"dismissed_until": {"gt": epoch_us(evaluated_at)}}},
+            ],
+            "minimum_should_match": 1,
+        }
+    }
+
+
+def elastic(ir: IR, evaluated_at: datetime) -> dict:
+    op = ir.op
+    if op == "literal":
+        return {"match_all" if ir.value else "match_none": {}}
+    if op == "field":
+        if ir.value == "suppressed":
+            return suppressed_query(evaluated_at)
+        return {"term": {storage_name(ir.value): True}}
+    if op == "has":
+        return {
+            "exists": {
+                "field": "status" if ir.value == "display_status" else storage_name(ir.value)
+            }
+        }
+    if op == "not":
+        return negate(elastic(ir.args[0], evaluated_at))
+    if op in {"and", "or"}:
+        body = {"filter" if op == "and" else "should": [elastic(x, evaluated_at) for x in ir.args]}
+        if op == "or":
+            body["minimum_should_match"] = 1
+        return {"bool": body}
+    left, right = ir.args
+    if op == "member":
+        return {"term": {storage_name(right.value): left.value}}
+    name = storage_name(left.value)
+    if op == "in":
+        return (
+            {
+                "bool": {
+                    "should": [
+                        elastic(IR("eq", "bool", args=(left, x)), evaluated_at) for x in right.args
+                    ],
+                    "minimum_should_match": 1,
+                }
+            }
+            if right.args
+            else {"match_none": {}}
+        )
+    value = time_bound(right, evaluated_at)
+    if left.value == "display_status" and op in {"eq", "ne"}:
+        if value == "resolved":
+            query = {"term": {"status": "resolved"}}
+        else:
+            assigned = {"exists": {"field": "assignee_id"}}
+            query = {
+                "bool": {
+                    "filter": [
+                        {"term": {"status": "firing"}},
+                        assigned if value == "acknowledged" else negate(assigned),
+                    ]
+                }
+            }
+        return negate(query) if op == "ne" else query
+    if left.value == "suppressed" and op in {"eq", "ne"} and isinstance(value, bool):
+        query = suppressed_query(evaluated_at)
+        return query if (op == "eq") == value else negate(query)
+    if op in {"eq", "ne"}:
+        query = negate({"exists": {"field": name}}) if value is None else {"term": {name: value}}
+        return negate(query) if op == "ne" else query
+    if op in {"lt", "le", "gt", "ge"}:
+        return {"range": {name: {{"le": "lte", "ge": "gte"}.get(op, op): value}}}
+    escaped = value.replace("\\", "\\\\").replace("*", "\\*").replace("?", "\\?")
+    pattern = {
+        "startsWith": escaped + "*",
+        "endsWith": "*" + escaped,
+        "contains": "*" + escaped + "*",
+    }[op]
+    return {"wildcard": {name: {"value": pattern, "case_insensitive": False}}}
+
+
+@dataclass(frozen=True)
+class CompiledExpression:
+    source: str
+    ir: IR
+    fields: tuple[str, ...]
+    bounds: tuple[int, ...]
+    checked: bytes = field(repr=False)
+    ast_nodes: int = 0
+    lowered_source: str = field(default="", repr=False)
+    profile: str = PROFILE
+    cost_model: str = COST_MODEL
+    _program: Any = field(default=None, repr=False, compare=False)
+
+    @property
+    def relative(self) -> bool:
+        return bool(self.bounds)
+
+    @property
+    def rule_cost_upper_bound(self) -> int:
+        cost = self.ast_nodes
+        for item in walk(self.ir):
+            if item.op in {
+                "eq",
+                "ne",
+                "lt",
+                "le",
+                "gt",
+                "ge",
+                "startsWith",
+                "endsWith",
+                "contains",
+                "in",
+            }:
+                left, right = item.args
+                candidates = right.args if right.op == "list" else (right,)
+                for candidate in candidates:
+                    cost += 1
+                    if left.kind in {"string", "enum"}:
+                        literal_bytes = len(str(candidate.value).encode("utf-8"))
+                        work = FIELDS[left.value].max_bytes + literal_bytes
+                        if item.op == "contains":
+                            work = (
+                                FIELDS[left.value].max_bytes * max(literal_bytes, 1) + literal_bytes
+                            )
+                        cost += work
+        return cost
+
+    def evaluate(self, alert: dict, evaluated_at: datetime) -> bool:
+        epoch_us(evaluated_at)
+        data = {}
+        defaults = {"string": "", "enum": "", "bool": False, "int": 0, "time": 0, "ids": []}
+        for name in self.fields:
+            spec = FIELDS[name]
+            value = (
+                display_status(alert)
+                if name == "display_status"
+                else effective_suppressed(alert, evaluated_at)
+                if name == "suppressed" and "suppressed" in alert
+                else alert_name(alert)
+                if name == "name"
+                else alert_provider(alert)
+                if name == "provider"
+                else alert.get(name, alert.get(storage_name(name)))
+            )
+            if value is None and not spec.nullable:
+                raise CELValidationError(f"Required alert field missing: {name}")
+            data["p_" + name] = value is not None
+            if value is not None:
+                if spec.kind == "time":
+                    value = timestamp(value) if isinstance(value, str) else epoch_us(value)
+                elif spec.kind in {"string", "enum"}:
+                    if not isinstance(value, str) or len(value.encode("utf-8")) > spec.max_bytes:
+                        raise CELValidationError(f"Invalid string field: {name}")
+                    if spec.values and value not in spec.values:
+                        raise CELValidationError(f"Invalid enum field: {name}")
+                elif spec.kind == "bool" and type(value) is not bool:
+                    raise CELValidationError(f"Invalid boolean field: {name}")
+                elif spec.kind == "int" and (
+                    type(value) is not int or not -(2**63) <= value < 2**63
+                ):
+                    raise CELValidationError(f"Invalid integer field: {name}")
+                elif spec.kind == "ids" and (
+                    not isinstance(value, list) or any(not isinstance(x, str) for x in value)
+                ):
+                    raise CELValidationError(f"Invalid membership field: {name}")
+            data["v_" + name] = defaults[spec.kind] if value is None else value
+        for i, offset in enumerate(self.bounds):
+            data[f"clock_{i}"] = time_bound(IR("bound", "time", offset), evaluated_at)
+        program = self._runtime()
+        try:
+            result = program.eval(data=data).value()
+        except Exception as exc:
+            raise CELUnavailableError("Native CEL evaluation failed") from exc
+        if type(result) is not bool:
+            raise CELUnavailableError("Native CEL evaluation did not return a boolean")
+        return result
+
+    def _runtime(self):
+        if self._program is None:
+            try:
+                object.__setattr__(
+                    self,
+                    "_program",
+                    environment(self.fields, len(self.bounds)).deserialize(self.checked),
+                )
+            except Exception as exc:
+                raise CELUnavailableError("Checked native runtime unavailable") from exc
+        return self._program
+
+    def to_elasticsearch(self, evaluated_at: datetime) -> dict:
+        """Return only the CEL predicate; caller must enforce tenant/live/suppression."""
+        epoch_us(evaluated_at)
+        return elastic(self.ir, evaluated_at)
+
+    def scoped_query(
+        self, tenant_id: str, evaluated_at: datetime, *, include_suppressed: bool = False
+    ) -> dict:
+        filters = [
+            {"term": {"tenant_id": tenant_id}},
+            {"term": {"deleted": False}},
+            self.to_elasticsearch(evaluated_at),
+        ]
+        if not include_suppressed:
+            filters.append(negate(suppressed_query(evaluated_at)))
+        return {"bool": {"filter": filters}}
+
+
+def compile_expression(
+    source: str, *, rule: bool = False, reuse: bool = False
+) -> CompiledExpression:
+    """Compile checked CEL; reuse=True returns this thread's warmed instance.
+
+    Preparation that evaluates the same programs for many alerts passes reuse,
+    so writers never rebuild a native handle under their locks. That includes
+    API mutation handlers, which prepare inline on server threads. Callers that
+    only build Elasticsearch queries never build a handle, and test handlers
+    evaluate once, spending well under a millisecond on one; they keep fresh
+    instances so request-supplied expressions are not retained per server thread.
+    Both paths share the process-wide checked-data cache.
+    """
+    if not isinstance(source, str):
+        raise CELValidationError("Expression source must be a string")
+    if reuse:
+        # Checked output depends only on profile, mode and source text.
+        return _reusable.get((PROFILE, rule, source), lambda: _warmed(source, rule))
+    try:
+        encoded = source.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise CELValidationError("Expression contains invalid Unicode") from exc
+    if not encoded or len(encoded) > MAX_SOURCE_BYTES:
+        raise CELValidationError("Expression must contain 1–16384 UTF-8 bytes")
+    ir, fields, bounds, checked, nodes, lowered = _compile_checked(source, rule)
+    # Native evaluation handles are instance-local; cached checked data never shares
+    # mutable native runtime state between concurrent callers.
+    return CompiledExpression(source, ir, fields, bounds, checked, nodes, lowered)
+
+
+def _warmed(source: str, rule: bool) -> CompiledExpression:
+    program = compile_expression(source, rule=rule)
+    program._runtime()
+    return program
+
+
+class _ThreadPrograms(local):
+    """One LRU of reusable compiled expressions per thread.
+
+    Reuse keeps each instance's native handle across alerts. Handles stay
+    thread-local, as for fresh instances, so concurrent API threads never share
+    native runtime state; do not hand a reused instance to another thread.
+    """
+
+    def __init__(self, capacity=CACHE_ENTRIES, evictions=None):
+        # threading.local reapplies these arguments in every thread, so one
+        # evictions counter passed here is shared by all threads.
+        self.capacity = capacity
+        self.entries = OrderedDict()
+        self.evictions = evictions or _Evictions("programs")
+
+    def get(self, key, create):
+        program = self.entries.get(key)
+        if program is None:
+            # A failed compile or warmup is raised and never cached.
+            program = create()
+            self.entries[key] = program
+            if len(self.entries) > self.capacity:
+                self.entries.popitem(last=False)
+                self.evictions.record(self.capacity)
+        else:
+            self.entries.move_to_end(key)
+        return program
+
+
+_reusable = _ThreadPrograms(CACHE_ENTRIES, _Evictions("programs"))
+
+
+class _CompileCache:
+    """Bound checked-data retention and share concurrent same-key cold work.
+
+    The condition protects metadata only. Native compilation and followers wait
+    outside it, so a slow cold key cannot block hits for other expressions.
+    Failed compilation is shared with current followers but is never cached.
+    Concurrent cold compilations are bounded separately from retention.
+    """
+
+    def __init__(self, capacity=CACHE_ENTRIES, max_pending=None):
+        self.capacity = capacity
+        self.max_pending = (
+            min(capacity, MAX_PENDING_COMPILES) if max_pending is None else max_pending
+        )
+        self.ready = OrderedDict()
+        self.pending = {}
+        self.condition = Condition()
+        self.evictions = _Evictions("checked")
+
+    def get(self, key, compile_one):
+        with self.condition:
+            while True:
+                remaining()
+                if key in self.ready:
+                    self.ready.move_to_end(key)
+                    return self.ready[key]
+                future = self.pending.get(key)
+                if future is not None:
+                    owner = False
+                    break
+                if len(self.pending) < self.max_pending:
+                    future = Future()
+                    self.pending[key] = future
+                    owner = True
+                    break
+                # Bound bookkeeping for a burst of different expressions too.
+                # Hits and existing-key followers bypass this admission wait.
+                self.condition.wait(timeout=remaining())
+        if not owner:
+            while True:
+                try:
+                    value = future.result(timeout=remaining())
+                    break
+                except TimeoutError:
+                    if future.done():
+                        # A completed owner may itself have raised TimeoutError.
+                        # Preserve that exception (and concurrent completion).
+                        value = future.result()
+                        break
+                    # Timed waits can wake just before the monotonic deadline.
+                    # Recompute the same budget rather than leak that wakeup or
+                    # cancel shared work that can still warm the cache.
+                    remaining()
+            remaining()
+            return value
+        try:
+            value = compile_one()
+        except BaseException as error:
+            with self.condition:
+                future.set_exception(error)
+                del self.pending[key]
+                self.condition.notify_all()
+            raise
+        evicted = False
+        with self.condition:
+            self.ready[key] = value
+            self.ready.move_to_end(key)
+            if len(self.ready) > self.capacity:
+                self.ready.popitem(last=False)
+                evicted = True
+            future.set_result(value)
+            del self.pending[key]
+            self.condition.notify_all()
+        if evicted:
+            # Counted and logged outside the condition so hits never wait on it.
+            self.evictions.record(self.capacity)
+        return value
+
+
+_checked_cache = _CompileCache()
+
+
+def _compile_checked(source: str, rule: bool):
+    return _checked_cache.get((source, rule), lambda: _compile_native(source, rule))
+
+
+def _compile_native(source: str, rule: bool):
+    started = monotonic()
+    reason, process, exit_code = "child_unavailable", None, None
+    try:
+        command, env = _child_command()
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+        except OSError as exc:
+            raise CELUnavailableError("CEL compiler process could not start") from exc
+        try:
+            output, _ = process.communicate(
+                pickle.dumps((source, rule)), timeout=COMPILE_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired as exc:
+            reason, exit_code = "deadline", process.poll()
+            raise CELUnavailableError("CEL compiler exceeded one-second deadline") from exc
+        exit_code = process.returncode
+        try:
+            message = pickle.loads(output)
+        except Exception as exc:
+            # No reply (or a truncated one) means the child died before answering.
+            reason = "worker_crashed"
+            raise CELUnavailableError("CEL compiler worker crashed") from exc
+        if message[0] == "invalid":
+            raise CELValidationError(message[1], message[2])
+        if message[0] == "unavailable":
+            raise CELUnavailableError(message[1])
+        _, ir, fields, bounds, checked, nodes, lowered = message
+        return ir, fields, bounds, checked, nodes, lowered
+    except CELUnavailableError:
+        # Child error text can contain expression text or local paths. Emit only
+        # fixed categories and operational metadata, retaining the original error.
+        log.warning(
+            "cel_compile_unavailable reason=%s elapsed_ms=%d rule=%s child_exit_code=%s",
+            reason,
+            round((monotonic() - started) * 1000),
+            rule,
+            exit_code,
+        )
+        raise
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            try:
+                # Reap the killed child and close its pipes.
+                process.communicate(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                pass

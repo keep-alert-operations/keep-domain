@@ -6,9 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from appchi import clock_health
-from appchi.clock_health import ClockEvidenceCache, require_clock_health
-from appchi.shared.errors import AppError
+from keep import clock_health
+from keep.clock_health import ClockEvidenceCache, require_clock_health
+from keep.shared.errors import AppError
 
 
 @pytest.mark.parametrize(

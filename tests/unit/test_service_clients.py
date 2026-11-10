@@ -3,8 +3,8 @@ import base64
 import pytest
 from pydantic import ValidationError
 
-from appchi.config import Settings
-from appchi.service_clients import elasticsearch_options, kafka_options
+from keep.config import Settings
+from keep.service_clients import elasticsearch_options, kafka_options
 
 
 def settings(**values):
@@ -57,13 +57,13 @@ def test_ticket_count_address_is_an_optional_masked_secret(monkeypatch):
     """Requirements: REV-65; operators 14 (deployment configuration)."""
     assert settings().ticket_count_url is None
     address = "https://tickets.invalid/count?key=ticket-secret"
-    monkeypatch.setenv("APPCHI_TICKET_COUNT_URL", address)
+    monkeypatch.setenv("KEEP_TICKET_COUNT_URL", address)
     config = settings()
     assert config.ticket_count_url.get_secret_value() == address
     assert "ticket-secret" not in repr(config) and "ticket-secret" not in str(config)
     # An unusable address doesn't stop startup; the API treats it as not configured.
-    monkeypatch.setenv("APPCHI_TICKET_COUNT_URL", "not an address")
+    monkeypatch.setenv("KEEP_TICKET_COUNT_URL", "not an address")
     assert settings().ticket_count_url.get_secret_value() == "not an address"
     assert settings().ticket_count_ca_file is None
-    monkeypatch.setenv("APPCHI_TICKET_COUNT_CA_FILE", "/etc/appchi/ticket-ca.pem")
-    assert settings().ticket_count_ca_file == "/etc/appchi/ticket-ca.pem"
+    monkeypatch.setenv("KEEP_TICKET_COUNT_CA_FILE", "/etc/keep/ticket-ca.pem")
+    assert settings().ticket_count_ca_file == "/etc/keep/ticket-ca.pem"

@@ -3,7 +3,7 @@ from uuid import uuid4
 
 import pytest
 
-from appchi.correlation.evidence import (
+from keep.correlation.evidence import (
     Boundary,
     CorrelationProofError,
     EvidenceState,

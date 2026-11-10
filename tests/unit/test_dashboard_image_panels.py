@@ -9,9 +9,9 @@ import pytest
 from fastapi import Request
 from pydantic import ValidationError
 
-import appchi.http as protocol
-from appchi.configuration.images import MAX_BYTES, InvalidImage, inspect
-from appchi.configuration.models import DashboardDefinition, ImagePanel, images_of, presets_of
+import keep.http as protocol
+from keep.configuration.images import MAX_BYTES, InvalidImage, inspect
+from keep.configuration.models import DashboardDefinition, ImagePanel, images_of, presets_of
 
 IMAGE = "00000000-0000-4000-8000-000000000003"
 PRESET = "00000000-0000-4000-8000-000000000002"

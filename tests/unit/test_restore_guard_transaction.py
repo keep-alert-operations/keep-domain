@@ -5,9 +5,9 @@ from uuid import uuid4
 
 import pytest
 
-from appchi.db import BudgetConnection, Database
-from appchi.request_budget import request_budget
-from appchi.shared.errors import AppError
+from keep.db import BudgetConnection, Database
+from keep.request_budget import request_budget
+from keep.shared.errors import AppError
 
 TENANT = uuid4()
 XACT_LOCK = "pg_try_advisory_xact_lock_shared"
@@ -161,7 +161,7 @@ def test_eligible_unit_guards_inside_its_single_transaction(path):
     assert setup[isolation] == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
     assert not any(query.startswith("SELECT") for query in setup[:isolation])
     if path == "tenant":
-        assert control < position(setup, "set_config('appchi.tenant_id'")
+        assert control < position(setup, "set_config('keep.tenant_id'")
     else:
         assert not any("set_config" in query for query in setup)
     assert not any(

@@ -7,13 +7,13 @@ from uuid import UUID
 import httpx
 import pytest
 
-from appchi.identity.directory import DirectoryUnavailable, DirectoryVerifier, PrincipalKey
-from appchi.identity.keycloak_directory import (
+from keep.identity.directory import DirectoryUnavailable, DirectoryVerifier, PrincipalKey
+from keep.identity.keycloak_directory import (
     KeycloakDirectoryReader,
     LocalKeycloakConfig,
     load_config,
 )
-from appchi.identity import local_keycloak_worker
+from keep.identity import local_keycloak_worker
 
 
 def test_continuous_local_directory_startup_fails_before_config(monkeypatch, capsys):
@@ -30,17 +30,17 @@ def uid(number):
 
 @pytest.fixture
 def config(monkeypatch):
-    monkeypatch.setenv("APPCHI_ENVIRONMENT", "development")
-    monkeypatch.setenv("APPCHI_LOCAL_DIRECTORY_SECRET", "test-secret")
+    monkeypatch.setenv("KEEP_ENVIRONMENT", "development")
+    monkeypatch.setenv("KEEP_LOCAL_DIRECTORY_SECRET", "test-secret")
     context = ssl.create_default_context()
     monkeypatch.setattr(
-        "appchi.identity.keycloak_directory.ssl.create_default_context", lambda **_: context
+        "keep.identity.keycloak_directory.ssl.create_default_context", lambda **_: context
     )
     return LocalKeycloakConfig(
-        issuer="https://localhost:58443/realms/appchi-local",
+        issuer="https://localhost:58443/realms/keep-local",
         source="keycloak-local",
-        client_id="appchi-directory",
-        client_secret_env="APPCHI_LOCAL_DIRECTORY_SECRET",
+        client_id="keep-directory",
+        client_secret_env="KEEP_LOCAL_DIRECTORY_SECRET",
         ca_file="trusted-local.pem",
         superadmin_group=uid(10),
         max_objects=50,
@@ -59,7 +59,7 @@ class Realm:
                 "id": uid(3),
                 "username": "service-account",
                 "enabled": True,
-                "serviceAccountClientId": "appchi-directory",
+                "serviceAccountClientId": "keep-directory",
             },
         ]
         self.groups = [{"id": uid(10), "name": "admins"}]
@@ -76,7 +76,7 @@ class Realm:
             return httpx.Response(200, json={"access_token": "test-token"})
         assert request.method == "GET"
         assert request.headers["authorization"] == "Bearer test-token"
-        path = request.url.path.removeprefix("/admin/realms/appchi-local")
+        path = request.url.path.removeprefix("/admin/realms/keep-local")
         if path == self.fail:
             return httpx.Response(503, text="sensitive upstream failure")
         if path == "/users":
@@ -109,10 +109,10 @@ def test_complete_pagination_nested_members_disabled_and_service_accounts(config
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("issuer", "http://localhost:58443/realms/appchi-local"),
-        ("issuer", "https://company.example/realms/appchi-local"),
-        ("issuer", "https://localhost:58443/realms/appchi"),
-        ("issuer", "https://user:secret@localhost/realms/appchi-local"),
+        ("issuer", "http://localhost:58443/realms/keep-local"),
+        ("issuer", "https://company.example/realms/keep-local"),
+        ("issuer", "https://localhost:58443/realms/keep"),
+        ("issuer", "https://user:secret@localhost/realms/keep-local"),
         ("source", "ldap"),
         ("local_only", False),
         ("page_size", 0),
@@ -128,9 +128,9 @@ def test_configuration_cannot_be_used_as_production_adapter(config, field, value
 @pytest.mark.parametrize("environment", [None, "staging", "production"])
 def test_explicit_development_required(config, monkeypatch, environment):
     if environment is None:
-        monkeypatch.delenv("APPCHI_ENVIRONMENT")
+        monkeypatch.delenv("KEEP_ENVIRONMENT")
     else:
-        monkeypatch.setenv("APPCHI_ENVIRONMENT", environment)
+        monkeypatch.setenv("KEEP_ENVIRONMENT", environment)
     with pytest.raises(ValueError, match="development"):
         KeycloakDirectoryReader(config)
 
@@ -139,7 +139,7 @@ def test_config_secrets_are_only_environment_bindings(config, tmp_path, monkeypa
     path = tmp_path / "directory.json"
     path.write_text(json.dumps(config.model_dump()))
     assert load_config(path) == config
-    monkeypatch.delenv("APPCHI_LOCAL_DIRECTORY_SECRET")
+    monkeypatch.delenv("KEEP_LOCAL_DIRECTORY_SECRET")
     with pytest.raises(ValueError, match="secret binding"):
         load_config(path)
 

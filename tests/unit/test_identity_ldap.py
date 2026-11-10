@@ -1,7 +1,7 @@
 import pytest
 
-from appchi.identity.directory import DirectoryUnavailable, PrincipalKey
-from appchi.identity.ldap import LDAPConfig, LDAPDirectoryReader, LDAPSchema
+from keep.identity.directory import DirectoryUnavailable, PrincipalKey
+from keep.identity.ldap import LDAPConfig, LDAPDirectoryReader, LDAPSchema
 
 
 def config(**changes):

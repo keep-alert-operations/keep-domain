@@ -12,14 +12,14 @@ from uuid import uuid4
 
 import pytest
 
-import appchi.cel.compiler as compiler
-from appchi.cel.compiler import COST_MODEL, PROFILE
-from appchi.correlation import repository
-from appchi.correlation import runtime as correlation
-from appchi.maintenance import runtime as maintenance
-from appchi.serialization import wire
-from appchi.shared.capacity import UNLIMITED
-from appchi.shared.errors import AppError
+import keep.cel.compiler as compiler
+from keep.cel.compiler import COST_MODEL, PROFILE
+from keep.correlation import repository
+from keep.correlation import runtime as correlation
+from keep.maintenance import runtime as maintenance
+from keep.serialization import wire
+from keep.shared.capacity import UNLIMITED
+from keep.shared.errors import AppError
 
 NOW = datetime(2026, 10, 18, 12, tzinfo=UTC)
 RELEASE = NOW - timedelta(days=1)
@@ -325,16 +325,16 @@ def test_checked_cache_retains_beyond_the_pending_bound(native):
 @pytest.mark.parametrize(("value", "expected"), [(None, 4096), ("1", 1), (" 65536 ", 65536)])
 def test_cache_entries_default_and_override(monkeypatch, value, expected):
     if value is None:
-        monkeypatch.delenv("APPCHI_CEL_CACHE_ENTRIES", raising=False)
+        monkeypatch.delenv("KEEP_CEL_CACHE_ENTRIES", raising=False)
     else:
-        monkeypatch.setenv("APPCHI_CEL_CACHE_ENTRIES", value)
+        monkeypatch.setenv("KEEP_CEL_CACHE_ENTRIES", value)
     assert compiler._cache_entries() == expected
 
 
 @pytest.mark.parametrize("value", ["0", "65537", "-4", "many", ""])
 def test_cache_entries_rejects_unbounded_values(monkeypatch, value):
-    monkeypatch.setenv("APPCHI_CEL_CACHE_ENTRIES", value)
-    with pytest.raises(ValueError, match="APPCHI_CEL_CACHE_ENTRIES"):
+    monkeypatch.setenv("KEEP_CEL_CACHE_ENTRIES", value)
+    with pytest.raises(ValueError, match="KEEP_CEL_CACHE_ENTRIES"):
         compiler._cache_entries()
 
 
@@ -495,7 +495,7 @@ class EvidenceTenant(WorkerTenant):
 
 def per_row_reference(conn, tenant, rows, incident_ids):
     """The former per-alert and per-incident reads, kept as the oracle."""
-    from appchi.maintenance.processing import derive_current
+    from keep.maintenance.processing import derive_current
 
     unsafe = set()
     for row in rows:
@@ -516,7 +516,7 @@ def per_row_reference(conn, tenant, rows, incident_ids):
 
 
 def batched(conn, tenant, rows, incident_ids):
-    from appchi.maintenance.processing import derive_current_many
+    from keep.maintenance.processing import derive_current_many
 
     unsafe = {
         row["id"]
@@ -554,7 +554,7 @@ def test_batched_reads_issue_nothing_for_empty_input():
 
 @pytest.mark.parametrize("stale", [{0}, {2}, {0, 2}])
 def test_batched_checkpoint_proof_fails_like_the_per_row_read(stale):
-    from appchi.maintenance.processing import MaintenanceProofError
+    from keep.maintenance.processing import MaintenanceProofError
 
     tenant = EvidenceTenant(stale=frozenset(stale))
     rows = [tenant.alert_row(a) for a in tenant.alerts]
@@ -567,7 +567,7 @@ def test_batched_checkpoint_proof_fails_like_the_per_row_read(stale):
 
 
 def test_batched_checkpoint_proof_rejects_a_missing_checkpoint():
-    from appchi.maintenance.processing import MaintenanceProofError
+    from keep.maintenance.processing import MaintenanceProofError
 
     tenant = EvidenceTenant()
     missing = tenant.alerts[1]
