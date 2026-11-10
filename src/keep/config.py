@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     ticket_count_url: SecretStr | None = None
     # Optional CA bundle that alone verifies the counting service's TLS certificate.
     ticket_count_ca_file: str | None = None
+    # REV-68: the Grafana instances Grafana panels may frame, comma-separated https
+    # addresses with an optional base path. Not a secret. Empty turns Grafana panels off;
+    # unusable entries are ignored (see keep.configuration.grafana).
+    grafana_panel_origins: str | None = None
     worker_health_path: Path | None = None
 
     @model_validator(mode="after")

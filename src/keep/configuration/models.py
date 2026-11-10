@@ -340,6 +340,41 @@ class ServiceNowPanel(PanelLayout):
         return increasing_thresholds(self)
 
 
+class GrafanaPanel(PanelLayout):
+    """A panel framing one live Grafana panel in the browser (REV-68).
+
+    The model checks only the address's form. Whether this deployment allows its
+    Grafana is checked by ``keep.configuration.grafana.grafana_url_problem`` when the
+    address is new or changed, and again by the browser before every render. It
+    references no preset and is never part of a count batch.
+    """
+
+    type: Literal["grafana"]
+    url: str = Field(max_length=2048)
+
+    @field_validator("url")
+    @classmethod
+    def address(cls, value):
+        if not value.isascii() or any(c.isspace() or not c.isprintable() for c in value):
+            raise ValueError("Use a Grafana address without spaces or control characters")
+        try:
+            parts = urlsplit(value)
+            parts.port
+        except ValueError:
+            raise ValueError("Use a valid Grafana panel address") from None
+        # The literal prefix matters: "https:host/x" parses but a browser resolves it
+        # as a path on Keep's own origin.
+        if (
+            parts.scheme not in ("http", "https")
+            or not value.lower().startswith(("http://", "https://"))
+            or not parts.hostname
+        ):
+            raise ValueError("Use an address that starts with https://")
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("Grafana addresses cannot contain a user name or password")
+        return value
+
+
 def sanitize_panels(panels):
     """Sanitize HTML panels in place and return what sanitizing removed."""
     removed = []
@@ -364,7 +399,8 @@ AnyPanel = Annotated[
     | Annotated[HtmlPanel, Tag("html")]
     | Annotated[ImagePanel, Tag("image")]
     | Annotated[TablePanel, Tag("table")]
-    | Annotated[ServiceNowPanel, Tag("servicenow")],
+    | Annotated[ServiceNowPanel, Tag("servicenow")]
+    | Annotated[GrafanaPanel, Tag("grafana")],
     Discriminator(panel_type),
 ]
 
