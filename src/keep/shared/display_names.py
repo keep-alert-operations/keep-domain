@@ -150,7 +150,7 @@ def incident_origins(conn, tenant, context_ids: Iterable) -> dict[str, tuple[str
 
 
 def enrich_incidents(conn, tenant, rows: list[dict]) -> list[dict]:
-    """Assignee names plus the correlation origin rule for correlation-created incidents."""
+    """Assignee names, the correlation origin rule and who linked the ServiceNow ticket."""
     origins = incident_origins(
         conn,
         tenant,
@@ -164,7 +164,13 @@ def enrich_incidents(conn, tenant, rows: list[dict]) -> list[dict]:
             else (None, None)
         )
         result.append({**row, "origin_rule_id": rule_id, "origin_rule_name": rule_name})
-    return result
+    linked_by = principal_names(conn, [row.get("ticket_linked_by") for row in result])
+    return [
+        {**row, "ticket_linked_by_display_name": linked_by.get(_key(row.get("ticket_linked_by")))}
+        if "ticket_linked_by" in row
+        else row
+        for row in result
+    ]
 
 
 def actor_names(conn, sources: list[dict]) -> list[dict]:
@@ -250,6 +256,22 @@ class IncidentDisplayNames(_Open):
     unavailable: str | None = Field(
         default=None,
         description="Current linked references whose alert is no longer retained.",
+    )
+    ticket_url: str | None = Field(
+        default=None,
+        description="Link to the incident's ServiceNow ticket (REV-70); null when none is linked.",
+    )
+    ticket_number: str | None = Field(
+        default=None, description="The linked ticket's number, upper case; null when not given."
+    )
+    ticket_linked_at: str | None = Field(
+        default=None, description="When the current ticket link was saved; null without a ticket."
+    )
+    ticket_linked_by: str | None = Field(
+        default=None, description="Principal who saved the current ticket link."
+    )
+    ticket_linked_by_display_name: str | None = Field(
+        default=None, description="Stored directory name of ticket_linked_by."
     )
 
 

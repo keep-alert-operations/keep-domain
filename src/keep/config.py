@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     # addresses with an optional base path. Not a secret. Empty turns Grafana panels off;
     # unusable entries are ignored (see keep.configuration.grafana).
     grafana_panel_origins: str | None = None
+    # REV-70: the deployment's ServiceNow, e.g. https://acme.service-now.com. Not a
+    # secret: incidents may only store ticket links into it, and browsers open its new
+    # incident form. Keep never calls it. Absent or unusable means ServiceNow tickets
+    # are off; keep.incidents.tickets.parse_servicenow checks it.
+    servicenow_url: str | None = None
     worker_health_path: Path | None = None
 
     @model_validator(mode="after")
