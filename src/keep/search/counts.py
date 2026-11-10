@@ -13,11 +13,18 @@ from .projection import assert_complete
 from .text import query_tokens
 
 
+# An incident count panel counts at most this many distinct incidents; more is
+# reported unavailable rather than as a partial number (REV-69).
+MAX_INCIDENTS = 10_000
+
+
 @dataclass(frozen=True)
 class CountQuery:
     expression: CompiledExpression
     q: str = ""
     include_suppressed: bool = False
+    # Also report how many matching alerts each active incident owns (REV-69).
+    incidents: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,6 +58,29 @@ class CountBatch:
     updating: bool
     updating_suppression: bool
     next_change_at: str | None = None
+    # Per key of an ``incidents`` query: active incident ID -> its matching alerts, or
+    # None when more than MAX_INCIDENTS incidents match (REV-69).
+    incidents: dict[str, dict[str, int] | None] | None = None
+
+
+def _owners(result) -> dict[str, int] | None:
+    """Active incident ID -> matching alerts from an exact ``incidents`` aggregation,
+    or None when more than MAX_INCIDENTS incidents match."""
+    terms = result.get("aggregations", {}).get("incidents", {})
+    buckets = terms.get("buckets")
+    if not isinstance(buckets, list):
+        raise unavailable("incident_count_incomplete")
+    if len(buckets) > MAX_INCIDENTS or terms.get("sum_other_doc_count", 0) != 0:
+        return None
+    if terms.get("doc_count_error_upper_bound", 0) != 0:
+        raise unavailable("incident_count_incomplete")
+    owners = {}
+    for bucket in buckets:
+        key, count = bucket.get("key"), bucket.get("doc_count")
+        if not isinstance(key, str) or type(count) is not int or count < 1:
+            raise unavailable("incident_count_incomplete")
+        owners[key] = count
+    return owners
 
 
 class CountReader:
@@ -100,11 +130,14 @@ class CountReader:
                     query.expression.source,
                     tuple(query_tokens(query.q)),
                     query.include_suppressed,
+                    query.incidents,
                 )
                 if context not in unique:
                     unique[context] = query
                 positions[key] = list(unique).index(context)
             totals = []
+            # False for a query without incidents; None for too many incidents.
+            owners: list[dict[str, int] | None | bool] = []
             changes = []
             if unique:
                 opened = client().open_point_in_time(
@@ -133,6 +166,18 @@ class CountReader:
                     changing["bool"]["filter"].extend(
                         [*tokens, {"range": {"dismissed_until": {"gt": epoch_us(evaluated_at)}}}]
                     )
+                    aggs = {}
+                    if query.incidents:
+                        # Every distinct owner, exactly: one more bucket than allowed
+                        # reveals an overflow, and shard_size equal to size keeps each
+                        # shard's list complete up to that bound.
+                        aggs["incidents"] = {
+                            "terms": {
+                                "field": "active_incident_id",
+                                "size": MAX_INCIDENTS + 1,
+                                "shard_size": MAX_INCIDENTS + 1,
+                            }
+                        }
                     searches.extend(
                         [
                             {"allow_partial_search_results": False},
@@ -143,6 +188,7 @@ class CountReader:
                                 "timeout": f"{max(1, int(remaining() * 1000))}ms",
                                 "query": scoped,
                                 "aggs": {
+                                    **aggs,
                                     "next_change": {
                                         "global": {},
                                         "aggs": {
@@ -167,7 +213,7 @@ class CountReader:
                         pits.add(result["pit_id"])
                 if len(responses) != len(unique):
                     raise unavailable("count_incomplete")
-                for result in responses:
+                for query, result in zip(unique.values(), responses):
                     if "error" in result or result.get("status", 200) >= 400:
                         raise unavailable("count_search_failed")
                     assert_complete(result)
@@ -188,6 +234,7 @@ class CountReader:
                     ):
                         raise unavailable("search_total_inexact")
                     totals.append(total["value"])
+                    owners.append(_owners(result) if query.incidents else False)
                     at = (
                         result.get("aggregations", {})
                         .get("next_change", {})
@@ -217,6 +264,11 @@ class CountReader:
                 ).isoformat()
                 if changes
                 else None,
+                {
+                    key: owners[pos]
+                    for key, pos in positions.items()
+                    if owners[pos] is not False
+                },
             )
         except AppError:
             raise

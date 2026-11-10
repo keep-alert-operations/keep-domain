@@ -375,6 +375,35 @@ class GrafanaPanel(PanelLayout):
         return value
 
 
+IncidentStatus = Literal["open", "investigating", "both"]
+
+
+class IncidentCountPanel(PanelLayout):
+    """A panel counting the incidents its preset's alerts are in (REV-69).
+
+    It references a preset like a count panel and counts the distinct incidents that
+    actively own at least one alert the preset counts and whose status is
+    ``incident_status`` (``open``, shown as Firing, ``investigating``, or ``both``);
+    resolved incidents never count. ``thresholds`` color the count like a count
+    panel's.
+    """
+
+    type: Literal["incident_count"]
+    preset_id: str
+    incident_status: IncidentStatus = "both"
+    thresholds: list[Threshold] = Field(default_factory=list, max_length=3)
+    _preset = field_validator("preset_id")(uuid_string)
+
+    @model_validator(mode="after")
+    def increasing(self):
+        return increasing_thresholds(self)
+
+
+def incident_statuses(value: str) -> tuple[str, ...]:
+    """The stored incident statuses an ``incident_status`` setting counts (REV-69)."""
+    return ("open", "investigating") if value == "both" else (value,)
+
+
 def sanitize_panels(panels):
     """Sanitize HTML panels in place and return what sanitizing removed."""
     removed = []
@@ -400,19 +429,24 @@ AnyPanel = Annotated[
     | Annotated[ImagePanel, Tag("image")]
     | Annotated[TablePanel, Tag("table")]
     | Annotated[ServiceNowPanel, Tag("servicenow")]
-    | Annotated[GrafanaPanel, Tag("grafana")],
+    | Annotated[GrafanaPanel, Tag("grafana")]
+    | Annotated[IncidentCountPanel, Tag("incident_count")],
     Discriminator(panel_type),
 ]
 
 
+COUNTED_TYPES = ("count", "incident_count")
+PRESET_TYPES = ("count", "table", "incident_count")
+
+
 def presets_of(panels):
-    """Preset IDs counted by count panels, in first-use order."""
-    return list(dict.fromkeys(p.preset_id for p in panels if p.type == "count"))
+    """Preset IDs a count batch counts (count and incident count panels), in first-use order."""
+    return list(dict.fromkeys(p.preset_id for p in panels if p.type in COUNTED_TYPES))
 
 
 def referenced_presets_of(panels):
-    """Preset IDs any panel references (count and table panels), in first-use order."""
-    return list(dict.fromkeys(p.preset_id for p in panels if p.type in ("count", "table")))
+    """Preset IDs any panel references (count, table and incident count panels), in first-use order."""
+    return list(dict.fromkeys(p.preset_id for p in panels if p.type in PRESET_TYPES))
 
 
 class DashboardDefinition(StrictModel):
