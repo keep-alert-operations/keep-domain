@@ -113,3 +113,62 @@ def run_cycle(
         conn.execute("DELETE FROM login_transactions WHERE expires_at<=clock_timestamp()")
         conn.execute("DELETE FROM logout_fences WHERE expires_at<=clock_timestamp()")
     return evidence, result
+
+
+def main() -> int:
+    """Explicit one-shot LDAP directory publication.
+
+    REV-35 keeps directory automation deferred: this command performs a single
+    trusted publication cycle (optionally lifting the initial bootstrap gate) and
+    starts no polling worker. It uses the same guarded publication path as the
+    scheduled `run_cycle`. The superadmin group id is supplied through
+    KEEP_SUPERADMIN_GROUP and bound to the configuration's directory source.
+    """
+    import argparse
+
+    from keep.config import Settings
+    from keep.db import Database
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--bootstrap", action="store_true")
+    args = parser.parse_args()
+    if not args.once:
+        parser.error("directory automation is deferred; use --once for explicit publication")
+    config = load_directory_config(args.config)
+    settings = Settings()
+    if not settings.superadmin_group:
+        raise ValueError("KEEP_SUPERADMIN_GROUP is required for directory publication")
+    database = Database(
+        settings.database_url.get_secret_value(),
+        size=settings.pool_size,
+        deployment_epoch=settings.deployment_epoch,
+    )
+    try:
+        evidence, result = run_cycle(
+            database,
+            config,
+            PrincipalKey(config.source, settings.superadmin_group),
+            bootstrap_qualified=args.bootstrap,
+        )
+        print(
+            json.dumps(
+                {
+                    "complete": evidence.complete,
+                    "accepted": result.accepted,
+                    "generation": evidence.generation,
+                    "objects": len(evidence.objects),
+                    "semantic_revision": result.semantic_revision,
+                    "bootstrap_ready": result.bootstrap_ready,
+                }
+            ),
+            flush=True,
+        )
+        return 0 if result.accepted else 1
+    finally:
+        database.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
