@@ -48,7 +48,7 @@ def sign(key, payload):
     return JsonWebToken(["RS256"]).encode({"alg": "RS256", "kid": "key-1"}, payload, key).decode()
 
 
-def make_client(key, token_response=None, required_amr=("pwd",)):
+def make_client(key, token_response=None, required_amr=("pwd",), required_acr="company-password"):
     seen = []
     config = OIDCConfig(
         ISSUER,
@@ -59,7 +59,7 @@ def make_client(key, token_response=None, required_amr=("pwd",)):
         "company",
         "directory_id",
         "directory-identity",
-        "company-password",
+        required_acr,
         required_amr,
     )
 
@@ -159,6 +159,28 @@ def test_configured_stronger_authentication_policy_is_still_enforced(signing_key
         client.validate_id_token(sign(signing_key, claims(amr=["pwd", "otp"])), "nonce")
     )
     assert identity.directory_object_id == "immutable-123"
+
+
+def test_optional_acr_accepts_any_acr_but_still_requires_password_amr(signing_key):
+    # A lightweight provider (e.g. Authelia) need not emit Keycloak's acr value.
+    # With required_acr unset, any/absent acr is accepted, but amr=pwd evidence
+    # is still mandatory.
+    client, _ = make_client(signing_key, required_acr=None)
+    for overrides in ({"acr": "weak"}, {}):
+        identity = asyncio.run(
+            client.validate_id_token(sign(signing_key, claims(**overrides)), "nonce")
+        )
+        assert identity.directory_object_id == "immutable-123"
+    for overrides in ({"amr": []}, {"amr": ["otp"]}, {"amr": "pwd"}):
+        with pytest.raises(OIDCInvalid):
+            asyncio.run(client.validate_id_token(sign(signing_key, claims(**overrides)), "nonce"))
+
+
+def test_optional_acr_omits_acr_values_from_authorization_url(signing_key):
+    client, _ = make_client(signing_key, required_acr=None)
+    tx = client.new_transaction("/tenants/abc", "x" * 43)
+    query = parse_qs(urlsplit(asyncio.run(client.authorization_url(tx))).query)
+    assert "acr_values" not in query
 
 
 @pytest.mark.parametrize(

@@ -101,13 +101,14 @@ def oidc_client(request: Request) -> OIDCClient:
     if getattr(request.app.state, "oidc", None) is not None:
         return request.app.state.oidc
     settings = request.app.state.settings
+    # oidc_required_acr is intentionally omitted: it is optional (see OIDCConfig),
+    # enforced only when the provider supplies a configured acr value.
     fields = (
         "oidc_issuer",
         "oidc_client_secret",
         "oidc_directory_source",
         "oidc_directory_id_claim",
         "oidc_directory_scope",
-        "oidc_required_acr",
         "oidc_required_amr",
     )
     if not all(getattr(settings, field, None) for field in fields):

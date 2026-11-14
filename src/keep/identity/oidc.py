@@ -117,7 +117,10 @@ class OIDCConfig:
     directory_id_claim: str
     directory_scope: str
     # Protected authentication mapper values must be explicitly configured.
-    required_acr: str
+    # required_acr is optional: lightweight providers (e.g. Authelia) emit an acr
+    # that differs from Keycloak's, so acr is only enforced when a value is set.
+    # amr (password evidence) remains mandatory.
+    required_acr: str | None
     required_amr: tuple[str, ...]
     ca_file: str | None = None
     timeout_seconds: float = 5
@@ -139,7 +142,6 @@ class OIDCConfig:
                 self.directory_source,
                 self.directory_id_claim,
                 self.directory_scope,
-                self.required_acr,
                 self.required_amr,
             )
         ):
@@ -315,6 +317,7 @@ class OIDCClient:
             code_challenge_method="S256",
             **self._http_options(),
         ) as client:
+            optional = {"acr_values": self.config.required_acr} if self.config.required_acr else {}
             uri, _ = client.create_authorization_url(
                 metadata["authorization_endpoint"],
                 state=transaction.state,
@@ -322,7 +325,7 @@ class OIDCClient:
                 code_verifier=transaction.verifier,
                 scope=f"openid profile {self.config.directory_scope}",
                 max_age=transaction.max_age,
-                acr_values=self.config.required_acr,
+                **optional,
             )
             return uri
 
@@ -423,10 +426,10 @@ class OIDCClient:
             or (requested_at is not None and auth_time < requested_at - max_age - 30)
         ):
             raise OIDCInvalid("invalid_authentication_time")
-        if (
-            claims.get("acr") != self.config.required_acr
-            or not isinstance(claims.get("amr"), list)
-            or not set(self.config.required_amr).issubset(claims["amr"])
+        if self.config.required_acr is not None and claims.get("acr") != self.config.required_acr:
+            raise OIDCInvalid("mfa_evidence_required")
+        if not isinstance(claims.get("amr"), list) or not set(self.config.required_amr).issubset(
+            claims["amr"]
         ):
             raise OIDCInvalid("mfa_evidence_required")
         for name in ("sub", "sid", self.config.directory_id_claim):
