@@ -118,7 +118,6 @@ def test_signed_identity_binding_and_rs256(signing_key):
         {"amr": "pwd"},
         {"acr": "weak"},
         {"events": {LOGOUT_EVENT: {}}},
-        {"sid": ""},
         {"iat": NOW + 31},
     ],
 )
@@ -174,6 +173,16 @@ def test_optional_acr_accepts_any_acr_but_still_requires_password_amr(signing_ke
     for overrides in ({"amr": []}, {"amr": ["otp"]}, {"amr": "pwd"}):
         with pytest.raises(OIDCInvalid):
             asyncio.run(client.validate_id_token(sign(signing_key, claims(**overrides)), "nonce"))
+
+
+def test_optional_sid_accepts_absent_or_empty_session_id(signing_key):
+    # The provider session id is optional (only used for back-channel logout). An
+    # absent or empty sid is accepted and yields an empty OIDCIdentity.sid.
+    client, _ = make_client(signing_key)
+    for payload in (claims(sid=""), {k: v for k, v in claims().items() if k != "sid"}):
+        identity = asyncio.run(client.validate_id_token(sign(signing_key, payload), "nonce"))
+        assert identity.sid == ""
+        assert identity.directory_object_id == "immutable-123"
 
 
 def test_optional_acr_omits_acr_values_from_authorization_url(signing_key):

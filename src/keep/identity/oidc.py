@@ -279,13 +279,13 @@ class OIDCClient:
             )
             if metadata.get("issuer") != self.config.issuer:
                 raise OIDCUnavailable("provider_issuer_mismatch")
-            for name in (
-                "authorization_endpoint",
-                "token_endpoint",
-                "jwks_uri",
-                "end_session_endpoint",
-            ):
+            for name in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
                 self._pinned_endpoint(metadata.get(name))
+            # RP-initiated logout is optional: provider-side logout was dropped as a
+            # hard requirement (local revocation + session TTLs suffice). Pin the
+            # end-session endpoint only when the provider advertises one.
+            if metadata.get("end_session_endpoint") is not None:
+                self._pinned_endpoint(metadata.get("end_session_endpoint"))
             if "RS256" not in metadata.get("id_token_signing_alg_values_supported", []):
                 raise OIDCUnavailable("provider_signing_contract_missing")
             self._metadata = metadata
@@ -318,12 +318,15 @@ class OIDCClient:
             **self._http_options(),
         ) as client:
             optional = {"acr_values": self.config.required_acr} if self.config.required_acr else {}
+            # offline_access is requested because the backend requires a refresh token
+            # for server-side session rotation; some providers (e.g. Authelia) only
+            # issue a refresh token when this scope is granted.
             uri, _ = client.create_authorization_url(
                 metadata["authorization_endpoint"],
                 state=transaction.state,
                 nonce=transaction.nonce,
                 code_verifier=transaction.verifier,
-                scope=f"openid profile {self.config.directory_scope}",
+                scope=f"openid profile offline_access {self.config.directory_scope}",
                 max_age=transaction.max_age,
                 **optional,
             )
@@ -432,13 +435,20 @@ class OIDCClient:
             claims["amr"]
         ):
             raise OIDCInvalid("mfa_evidence_required")
-        for name in ("sub", "sid", self.config.directory_id_claim):
+        for name in ("sub", self.config.directory_id_claim):
             if not isinstance(claims.get(name), str) or not claims[name] or len(claims[name]) > 512:
                 raise OIDCInvalid("immutable_identity_binding_required")
+        # The provider session id (sid) is optional: it is only used for
+        # provider-initiated back-channel logout, which is no longer required. When a
+        # provider omits it, local idle/absolute session lifetimes and revocation
+        # still apply. When present it must be a bounded string.
+        sid = claims.get("sid", "")
+        if not isinstance(sid, str) or len(sid) > 512:
+            raise OIDCInvalid("immutable_identity_binding_required")
         return OIDCIdentity(
             self.config.issuer,
             claims["sub"],
-            claims["sid"],
+            sid,
             self.config.directory_source,
             claims[self.config.directory_id_claim],
             auth_time,
@@ -539,6 +549,10 @@ class OIDCClient:
 
     async def logout_url(self, id_token_hint: str) -> str:
         metadata = await self.metadata()
+        if metadata.get("end_session_endpoint") is None:
+            # Provider advertises no RP-initiated logout; callers treat this as an
+            # unavailable provider logout and fall back to local session revocation.
+            raise OIDCUnavailable("provider_logout_unsupported")
         return (
             metadata["end_session_endpoint"]
             + "?"
