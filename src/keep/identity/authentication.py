@@ -1,21 +1,27 @@
+"""Local human sessions: the session cookie, CSRF, the gate and the return path.
+
+Requirements: REV-73; identity configuration 2, 4-5, 8, 10.
+
+Password sign-in (one LDAP bind and a WhoAmI check) lives in ``keep.identity.login``;
+the Product API's ``/auth`` routes compose both. A session lasts 24 hours from sign-in
+with no idle timeout, refresh or provider credential.
+"""
+
 from __future__ import annotations
+
 import hashlib
-import json
 import secrets
-from starlette.concurrency import run_in_threadpool
+from urllib.parse import unquote, urlsplit
+
 from fastapi import Request
+
 from keep.shared.errors import AppError, unavailable
-from .oidc import (
-    OIDCClient,
-    OIDCConfig,
-    OIDCIdentity,
-    OIDCInvalid,
-    OIDCRevoked,
-    OIDCUnavailable,
-)
 
 SESSION_COOKIE = "__Host-keep_session"
-LOGIN_COOKIE = "__Host-keep_login"
+
+
+class InvalidReturnPath(ValueError):
+    """The value is not a local relative path the browser may return to."""
 
 
 def _hash(value: str) -> bytes:
@@ -45,12 +51,39 @@ def same_origin(request: Request):
         raise AppError("origin_rejected", "A same-origin request is required.", 403)
 
 
+def safe_return_path(path: str) -> str:
+    """Return ``path`` if it is a local relative path, else raise InvalidReturnPath.
+
+    Browsers normalize backslashes, controls and encoded path separators in ways
+    that can turn apparent relative paths into cross-origin redirects.
+    """
+    if not isinstance(path, str):
+        raise InvalidReturnPath("invalid_return_path")
+    decoded = path
+    for _ in range(3):
+        decoded = unquote(decoded)
+    if (
+        not path.startswith("/")
+        or path.startswith("//")
+        or not decoded.startswith("/")
+        or decoded.startswith("//")
+        or "\\" in decoded
+        or any(ord(c) < 32 or ord(c) == 127 for c in decoded)
+        or urlsplit(path).scheme
+        or urlsplit(path).netloc
+        or len(path) > 2048
+    ):
+        raise InvalidReturnPath("invalid_return_path")
+    return path
+
+
 def authenticate(conn, request: Request, mutation: bool = False):
     """Return (principal, session) under the transaction's authorization guard.
 
     Keep this transaction open through protected reads or mutation commit. A
     mutation guard serializes identity revocation and grant publication; no age test
-    is applied to successfully verified cached directory evidence.
+    is applied to successfully verified cached directory evidence. A session is
+    valid until its absolute deadline; there is no idle timeout (REV-73).
     """
     if mutation:
         _guard(conn)
@@ -63,7 +96,7 @@ def authenticate(conn, request: Request, mutation: bool = False):
                   p.super_admin,p.evidence_generation,p.verified_at
            FROM auth_sessions s JOIN principals p ON p.id=s.principal_id
            WHERE s.handle_hash=%s AND s.revoked_at IS NULL AND s.absolute_at>clock_timestamp()
-           AND s.activity_at>clock_timestamp()-interval '30 minutes' AND s.deployment_epoch=%s""",
+           AND s.deployment_epoch=%s""",
         (_hash(handle), request.app.state.settings.deployment_epoch),
     ).fetchone()
     if not row or not row["eligible"] or row["deleted"] or row["kind"] != "user":
@@ -97,131 +130,6 @@ def authenticate(conn, request: Request, mutation: bool = False):
     return principal, row
 
 
-def oidc_client(request: Request) -> OIDCClient:
-    if getattr(request.app.state, "oidc", None) is not None:
-        return request.app.state.oidc
-    settings = request.app.state.settings
-    fields = (
-        "oidc_issuer",
-        "oidc_client_secret",
-        "oidc_directory_source",
-        "oidc_directory_id_claim",
-        "oidc_directory_scope",
-        "oidc_required_acr",
-        "oidc_required_amr",
-    )
-    if not all(getattr(settings, field, None) for field in fields):
-        raise unavailable("oidc_configuration_required")
-    try:
-        config = OIDCConfig(
-            settings.oidc_issuer,
-            settings.oidc_client_id,
-            settings.oidc_client_secret.get_secret_value(),
-            settings.public_origin + "/auth/callback",
-            settings.public_origin + "/signed-out",
-            settings.oidc_directory_source,
-            settings.oidc_directory_id_claim,
-            settings.oidc_directory_scope,
-            settings.oidc_required_acr,
-            tuple(settings.oidc_required_amr),
-            settings.oidc_ca_file,
-        )
-        request.app.state.oidc = OIDCClient(config)
-    except ValueError:
-        raise unavailable("oidc_configuration_invalid") from None
-    return request.app.state.oidc
-
-
-def _protocol_error(exc):
-    if isinstance(exc, OIDCUnavailable):
-        return unavailable("identity_provider_unavailable")
-    return AppError(
-        "authentication_rejected", "The authentication response could not be accepted.", 401
-    )
-
-
 def _cookie(response, name, value):
     response.set_cookie(name, value, secure=True, httponly=True, samesite="lax", path="/")
     response.headers["Cache-Control"] = "private, no-store"
-
-
-async def refresh_session(request: Request):
-    """Claim once, exchange outside locks, atomically persist rotated credentials."""
-
-    def claim_refresh():
-        with request.app.state.db.transaction() as conn:
-            principal, session = authenticate(conn, request)
-            # A worker may die after consuming a rotating provider token. Never
-            # retry its old credential after the bounded exchange lease expires.
-            conn.execute(
-                """UPDATE auth_sessions SET refresh_uncertain=true,refresh_started_at=NULL
-                         WHERE handle_hash=%s AND refresh_started_at<clock_timestamp()-interval '30 seconds'""",
-                (session["handle_hash"],),
-            )
-            claimed = conn.execute(
-                """UPDATE auth_sessions SET refresh_generation=refresh_generation+1,
-                     refresh_started_at=clock_timestamp() WHERE handle_hash=%s AND refresh_uncertain=false
-                     AND refresh_started_at IS NULL AND refresh_at<=clock_timestamp()-interval '4 minutes'
-                     RETURNING refresh_generation""",
-                (session["handle_hash"],),
-            ).fetchone()
-        return principal, session, claimed
-
-    principal, session, claimed = await run_in_threadpool(claim_refresh)
-    if not claimed:
-        return
-    generation, handle_hash = claimed["refresh_generation"], bytes(session["handle_hash"])
-    cipher = request.app.state.settings.cipher()
-    stored = json.loads(
-        cipher.open(bytes(session["tokens"]), "session-tokens:" + handle_hash.hex())
-    )
-    identity = OIDCIdentity(
-        session["issuer"],
-        session["subject"],
-        session["provider_sid"],
-        principal["directory_source"],
-        principal["object_id"],
-        int(session["auth_time"].timestamp()),
-        principal["display_name"],
-    )
-    try:
-        refreshed = await oidc_client(request).refresh(stored["refresh_token"], identity)
-    except (OIDCInvalid, OIDCUnavailable, AppError) as exc:
-
-        def record_refresh_failure(failure=exc):
-            with request.app.state.db.transaction() as conn:
-                _guard(conn, exclusive=True)
-                if isinstance(failure, (OIDCRevoked, OIDCInvalid)):
-                    conn.execute(
-                        """UPDATE auth_sessions SET revoked_at=clock_timestamp(),tokens=NULL,
-                                 refresh_started_at=NULL WHERE handle_hash=%s AND refresh_generation=%s""",
-                        (handle_hash, generation),
-                    )
-                else:
-                    conn.execute(
-                        """UPDATE auth_sessions SET refresh_uncertain=true,refresh_started_at=NULL
-                                 WHERE handle_hash=%s AND refresh_generation=%s""",
-                        (handle_hash, generation),
-                    )
-
-        await run_in_threadpool(record_refresh_failure)
-        return
-
-    def persist_refresh():
-        with request.app.state.db.transaction() as conn:
-            _guard(conn)
-            conn.execute(
-                """UPDATE auth_sessions SET tokens=%s,refresh_at=clock_timestamp(),refresh_started_at=NULL
-                         WHERE handle_hash=%s AND refresh_generation=%s AND revoked_at IS NULL
-                         AND absolute_at>clock_timestamp() AND deployment_epoch=%s""",
-                (
-                    cipher.seal(
-                        json.dumps(refreshed.tokens).encode(), "session-tokens:" + handle_hash.hex()
-                    ),
-                    handle_hash,
-                    generation,
-                    request.app.state.settings.deployment_epoch,
-                ),
-            )
-
-    await run_in_threadpool(persist_refresh)

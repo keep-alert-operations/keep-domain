@@ -49,12 +49,11 @@ version = "1.8.0"
 description = "The ultimate Python library in building OAuth and OpenID Connect servers and clients."
 optional = false
 python-versions = ">=3.10"
-groups = ["main", "lock-constraints"]
+groups = ["lock-constraints"]
 files = [
     {file = "authlib-1.8.0-py2.py3-none-any.whl", hash = "sha256:88aebbd9af6757e14e912d5dc007ae1dc1f3e27e3b2152ce7c552ee2c3b3c121"},
     {file = "authlib-1.8.0.tar.gz", hash = "sha256:f3ecd5f1da737262fb53bf1a4d95c4ea1ad9dd509316587a255c99ab1838a4f0"},
 ]
-markers = {main = "extra == \"runtime\""}
 
 [package.dependencies]
 cryptography = ">=45.0.1"
@@ -677,12 +676,11 @@ version = "1.7.5"
 description = "The ultimate Python library for JOSE RFCs, including JWS, JWE, JWK, JWA, JWT"
 optional = false
 python-versions = ">=3.10"
-groups = ["main", "lock-constraints"]
+groups = ["lock-constraints"]
 files = [
     {file = "joserfc-1.7.5-py3-none-any.whl", hash = "sha256:add2c2c84e8373b084d526a8b53daba5d7a513a118cd2dcd9fc9f979d0922159"},
     {file = "joserfc-1.7.5.tar.gz", hash = "sha256:d5ff536e658e17664f8c1b1ab60dc4aa62aa973fcef1edd33cc44bda45d6f5ea"},
 ]
-markers = {main = "extra == \"runtime\""}
 
 [package.dependencies]
 cryptography = ">=45.0.1"
@@ -1418,9 +1416,9 @@ h11 = ">=0.8"
 standard = ["httptools (>=0.8.0)", "python-dotenv (>=0.13)", "pyyaml (>=5.1)", "uvloop (>=0.15.1) ; sys_platform != \"win32\" and sys_platform != \"cygwin\" and platform_python_implementation != \"PyPy\"", "watchfiles (>=0.20)", "websockets (>=13.0)"]
 
 [extras]
-runtime = ["authlib", "cel-expr-python", "confluent-kafka", "elasticsearch", "ldap3", "protobuf", "psycopg", "redis", "tzdata"]
+runtime = ["cel-expr-python", "confluent-kafka", "elasticsearch", "ldap3", "protobuf", "psycopg", "redis", "tzdata"]
 
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13,<3.14"
-content-hash = "17cf00ca19eda5b9979a24c11747bd286685c3e734e941b05d4183920aaaa0c8"
+content-hash = "c5d230d5af331f7a066ffac5f415b2c3cdd3c2103e8477f9ed1750d0054e7196"

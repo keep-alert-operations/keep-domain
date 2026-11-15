@@ -32,11 +32,7 @@ FAMILIES = {
     "operator-credentials": Family(
         "operator_credentials", "id", "ciphertext", "operator-key:", context=("operator_id",)
     ),
-    "session-tokens": Family("auth_sessions", "handle_hash", "tokens", "session-tokens:", True),
     "session-csrf": Family("auth_sessions", "handle_hash", "csrf_cipher", "session-csrf:", True),
-    "login-transactions": Family(
-        "login_transactions", "state_hash", "encrypted_state", "login:", True
-    ),
     "ingest-receipts": Family("ingest_requests", "id", "response_cipher", "receipt:"),
 }
 

@@ -77,9 +77,8 @@ def begin_restore(db, *, run_id, previous_epoch, deployment_epoch, operation_ref
             "UPDATE capability_gates SET ready=false,reason='restore_reconciliation_required'"
         )
         conn.execute(
-            "UPDATE auth_sessions SET revoked_at=coalesce(revoked_at,clock_timestamp()),tokens=NULL,refresh_generation=refresh_generation+1,refresh_started_at=NULL"
+            "UPDATE auth_sessions SET revoked_at=coalesce(revoked_at,clock_timestamp())"
         )
-        conn.execute("DELETE FROM login_transactions")
         return row
 
 

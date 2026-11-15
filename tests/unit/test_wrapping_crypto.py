@@ -34,17 +34,17 @@ def test_rewrap_preserves_payload_and_secret_with_old_version_overlap():
 @pytest.mark.parametrize("method", ["open", "rewrap"])
 def test_wrong_aad_and_tampered_payload_are_rejected_even_with_current_key(method):
     cipher = EnvelopeCipher({"current": b"b" * 32}, "current")
-    sealed = cipher.seal(b"refresh-token", "session-tokens:abc")
+    sealed = cipher.seal(b"csrf-token", "session-csrf:abc")
     with pytest.raises(ValueError):
-        getattr(cipher, method)(sealed, "session-csrf:abc")
+        getattr(cipher, method)(sealed, "receipt:abc")
     with pytest.raises(ValueError):
-        getattr(cipher, method)(sealed, "session-tokens:def")
+        getattr(cipher, method)(sealed, "session-csrf:def")
     envelope = json.loads(sealed)
     ciphertext = bytearray(base64.urlsafe_b64decode(envelope["data"]))
     ciphertext[0] ^= 1
     envelope["data"] = base64.urlsafe_b64encode(ciphertext).decode()
     with pytest.raises(ValueError):
-        getattr(cipher, method)(json.dumps(envelope).encode(), "session-tokens:abc")
+        getattr(cipher, method)(json.dumps(envelope).encode(), "session-csrf:abc")
 
 
 @pytest.mark.parametrize(
@@ -120,7 +120,13 @@ def test_supplied_purpose_keys_keep_legacy_overlap_and_use_distinct_active_ids()
     assert json.loads(cipher.seal(b"key", "operator-key:a:b:1"))["kid"] == "legacy"
     with pytest.raises(ValueError):
         cipher.open(wrapped, "cursor:abc")
-    for purpose, kid in (("typo-cursor", "cursor-v2"), ("cursor", "missing")):
+    # REV-73 removed the provider-token and login-transaction purposes.
+    for purpose, kid in (
+        ("typo-cursor", "cursor-v2"),
+        ("cursor", "missing"),
+        ("session-tokens", "cursor-v2"),
+        ("login", "cursor-v2"),
+    ):
         ring["purposes"] = {purpose: kid}
         with pytest.raises(ValueError):
             EnvelopeCipher.from_keyring(json.dumps(ring))

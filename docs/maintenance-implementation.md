@@ -155,7 +155,7 @@ inactivity and real projection publication. The existing ingestion/product/
 inactivity/security regression suite also passed 21 tests; one OS temporary-folder
 permission failure was rerun successfully using a workspace test directory.
 Identity, timestamps, recovery storage and publisher callbacks are controlled
-fixtures; they do not qualify deployed OIDC, LDAP, storage or the shared worker.
+fixtures; they do not qualify deployed sign-in, LDAP, ADAPI, storage or the shared worker.
 
 After adding input-head warmup and protected-delete rechecks, the targeted real
 PostgreSQL regression passed 40 tests: 3 warmup, 15 maintenance CRUD, 14 temporal
