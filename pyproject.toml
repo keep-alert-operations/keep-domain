@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Shared transactional business rules, CEL semantics, authorization primitives and recovery fences."
 requires-python = ">=3.13,<3.14"
 dependencies = [
-  "keep-contracts @ git+https://github.com/keep-alert-operations/keep-contracts.git@4ba0682dce4da0c4bd2860d99b28a8528a007816",
+  "keep-contracts @ git+https://github.com/keep-alert-operations/keep-contracts.git@89adb3791ba83bb98eceb52b189319edb2749743",
   "fastapi>=0.115,<1",
   "pydantic-settings>=2.8,<3",
   "cryptography>=44,<47",

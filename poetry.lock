@@ -704,8 +704,8 @@ pydantic = ">=2.8,<3"
 [package.source]
 type = "git"
 url = "https://github.com/keep-alert-operations/keep-contracts.git"
-reference = "4ba0682dce4da0c4bd2860d99b28a8528a007816"
-resolved_reference = "4ba0682dce4da0c4bd2860d99b28a8528a007816"
+reference = "89adb3791ba83bb98eceb52b189319edb2749743"
+resolved_reference = "89adb3791ba83bb98eceb52b189319edb2749743"
 
 [[package]]
 name = "ldap3"
@@ -1438,4 +1438,4 @@ runtime = ["cel-expr-python", "confluent-kafka", "elasticsearch", "ldap3", "prot
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13,<3.14"
-content-hash = "c5715f8695d18770f8f9e9407fda60eb98c61c721fd0c87b6ba4086bedfe76db"
+content-hash = "caa94d090cc7f0ceb77c16950c612edf58f7a261a772ef4fd07b08536c7c190f"
