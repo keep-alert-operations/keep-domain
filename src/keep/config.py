@@ -22,18 +22,24 @@ class Settings(BaseSettings):
     pool_size: int = 4
     role: str = "product-api"
     capacity_profile: Path | None = None
-    oidc_issuer: str | None = None
-    oidc_client_id: str = "keep-web"
-    oidc_client_secret: SecretStr | None = None
+    # REV-73: the samAccountName of the AD group whose eligible members are global
+    # super-admins. The Product API and the directory refresh command read this one
+    # setting; it is stored lowercased, like every ADAPI principal key.
     superadmin_group: str | None = None
-    directory_config: Path | None = None
-    directory_search_profile: Path | None = None
-    oidc_directory_source: str | None = None
-    oidc_directory_id_claim: str | None = None
-    oidc_directory_scope: str | None = None
-    oidc_required_acr: str | None = None
-    oidc_required_amr: tuple[str, ...] = ()
-    oidc_ca_file: str | None = None
+    # REV-73: password sign-in is one LDAP simple bind as ldap_bind_format with the
+    # typed username (for example "{username}@corp.example"); encryption is a setting,
+    # off for now on the private network. Keep runs no LDAP searches.
+    ldap_host: str | None = None
+    ldap_port: int = 389
+    ldap_use_tls: bool = False
+    ldap_ca_file: Path | None = None
+    ldap_bind_format: str | None = None
+    # REV-73: ADAPI, the company AD REST API, supplies people and groups. The ClientId
+    # header value is a deployment secret, never logged or returned.
+    adapi_url: str | None = None
+    adapi_client_id: SecretStr | None = None
+    adapi_lookup_batch: int = 50
+    adapi_search_cache_ttl_seconds: int = 7200
     elasticsearch_url: str | None = None
     elasticsearch_index: str = "keep-development-alerts"
     elasticsearch_api_key: SecretStr | None = None
@@ -88,8 +94,34 @@ class Settings(BaseSettings):
             raise ValueError("Ingress requires Kafka and the immutable Global tenant ID")
         if not ingress and not self.database_url:
             raise ValueError("This workload requires PostgreSQL")
-        if self.directory_search_profile and not self.directory_config:
-            raise ValueError("Directory search requires the explicit LDAP configuration")
+        if self.superadmin_group is not None:
+            group = self.superadmin_group.strip()
+            if not group:
+                raise ValueError("The super-admin group must name a samAccountName")
+            self.superadmin_group = group.lower()
+        if self.ldap_bind_format is not None and (
+            self.ldap_bind_format.count("{username}") != 1
+            or self.ldap_bind_format.replace("{username}", "").count("{")
+            or self.ldap_bind_format.replace("{username}", "").count("}")
+        ):
+            raise ValueError("The LDAP bind format must contain {username} exactly once")
+        if not 1 <= self.ldap_port <= 65535:
+            raise ValueError("The LDAP port must be a TCP port")
+        if self.adapi_url is not None:
+            parsed = urlsplit(self.adapi_url)
+            if (
+                parsed.scheme not in ("http", "https")
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError("ADAPI requires an explicit origin without embedded secrets")
+        if not 1 <= self.adapi_lookup_batch <= 200:
+            raise ValueError("The ADAPI lookup batch must be between 1 and 200 names")
+        if not 1 <= self.adapi_search_cache_ttl_seconds <= 86400:
+            raise ValueError("The ADAPI search cache TTL must be between 1 s and 1 day")
         if not self.public_origin.startswith("https://"):
             raise ValueError("The browser origin must use HTTPS")
         if not 1 <= self.pool_size <= 32:

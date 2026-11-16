@@ -19,14 +19,14 @@ def test_keyring_settings_accept_overlap_and_reload_atomic_file_rotation(tmp_pat
     path = tmp_path / "keyring.json"
     path.write_text(json.dumps({"current": "old", "keys": {"old": old}}), encoding="utf-8")
     settings = configuration(wrapping_keyring=path)
-    ciphertext = settings.cipher().seal(b"synthetic", "login:test")
+    ciphertext = settings.cipher().seal(b"synthetic", "session-csrf:test")
     replacement = tmp_path / "replacement.json"
     replacement.write_text(
         json.dumps({"current": "new", "keys": {"old": old, "new": new}}), encoding="utf-8"
     )
     replacement.replace(path)
     cipher = settings.cipher()
-    assert cipher.current == "new" and cipher.open(ciphertext, "login:test") == b"synthetic"
+    assert cipher.current == "new" and cipher.open(ciphertext, "session-csrf:test") == b"synthetic"
     assert old not in repr(settings) and new not in repr(settings)
     with pytest.raises(ValidationError, match="exactly one"):
         configuration(wrapping_keyring=path, wrapping_key=old)

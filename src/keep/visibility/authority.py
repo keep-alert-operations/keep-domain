@@ -5,7 +5,7 @@ can retain the returned server-only token and recheck in a later transaction.
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from hashlib import sha256
 import re
 from uuid import UUID
@@ -16,7 +16,8 @@ from keep.shared.errors import unavailable
 from keep.shared.transactions import coordinator
 from keep.serialization import wire
 
-SCHEMA = "keep-visibility-authority-v1"
+# v2 (REV-73): sessions bind on handle, sign-in time and absolute deadline only.
+SCHEMA = "keep-visibility-authority-v2"
 
 
 @dataclass(frozen=True)
@@ -42,15 +43,12 @@ def _binding(principal, session):
         canonical(
             wire(
                 [
-                    "keep-visibility-session-binding-v1",
+                    "keep-visibility-session-binding-v2",
                     bytes(session["handle_hash"]).hex(),
                     principal["id"],
                     principal["directory_source"],
                     principal["object_id"],
                     session["principal_id"],
-                    session["issuer"],
-                    session["subject"],
-                    session["provider_sid"],
                     session["auth_time"],
                     session["absolute_at"],
                     session["deployment_epoch"],
@@ -76,7 +74,8 @@ def capture_authority(conn, *, tenant, principal, session, role, now):
     fences = _fences(conn, tenant)
     if not fences or not fences["human_auth_ready"]:
         raise unavailable("human_authorization_gated")
-    bound = min(session["absolute_at"], session["activity_at"] + timedelta(minutes=30))
+    # REV-73: a session has no idle timeout; its absolute deadline bounds authority.
+    bound = session["absolute_at"]
     if now >= bound:
         raise unavailable("visibility_session_boundary_unproven")
     return wire(
@@ -87,7 +86,6 @@ def capture_authority(conn, *, tenant, principal, session, role, now):
             "role": role,
             "super_admin": principal["super_admin"],
             "session_authorized_until": bound,
-            "session_activity_at": session["activity_at"],
             "session_absolute_at": session["absolute_at"],
             "session_binding_digest": _binding(principal, session),
             "captured_at": now,
@@ -150,7 +148,6 @@ def prove_authority(conn, *, tenant, input_id, view_id, view_epoch):
             )
         }
         captured_at = _time(authority["captured_at"])
-        original_activity = _time(authority["session_activity_at"])
         original_absolute = _time(authority["session_absolute_at"])
         original_bound = _time(authority["session_authorized_until"])
         valid_shape = (
@@ -162,7 +159,7 @@ def prove_authority(conn, *, tenant, input_id, view_id, view_epoch):
             and authority["role"] in {"view", "edit", "admin"}
             and re.fullmatch(r"[0-9a-f]{64}", authority["session_binding_digest"])
             and captured_at == row["recorded_at"]
-            and original_bound == min(original_absolute, original_activity + timedelta(minutes=30))
+            and original_bound == original_absolute
         )
     except (KeyError, ValueError, TypeError, OverflowError):
         return AuthorityProof(False, "authority_snapshot_invalid")
@@ -212,14 +209,9 @@ def prove_authority(conn, *, tenant, input_id, view_id, view_epoch):
         or session["deployment_epoch"] != row["deployment_epoch"]
         or _binding(principal, session) != authority["session_binding_digest"]
         or session["absolute_at"] != original_absolute
-        or session["activity_at"] < original_activity
     ):
         return AuthorityProof(False, "authority_session_binding_changed")
-    if (
-        session["revoked_at"] is not None
-        or now >= session["absolute_at"]
-        or now >= session["activity_at"] + timedelta(minutes=30)
-    ):
+    if session["revoked_at"] is not None or now >= session["absolute_at"]:
         return AuthorityProof(False, "authority_session_no_longer_valid")
     if effective_role(conn, principal, tenant) != authority["role"]:
         return AuthorityProof(False, "authority_effective_role_changed")

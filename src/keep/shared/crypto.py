@@ -10,9 +10,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 PURPOSES = frozenset(
     {
         "operator-key",
-        "session-tokens",
         "session-csrf",
-        "login",
         "receipt",
         "cursor",
         "search-cursor",

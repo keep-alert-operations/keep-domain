@@ -1,13 +1,23 @@
+"""Directory verification: completeness, fences and structured failure reasons.
+
+Requirements: REV-73; identity configuration 7, 9; worker scope 4.
+"""
+
 from datetime import UTC, datetime
 
 import pytest
 
 from keep.identity.directory import (
+    FAILURE_DEADLINE,
+    FAILURE_TOO_LARGE,
+    FAILURE_UNAVAILABLE,
     AcceptedDirectory,
+    DirectoryEvidence,
     DirectoryObject,
     DirectoryUnavailable,
     DirectoryVerifier,
     PrincipalKey,
+    failure_reason,
 )
 
 
@@ -124,3 +134,51 @@ def test_allocation_and_deadline_are_partial_not_empty_success():
     evidence = DirectoryVerifier(reader, monotonic=lambda: next(ticks)).verify([key("root")], 2)
     assert not evidence.complete
     assert evidence.memberships == {}
+
+
+def test_failures_carry_structured_reasons_without_exception_text():
+    reader = Reader()
+    reader.fail.add(key("a"))
+    evidence = DirectoryVerifier(reader).verify([key("root")], 1)
+    assert evidence.failure_reason == FAILURE_UNAVAILABLE
+    assert set(evidence.failures) == {FAILURE_UNAVAILABLE}
+    assert "secret" not in repr(evidence.failures)
+    too_large = DirectoryVerifier(Reader(), max_objects=2).verify([key("root")], 2)
+    assert too_large.failure_reason == FAILURE_TOO_LARGE
+    ticks = iter([0, 61])
+    late = DirectoryVerifier(Reader(), monotonic=lambda: next(ticks)).verify([key("root")], 3)
+    assert late.failure_reason == FAILURE_DEADLINE
+    assert DirectoryVerifier(Reader()).verify([key("root")], 4).failure_reason is None
+
+
+def test_a_call_timeout_is_a_deadline_not_an_outage():
+    """A call past its timeout didn't fit; an inline save hands it to the background.
+
+    Requirements: REV-73; tenant access 5 (inline save); plan A22.
+    """
+    assert failure_reason(DirectoryUnavailable("directory_timeout")) == FAILURE_DEADLINE
+    assert failure_reason(DirectoryUnavailable("directory_deadline")) == FAILURE_DEADLINE
+    for code in ("directory_status_rejected", "directory_transport_failure", "other"):
+        assert failure_reason(DirectoryUnavailable(code)) == FAILURE_UNAVAILABLE
+
+
+def test_deadline_inside_members_is_a_deadline_failure():
+    reader = Reader()
+    # start, loop check before the root, then the first member's check: past 7 s.
+    ticks = iter([0, 0, 8])
+    evidence = DirectoryVerifier(
+        reader, deadline_seconds=7, monotonic=lambda: next(ticks, 8)
+    ).verify([key("root")], 1)
+    assert not evidence.complete and evidence.failure_reason == FAILURE_DEADLINE
+    assert evidence.failures == (FAILURE_DEADLINE,) and evidence.edges == {}
+
+
+def test_failed_evidence_publishes_no_fact():
+    started = datetime.now(UTC)
+    evidence = DirectoryEvidence.failed("company", 5, [key("root")], started, FAILURE_TOO_LARGE)
+    assert not evidence.complete and evidence.objects == {} and evidence.negative_keys == set()
+    assert (
+        evidence.failures == (FAILURE_TOO_LARGE,) and evidence.failure_reason == FAILURE_TOO_LARGE
+    )
+    with pytest.raises(ValueError):
+        DirectoryEvidence.failed("company", 5, [key("root")], started, "anything else")

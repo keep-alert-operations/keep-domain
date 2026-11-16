@@ -1,4 +1,4 @@
-"""Trusted directory evidence and backend-only OIDC protocol adapters."""
+"""Trusted directory evidence from ADAPI, its publication and local sessions (REV-73)."""
 
 from .directory import DirectoryEvidence, DirectoryObject, DirectoryVerifier, PrincipalKey
 

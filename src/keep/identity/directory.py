@@ -1,7 +1,9 @@
-"""Complete directory traversal, independent of persistence and LDAP schema.
+"""Complete directory traversal, independent of persistence and directory vendor.
 
 The caller allocates generations before starting work and publishes under the
 authorization guard. Failure never turns an incomplete roster into an empty one.
+
+Requirements: REV-73; identity configuration 6-7; worker scope 4.
 """
 
 from __future__ import annotations
@@ -16,7 +18,34 @@ from typing import Callable, Iterable, Literal, Protocol
 
 
 class DirectoryUnavailable(Exception):
-    """No complete, authoritative answer is available (safe to expose as 503)."""
+    """No complete, authoritative answer is available (safe to expose as 503).
+
+    The single argument is a fixed reason code, never upstream text.
+    """
+
+
+# Structured failure reasons (REV-73), the values allowed in
+# directory_verification_requests.last_failure. The verifier reports the first
+# three; publication callers assign FAILURE_BUSY after two fence rejections.
+FAILURE_UNAVAILABLE = "directory_unavailable"
+FAILURE_TOO_LARGE = "directory_group_too_large"
+FAILURE_DEADLINE = "directory_verification_deadline"
+FAILURE_BUSY = "directory_busy"
+FAILURE_REASONS = (FAILURE_UNAVAILABLE, FAILURE_TOO_LARGE, FAILURE_DEADLINE, FAILURE_BUSY)
+_TOO_LARGE_CODES = frozenset({"directory_allocation_exceeded"})
+# A call that outlasts its timeout didn't fit the time it had: an inline save hands it to
+# the background saver (longer per-call cap) instead of reporting an outage.
+_DEADLINE_CODES = frozenset({"verification_deadline", "directory_deadline", "directory_timeout"})
+
+
+def failure_reason(exc: DirectoryUnavailable) -> str:
+    """Map a DirectoryUnavailable to its structured reason, never its text."""
+    code = exc.args[0] if exc.args else None
+    if code in _TOO_LARGE_CODES:
+        return FAILURE_TOO_LARGE
+    if code in _DEADLINE_CODES:
+        return FAILURE_DEADLINE
+    return FAILURE_UNAVAILABLE
 
 
 @dataclass(frozen=True, order=True)
@@ -66,18 +95,53 @@ class DirectoryEvidence:
     failures: tuple[str, ...] = ()
     negative_keys: frozenset[PrincipalKey] = frozenset()
     target_missed: bool = False
+    # The first structured failure (FAILURE_*); None when complete.
+    failure_reason: str | None = None
+
+    @classmethod
+    def failed(
+        cls,
+        source: str,
+        generation: int,
+        roots: Iterable[PrincipalKey],
+        started_at: datetime,
+        reason: str = FAILURE_UNAVAILABLE,
+    ) -> DirectoryEvidence:
+        """Incomplete evidence that read nothing (publishes no fact, only the attempt)."""
+        if reason not in FAILURE_REASONS:
+            raise ValueError("unknown directory failure reason")
+        return cls(
+            source,
+            generation,
+            started_at,
+            datetime.now(UTC),
+            frozenset(roots),
+            {},
+            {},
+            {},
+            False,
+            (reason,),
+            failure_reason=reason,
+        )
 
     @property
     def semantic_digest(self) -> str:
         if not self.complete:
             raise DirectoryUnavailable("incomplete_directory_evidence")
+        # Sorted in PrincipalKey order through a tuple key: the publisher computes
+        # this under the identity guard, and dataclass comparisons are slow at 10,000.
         data = {
             "objects": [
                 (k.source, k.object_id, v.kind, v.label, v.eligible, v.deleted)
-                for k, v in sorted(self.objects.items())
+                for k, v in sorted(
+                    self.objects.items(), key=lambda item: (item[0].source, item[0].object_id)
+                )
             ],
             "edges": [
-                (k.object_id, sorted(x.object_id for x in v)) for k, v in sorted(self.edges.items())
+                (k.object_id, sorted(x.object_id for x in v))
+                for k, v in sorted(
+                    self.edges.items(), key=lambda item: (item[0].source, item[0].object_id)
+                )
             ],
         }
         return hashlib.sha256(
@@ -86,6 +150,14 @@ class DirectoryEvidence:
 
 
 class DirectoryVerifier:
+    """Traverse roots within an object allocation and the caller's deadline.
+
+    ``deadline_seconds`` is the caller's budget: 7 s for an inline save on pick,
+    ``min(60, remaining - 15)`` in a background save, 60 s in the refresh. A
+    failure is recorded as a structured reason (``failure_reason``), never as
+    exception text.
+    """
+
     def __init__(
         self,
         reader: DirectoryReader,
@@ -114,7 +186,7 @@ class DirectoryVerifier:
             raise ValueError("directory coverage exceeds configured allocation")
         while pending:
             if self.monotonic() - start_tick >= self.deadline:
-                failures.append("verification_deadline")
+                failures.append(FAILURE_DEADLINE)
                 break
             key = pending.popleft()
             try:
@@ -138,9 +210,9 @@ class DirectoryVerifier:
                     edges[key] = frozenset(members)
                     pending.extend(sorted(unseen))
                     scheduled.update(unseen)
-            except DirectoryUnavailable:
-                # Never include exception text: LDAP errors may contain raw DNs/profiles.
-                failures.append("directory_verification_incomplete")
+            except DirectoryUnavailable as exc:
+                # Never include exception text: directory errors may name people.
+                failures.append(failure_reason(exc))
         ended = self.clock()
         missed = (ended - started).total_seconds() > 60
         complete = not failures
@@ -175,6 +247,7 @@ class DirectoryVerifier:
             tuple(failures),
             negatives,
             missed,
+            failures[0] if failures else None,
         )
 
 
