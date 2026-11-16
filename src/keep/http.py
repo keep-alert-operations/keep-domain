@@ -10,6 +10,7 @@ from keep.ingestion.native import parse_json
 from keep.shared.errors import AppError, unavailable
 from keep.request_budget import request_budget
 from keep.configuration.images import MAX_BYTES as IMAGE_LIMIT, MEDIA_TYPES as IMAGE_TYPES
+from keep.observability import http as observe
 
 
 def is_image_read(path):
@@ -62,6 +63,9 @@ def create_http_app(lifespan, *, product=False):
     app.state.clock_evidence = ClockEvidenceCache()
 
     def error_response(request, error):
+        # Every error envelope is built here, so this one line records every
+        # current and future error code for the request's log record and metrics.
+        request.state.error_code = error.code
         content = {
             "code": error.code,
             "message": error.message,
@@ -127,54 +131,74 @@ def create_http_app(lifespan, *, product=False):
     async def protocol(request, call_next):
         request.state.request_id = str(uuid4())
         request.state.received_at = datetime.now(UTC)
+        # One log record and one set of metrics per request (REV-74). A status
+        # still unset at the end means the caller left before a response existed.
+        observed = observe.started(request)
+        status = None
         try:
-            seconds = (
-                5
-                if "/ingest/" in request.url.path
-                else 100
-                if "/operators" in request.url.path and request.method != "GET"
-                else 10
+            with observe.bound(request):
+                try:
+                    seconds = (
+                        5
+                        if "/ingest/" in request.url.path
+                        else 100
+                        if "/operators" in request.url.path and request.method != "GET"
+                        else 10
+                    )
+                    with request_budget(seconds):
+                        async with asyncio.timeout(seconds):
+                            response = await handle(request, call_next)
+                except TimeoutError:
+                    response = error_response(
+                        request,
+                        unavailable(
+                            "ingress_timeout"
+                            if "/ingest/" in request.url.path
+                            else "request_timeout"
+                        ),
+                    )
+                except AppError as error:
+                    response = error_response(request, error)
+            response.headers.update(
+                {
+                    "Cache-Control": (
+                        "private, no-store, no-transform"
+                        if response.headers.get("content-type", "").split(";")[0]
+                        == "text/event-stream"
+                        # Served dashboard images revalidate with their ETag on every
+                        # view, so access is still checked each time (REV-62).
+                        else "private, no-cache"
+                        if request.method == "GET"
+                        and response.status_code in (200, 304)
+                        and is_image_read(request.url.path)
+                        else "private, no-store"
+                    ),
+                    "X-Content-Type-Options": "nosniff",
+                    "Referrer-Policy": "no-referrer",
+                    "X-Request-ID": request.state.request_id,
+                }
             )
-            with request_budget(seconds):
-                async with asyncio.timeout(seconds):
-                    response = await handle(request, call_next)
-        except TimeoutError:
-            response = error_response(
-                request,
-                unavailable(
-                    "ingress_timeout" if "/ingest/" in request.url.path else "request_timeout"
-                ),
-            )
-        except AppError as error:
-            response = error_response(request, error)
-        response.headers.update(
-            {
-                "Cache-Control": (
-                    "private, no-store, no-transform"
-                    if response.headers.get("content-type", "").split(";")[0] == "text/event-stream"
-                    # Served dashboard images revalidate with their ETag on every
-                    # view, so access is still checked each time (REV-62).
-                    else "private, no-cache"
-                    if request.method == "GET"
-                    and response.status_code in (200, 304)
-                    and is_image_read(request.url.path)
-                    else "private, no-store"
-                ),
-                "X-Content-Type-Options": "nosniff",
-                "Referrer-Policy": "no-referrer",
-                "X-Request-ID": request.state.request_id,
-            }
-        )
-        return response
+            status = response.status_code
+            return response
+        except Exception as error:
+            # Answered 500 internal_error by the handler above; recorded here,
+            # where the request is known, with class and stack but never its text.
+            observe.unhandled(request, error)
+            raise
+        finally:
+            observe.finished(request, observed, status)
 
     async def handle(request, call_next):
         from keep.workload import permits_http
 
         if not permits_http(request.app.state.settings, request.url.path):
             raise AppError("not_found", "Resource unavailable.", 404)
+        # Monitoring events change no Keep data, so an unhealthy clock does not
+        # refuse them (observability 9).
         if "/ingest/" in request.url.path or (
             request.method in ("POST", "PUT", "PATCH", "DELETE")
             and request.url.path.startswith("/api/")
+            and request.url.path != "/api/rum-events"
         ):
             from keep.clock_health import require_clock_health
 
@@ -235,6 +259,7 @@ def create_http_app(lifespan, *, product=False):
                     raise AppError("body_too_large", "Request body exceeds its size limit.", 413)
                 chunks.append(chunk)
             request._body = b"".join(chunks)
+            request.state.body_bytes = size
             request.state.receipt_started = monotonic()
             # Validated once here; handlers reuse the value instead of parsing again.
             if not upload:

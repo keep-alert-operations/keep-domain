@@ -14,6 +14,7 @@ from psycopg.types.json import Jsonb
 
 from keep.alerts.dismissal import correlation_suppressed, dismissal_recorded
 from keep.cel.catalog import CORRELATION_FIELDS as RULE_FIELDS, alert_name
+from keep.observability import alert_fields, flow as alert_flow
 from keep.shared.errors import AppError, unavailable
 from keep.shared.transactions import coordinator
 from keep.serialization import wire
@@ -814,6 +815,15 @@ def _commit_decision(conn, prepared, decision, position, alerts):
     )
     if new:
         update_tokens(conn, tenant, incident)
+    for alert_id in decision.attachment_ids:
+        # Held by the flow of the change being correlated; written after commit.
+        alert_flow.note(
+            "alert_incident_attached",
+            alert=alert_fields(alerts[alert_id], alert_id=alert_id),
+            incident_id=incident,
+            rule_id=row["id"],
+            outcome="incident_created" if new else "incident_existing",
+        )
     return incident
 
 

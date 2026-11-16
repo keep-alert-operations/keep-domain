@@ -5,17 +5,55 @@ import json
 import logging
 import signal
 from threading import Event
+from time import monotonic
 
 from keep.alert_notifications import configure
 from keep.clock_health import ClockEvidenceCache, require_clock_health
 from keep.config import Settings
 from keep.db import Database
+from keep.observability import Repeats, configure_logging, log_event, start_metrics_server
+from keep.observability.logs import SERVICES
+from keep.observability.metrics import counter, gauge, histogram
 from keep.visibility.runtime import capture_profile
 from keep.worker_health import WorkerHealth
 
 log = logging.getLogger(__name__)
 IDLE_WAIT_SECONDS = 0.01
 MAX_IDLE_WAIT_SECONDS = 1.0
+
+# REV-74, observability 7: what every worker's loop reports about itself.
+TURNS = counter("keep_worker_turns_total", "Worker loop turns.", ("role", "outcome"))
+TURN_SECONDS = histogram("keep_worker_turn_seconds", "Duration of one worker turn.", ("role",))
+LAST_TURN = gauge(
+    "keep_worker_last_turn_timestamp_seconds", "When the last turn finished.", ("role",)
+)
+READY = gauge("keep_worker_ready", "1 while the worker reports ready.", ("role",))
+DRAINING = gauge("keep_worker_draining", "1 while the worker is draining.", ("role",))
+FAILURES = counter(
+    "keep_worker_capability_failures_total",
+    "Failed worker turns, by controlled error code.",
+    ("role", "error_code"),
+)
+RESTARTS = counter(
+    "keep_worker_transport_restarts_total", "Kafka clients discarded after a failed turn.", ("role",)
+)
+
+
+def failure_code(error):
+    """The controlled code of a failed turn; a closed set, safe as a metric label."""
+    code = getattr(error, "code", None)
+    if isinstance(code, str) and code.isidentifier():
+        return code
+    module = type(error).__module__
+    for prefix, name in (
+        ("psycopg", "database"),
+        ("confluent_kafka", "kafka"),
+        ("cimpl", "kafka"),
+        ("elastic", "elasticsearch"),
+    ):
+        if module.startswith(prefix):
+            return name
+    return "other"
 
 
 def idle_wait(transport, before_turn):
@@ -36,9 +74,30 @@ def run(role, make_transport, *, before_turn=None, transport_optional=False):
     parser = argparse.ArgumentParser(description=f"Keep {role} worker")
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
+    # Before anything that can fail, so a failed start is recorded too (REV-74).
+    configure_logging(SERVICES.get(role, role), role=role)
+    start_metrics_server()
     settings = Settings(role=role)
     health = WorkerHealth(settings.worker_health_path, role)
     health.publish()
+    repeats = Repeats()
+    reported = None
+
+    def publish_ready(value):
+        nonlocal reported
+        health.publish(ready=value)
+        READY.labels(role).set(1 if value else 0)
+        if value != reported:
+            reported = value
+            log_event(
+                log, "worker_ready_changed", role=role, state="ready" if value else "not_ready"
+            )
+
+    def degraded(event, error):
+        # A persisting condition: recorded when it starts, then once a minute.
+        count = repeats.due(event)
+        if count:
+            log_event(log, event, exc=error, role=role, repeats=count)
     db = Database(
         settings.database_url.get_secret_value(),
         settings.pool_size,
@@ -51,6 +110,7 @@ def run(role, make_transport, *, before_turn=None, transport_optional=False):
     clock_evidence = ClockEvidenceCache()
 
     def stop(*_):
+        # Runs in a signal handler: publish and return; the loop records the stop.
         health.publish(draining=True)
         stopped.set()
 
@@ -62,9 +122,11 @@ def run(role, make_transport, *, before_turn=None, transport_optional=False):
             json.loads(settings.capacity_profile.read_text()) if settings.capacity_profile else None
         )
         capture_profile(profile, deployment_epoch=settings.deployment_epoch)
+        log_event(log, "process_started", role=role)
         while not stopped.is_set():
             progress = 0
             failed = False
+            began = monotonic()
             try:
                 require_clock_health(settings, cache=clock_evidence)
                 transport_failed = False
@@ -72,36 +134,48 @@ def run(role, make_transport, *, before_turn=None, transport_optional=False):
                     if transport is None:
                         transport = make_transport(db, settings, profile)
                     progress = transport.turn()
-                except Exception:
+                    repeats.clear("search_kafka_degraded_reconciliation_active")
+                except Exception as error:
                     if transport is not None:
                         transport.close()
                         transport = None
+                        RESTARTS.labels(role).inc()
                     if not transport_optional:
                         raise
                     transport_failed = True
-                    log.warning("search_kafka_degraded_reconciliation_active")
+                    degraded("search_kafka_degraded_reconciliation_active", error)
                 if before_turn is not None:
                     try:
                         progress += before_turn(db, settings) or 0
-                    except Exception:
+                        repeats.clear("search_reconciliation_degraded_hints_active")
+                    except Exception as error:
                         # Authority scan failure must not prevent independent
                         # Kafka hints from repairing healthy tenants.
                         if transport_failed:
                             raise
-                        log.warning("search_reconciliation_degraded_hints_active")
-                health.publish(ready=True)
-            except Exception:
+                        degraded("search_reconciliation_degraded_hints_active", error)
+                publish_ready(True)
+                repeats.clear("worker_capability_unavailable")
+            except Exception as error:
                 failed = True
                 if transport is not None:
                     try:
                         transport.close()
                     except Exception:
-                        pass
+                        pass  # The client is discarded either way; counted just below.
                     transport = None
-                health.publish(ready=False)
-                log.warning("worker_capability_unavailable")
+                    RESTARTS.labels(role).inc()
+                publish_ready(False)
+                # The class and controlled code of the failure, which this record
+                # used to omit; never the exception's text.
+                FAILURES.labels(role, failure_code(error)).inc()
+                degraded("worker_capability_unavailable", error)
                 if args.once:
                     raise SystemExit(1) from None
+            finally:
+                TURNS.labels(role, "failed" if failed else "progress" if progress else "idle").inc()
+                TURN_SECONDS.labels(role).observe(monotonic() - began)
+                LAST_TURN.labels(role).set_to_current_time()
             if args.once:
                 return
             health.wait(
@@ -109,6 +183,10 @@ def run(role, make_transport, *, before_turn=None, transport_optional=False):
             )
     finally:
         health.publish(draining=True)
+        DRAINING.labels(role).set(1)
+        log_event(
+            log, "process_stopping", role=role, reason="signal" if stopped.is_set() else "exit"
+        )
         try:
             if transport is not None:
                 transport.close()

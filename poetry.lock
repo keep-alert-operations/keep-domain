@@ -704,8 +704,8 @@ pydantic = ">=2.8,<3"
 [package.source]
 type = "git"
 url = "https://github.com/keep-alert-operations/keep-contracts.git"
-reference = "4ba0682dce4da0c4bd2860d99b28a8528a007816"
-resolved_reference = "4ba0682dce4da0c4bd2860d99b28a8528a007816"
+reference = "89adb3791ba83bb98eceb52b189319edb2749743"
+resolved_reference = "89adb3791ba83bb98eceb52b189319edb2749743"
 
 [[package]]
 name = "ldap3"
@@ -787,6 +787,23 @@ files = [
 [package.extras]
 dev = ["pre-commit", "tox"]
 testing = ["coverage", "pytest", "pytest-benchmark"]
+
+[[package]]
+name = "prometheus-client"
+version = "0.26.0"
+description = "Python client for the Prometheus monitoring system."
+optional = false
+python-versions = ">=3.9"
+groups = ["main", "lock-constraints"]
+files = [
+    {file = "prometheus_client-0.26.0-py3-none-any.whl", hash = "sha256:fa93d06737aa02bacd05794768508bb97d2fbee28cb3bca04eaae92f0ca953d6"},
+    {file = "prometheus_client-0.26.0.tar.gz", hash = "sha256:04a91bcf94e2cf74a44a1a874d651a2e853ed354b6e822f3b7487751465d5c2b"},
+]
+
+[package.extras]
+aiohttp = ["aiohttp"]
+django = ["django"]
+twisted = ["twisted"]
 
 [[package]]
 name = "protobuf"
@@ -1421,4 +1438,4 @@ runtime = ["cel-expr-python", "confluent-kafka", "elasticsearch", "ldap3", "prot
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13,<3.14"
-content-hash = "c5d230d5af331f7a066ffac5f415b2c3cdd3c2103e8477f9ed1750d0054e7196"
+content-hash = "caa94d090cc7f0ceb77c16950c612edf58f7a261a772ef4fd07b08536c7c190f"

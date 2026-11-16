@@ -3,6 +3,7 @@ from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from keep.alerts.dismissal import correlation_suppressed, dismissal_recorded
+from keep.observability import alert_fields, flow as alert_flow
 from keep.serialization import wire
 
 
@@ -209,6 +210,28 @@ def publish(
         from keep.alert_notifications import remember
 
         remember(envelope)
+    if cause != "source":
+        # A delivered input is recorded by the source processor as alert_applied.
+        # Held by the active flow and written once this transaction commits.
+        alert_flow.note(
+            "alert_changed",
+            alert=alert_fields(
+                after,
+                alert_id=after["id"],
+                native_version=after.get("schema_version"),
+                provider=after.get("provider"),
+            ),
+            cause=cause,
+            principal_id=actor,
+            outcome="changed" if semantic else "recorded",
+            status_before=before["status"] if before else "none",
+            status_after=after["status"],
+            revision=after["revision"],
+            suppressed=bool(after.get("suppressed")),
+            assignee_id=after.get("assignee_id"),
+            changed_event_id=event_id,
+            projection_seq=state["projection_seq"],
+        )
     from keep.maintenance.runtime import publish_inline_effects
 
     publish_inline_effects(conn, after)

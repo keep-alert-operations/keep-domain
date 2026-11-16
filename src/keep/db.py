@@ -135,9 +135,14 @@ class Database:
         """
         from keep.recovery.guard import runtime_guard
         from keep.alert_notifications import pending, publish_best_effort
+        from keep.observability import flow as alert_flow
 
         batch = []
         token = pending.set(batch)
+        # Log steps noted inside this unit of work are true only once it commits
+        # (observability 3): written after the commit, dropped on rollback.
+        flow = alert_flow.active()
+        mark = flow.mark() if flow is not None else 0
         try:
             with self.pool.connection(timeout=remaining(3)) as conn:
                 conn = BudgetConnection(conn) if deadline.get() is not None else conn
@@ -146,8 +151,12 @@ class Database:
                 ):
                     yield conn
         except BaseException:
+            if flow is not None:
+                flow.discard(mark)
             raise
         else:
+            if flow is not None:
+                flow.settle(mark)
             publish_best_effort(batch)
         finally:
             pending.reset(token)

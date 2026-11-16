@@ -5,9 +5,64 @@ from time import monotonic
 from types import MappingProxyType
 import logging
 
+from keep.observability import Flow, log_event
+from keep.observability.flow import seconds_since as seconds_since
+from keep.observability.kafka import statistics_options
+from keep.observability.metrics import gauge
 from keep.shared.errors import unavailable
 
 log = logging.getLogger(__name__)
+
+
+def changed_flow(logger, consumer, message, envelope):
+    """Begin the flow of one changed event in its consumer and record that it was read.
+
+    The returned flow carries the event, alert and Kafka position on every later
+    step the consumer writes for this change (observability 3).
+    """
+    alert = {"id": envelope.alert_id}
+    if getattr(envelope, "native_version", None):
+        alert["native_version"] = envelope.native_version
+    flow = Flow(
+        logger,
+        alert=alert,
+        consumer=consumer,
+        changed_event_id=envelope.event_id,
+        tenant_id=envelope.tenant_id,
+        cause=getattr(envelope, "cause", None),
+        partition=message.partition(),
+        offset=message.offset(),
+        projection_seq=getattr(envelope, "projection_seq", None),
+    )
+    flow.step(
+        "alert_change_consumed",
+        detail=True,
+        delay_seconds=seconds_since(getattr(envelope, "recorded_at", None)),
+    )
+    return flow
+
+
+HELD = gauge(
+    "keep_kafka_partitions_held",
+    "Partitions this process holds at one offset: retrying, or fenced until repair.",
+    ("state",),
+)
+
+
+def _identifiers(message):
+    """The changed event and alert that a failed input names, when it can be read."""
+    try:
+        from keep.event_models import ChangedEnvelope
+        from keep.ingestion.native import parse_json
+
+        envelope = ChangedEnvelope.model_validate(parse_json(message.value()))
+    except Exception:
+        return {}
+    return {
+        "changed_event_id": envelope.event_id,
+        "alert_id": envelope.alert_id,
+        "tenant_id": envelope.tenant_id,
+    }
 
 # Most inputs one fetch or one handler call may carry. A search hint becomes at
 # most one document, so this matches the projection writer's bulk limit.
@@ -28,6 +83,12 @@ class PartitionRetries:
         self.client.pause([point])
         self.client.seek(point)
         self.failed[(point.topic, point.partition)] = (point, monotonic() + delay)
+        self._count()
+
+    def _count(self):
+        fenced = sum(1 for _, deadline in self.failed.values() if deadline == float("inf"))
+        HELD.labels("fenced").set(fenced)
+        HELD.labels("retrying").set(len(self.failed) - fenced)
 
     def timeout(self, limit):
         """Bound an idle poll so a short retry resumes near its deadline."""
@@ -41,10 +102,12 @@ class PartitionRetries:
                 self.client.seek(point)
                 self.client.resume([point])
                 del self.failed[key]
+                self._count()
 
     def revoke(self, partitions):
         for point in partitions:
             self.failed.pop((point.topic, point.partition), None)
+        self._count()
 
     def fence(self, point):
         # Retention loss needs an explicit repair/restart, not a timed retry.
@@ -52,6 +115,7 @@ class PartitionRetries:
         # before polling, and no group offset is advanced by the fence.
         self.client.pause([point])
         self.failed[(point.topic, point.partition)] = (point, float("inf"))
+        self._count()
 
 
 class ChangedConsumer:
@@ -99,6 +163,7 @@ class ChangedConsumer:
         self.client = Consumer(
             {
                 **kafka_options(settings),
+                **statistics_options(),
                 "group.id": f"keep.{settings.environment}.{role}-v2",
                 "enable.auto.commit": False,
                 "enable.auto.offset.store": False,
@@ -339,7 +404,7 @@ class ChangedConsumer:
             else:
                 self.handler(self.db, self.settings, self.profile, group[0])
                 count = 1
-        except Exception:
+        except Exception as error:
             failed = group[0]
             self.retries.fail(failed)
             key = (failed.topic(), failed.partition())
@@ -351,8 +416,15 @@ class ChangedConsumer:
                     VALUES(%s,%s,%s,%s,'changed_processing_failed') ON CONFLICT DO NOTHING""",
                     (self.role, failed.topic(), failed.partition(), failed.offset()),
                 )
-            log.warning(
-                "changed_partition_retry consumer=%s partition=%d", self.role, failed.partition()
+            # Class, controlled code and stack only: exception text can quote values.
+            log_event(
+                log,
+                "changed_partition_retry",
+                exc=error,
+                consumer=self.role,
+                partition=failed.partition(),
+                offset=failed.offset(),
+                **_identifiers(failed),
             )
             # The failed partition's handled prefix and other partitions' progress
             # must not wait behind the retry.
