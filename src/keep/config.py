@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     kafka_admission_enabled: bool = False
     # Timed alert dismissal (REV-49) stays off until every writer runs this release.
     alert_dismissal_enabled: bool = False
+    # Real user monitoring (REV-74): the Product API accepts browser events only when on.
+    rum_enabled: bool = False
     clock_health_file: Path | None = None
     database_clock_health_file: Path | None = None
     kafka_security_protocol: Literal["PLAINTEXT", "SSL", "SASL_SSL"] = "PLAINTEXT"

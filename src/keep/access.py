@@ -1,3 +1,4 @@
+from keep.observability import http as observe
 from keep.shared.errors import AppError
 
 ROLE_RANK = {"view": 1, "edit": 2, "admin": 3}
@@ -44,6 +45,7 @@ def authorize(conn, request, tenant, minimum="view", mutation=False):
     from keep.identity.authentication import authenticate
 
     principal, session = authenticate(conn, request, mutation=mutation)
+    observe.actor(request, principal["id"], tenant)
     role = effective_role(conn, principal, tenant)
     if role is None:
         raise AppError("not_found", "Resource unavailable.", 404)

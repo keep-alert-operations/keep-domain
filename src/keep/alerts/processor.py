@@ -2,6 +2,8 @@ from psycopg.types.json import Jsonb
 
 from keep.alerts.lifecycle import apply_source
 from keep.alerts.repository import insert_alert_identity, publish, store_alert
+from keep.observability import alert_fields, flow as alert_flow
+from keep.observability.flow import seconds_since
 from keep.shared.errors import AppError, unavailable
 from keep.shared.transactions import coordinator
 
@@ -75,6 +77,12 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None, coordinate
                 (item["received_at"], item["id"]),
             )
             link_source_result(conn, item, error_code=error.code)
+        alert_flow.note(
+            "alert_refused",
+            learned={"alert": {"id": str(claim["alert_id"])}} if claim else None,
+            alert=alert_fields(item["payload"], whole=True),
+            error_code=error.code,
+        )
     else:
         if previous is None:
             # Maintenance proof references the identity. Nothing in
@@ -141,6 +149,23 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None, coordinate
             from keep.incidents.state import resolve_when_alerts_resolved
 
             resolve_when_alerts_resolved(conn, tenant, linked, now, catalog)
+        # Held by the alert's flow and written once this transaction commits.
+        alert_flow.note(
+            "alert_applied",
+            learned={
+                "alert": {"id": str(current["id"])},
+                "changed_event_id": publication["event_id"],
+            },
+            alert=alert_fields(item["payload"], whole=True, provider=current.get("provider")),
+            outcome=source_outcome(previous, current, changed),
+            status_before=previous["status"] if previous else "none",
+            status_after=current["status"],
+            revision=current["revision"],
+            suppressed=bool(current.get("suppressed")),
+            projection_seq=publication["projection_seq"],
+            # Receipt to PostgreSQL commit: read when the step is written.
+            delay_seconds=lambda: seconds_since(item["received_at"]),
+        )
         if supplied_item is None:
             link_source_result(
                 conn,
@@ -164,6 +189,15 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None, coordinate
     )
     release_reservation(conn, tenant, item["id"])
     return True
+
+
+def source_outcome(previous, current, changed):
+    """What a delivered input did to its alert, in one word."""
+    if previous is None:
+        return "created"
+    if previous["status"] != current["status"]:
+        return "resolved" if current["status"] == "resolved" else "reopened"
+    return "updated" if changed else "unchanged"
 
 
 def release_reservation(conn, tenant, item_id):

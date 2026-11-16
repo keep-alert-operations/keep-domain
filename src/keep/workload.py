@@ -1,6 +1,7 @@
 """Application route boundaries supplement the deployment network policies."""
 
 HTTP_ROLES = frozenset({"product-api", "ingestion-api", "private-ingestion"})
+RUM_PATH = "/api/rum-events"
 
 
 def permits_http(settings, path):
@@ -11,7 +12,8 @@ def permits_http(settings, path):
     if settings.environment == "development" and settings.role == "product-api":
         return True
     if settings.role == "product-api":
-        return path.startswith(("/auth/", "/api/tenants", "/api/admin/"))
+        # /api/rum-events: browser monitoring events (observability 9).
+        return path.startswith(("/auth/", "/api/tenants", "/api/admin/")) or path == RUM_PATH
     if settings.role == "ingestion-api":
         return path.startswith("/api/ingest/v1/")
     if settings.role == "private-ingestion":
