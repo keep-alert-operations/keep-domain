@@ -17,6 +17,7 @@ from keep.identity.directory import (
     DirectoryUnavailable,
     DirectoryVerifier,
     PrincipalKey,
+    failure_reason,
 )
 
 
@@ -148,6 +149,17 @@ def test_failures_carry_structured_reasons_without_exception_text():
     late = DirectoryVerifier(Reader(), monotonic=lambda: next(ticks)).verify([key("root")], 3)
     assert late.failure_reason == FAILURE_DEADLINE
     assert DirectoryVerifier(Reader()).verify([key("root")], 4).failure_reason is None
+
+
+def test_a_call_timeout_is_a_deadline_not_an_outage():
+    """A call past its timeout didn't fit; an inline save hands it to the background.
+
+    Requirements: REV-73; tenant access 5 (inline save); plan A22.
+    """
+    assert failure_reason(DirectoryUnavailable("directory_timeout")) == FAILURE_DEADLINE
+    assert failure_reason(DirectoryUnavailable("directory_deadline")) == FAILURE_DEADLINE
+    for code in ("directory_status_rejected", "directory_transport_failure", "other"):
+        assert failure_reason(DirectoryUnavailable(code)) == FAILURE_UNAVAILABLE
 
 
 def test_deadline_inside_members_is_a_deadline_failure():

@@ -33,7 +33,9 @@ FAILURE_DEADLINE = "directory_verification_deadline"
 FAILURE_BUSY = "directory_busy"
 FAILURE_REASONS = (FAILURE_UNAVAILABLE, FAILURE_TOO_LARGE, FAILURE_DEADLINE, FAILURE_BUSY)
 _TOO_LARGE_CODES = frozenset({"directory_allocation_exceeded"})
-_DEADLINE_CODES = frozenset({"verification_deadline", "directory_deadline"})
+# A call that outlasts its timeout didn't fit the time it had: an inline save hands it to
+# the background saver (longer per-call cap) instead of reporting an outage.
+_DEADLINE_CODES = frozenset({"verification_deadline", "directory_deadline", "directory_timeout"})
 
 
 def failure_reason(exc: DirectoryUnavailable) -> str:
