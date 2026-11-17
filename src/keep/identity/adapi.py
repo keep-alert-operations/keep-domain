@@ -1,6 +1,6 @@
 """Read-only ADAPI (the company AD REST API) client and directory reader.
 
-Requirements: REV-73; identity configuration 6-7; worker scope 4.
+Requirements: REV-73; REV-76; identity configuration 6-7; worker scope 4.
 
 Identity is the lowercase sAMAccountName under the source ``adapi``. Every HTTP
 call has an explicit timeout derived from the caller's cap and, inside a request
@@ -48,7 +48,8 @@ JOB_CALL_CAP = 5.0
 INLINE_VERIFY_DEADLINE = 7.0
 REFRESH_VERIFY_DEADLINE = 60.0
 MAX_OBJECTS = 10000
-USER_ATTRIBUTES = ("sAMAccountName", "displayName", "userAccountControl")
+# REV-76: Keep does not handle disabled people, so userAccountControl is not read.
+USER_ATTRIBUTES = ("sAMAccountName", "displayName")
 GROUP_ATTRIBUTES = ("sAMAccountName", "displayName", "cn")
 # Identity configuration 2: AD-forbidden characters, plus "@" (it would select a
 # userPrincipalName). Control characters are refused separately.
@@ -210,8 +211,20 @@ class ADAPIClient:
         return body
 
     def find_users(self, params: Params, *, timeout: float | None = None) -> list[dict]:
-        """``GET /users`` with OR'ed ADAPI params (exact unless ``*`` is used)."""
+        """``GET /users`` with OR'ed ADAPI params (exact unless ``*`` is used).
+
+        For batches (``customFilter``) and picker searches; one exact person is
+        ``exact_user``.
+        """
         return self._get("/users", params, timeout)
+
+    def exact_user(self, sam: str, *, timeout: float | None = None) -> list[dict]:
+        """``GET /users/user`` (REV-76): one person by exact sAMAccountName.
+
+        It takes the same query parameters as ``/users`` and answers the same row
+        shape, as a list holding one object; no rows when no person has that name.
+        """
+        return self._get("/users/user", exact_params(sam, USER_ATTRIBUTES), timeout)
 
     def find_groups(self, params: Params, *, timeout: float | None = None) -> list[dict]:
         """``GET /groups`` with OR'ed ADAPI params (exact unless ``*`` is used)."""
@@ -226,13 +239,13 @@ class ADAPIClient:
         )
 
     def lookup_user_rows(self, username: str, *, timeout: float | None = None) -> list[dict]:
-        """Raw ``/users`` rows for an exact sAMAccountName: zero, one or more.
+        """Raw ``/users/user`` rows for an exact sAMAccountName: zero, one or more.
 
         For sign-in, which tells the three apart. Every row must name the requested
         account (case-insensitively), otherwise this raises DirectoryUnavailable.
         """
         name = normalize_username(username)
-        rows = self.find_users(exact_params(name, USER_ATTRIBUTES), timeout=timeout)
+        rows = self.exact_user(name, timeout=timeout)
         for row in rows:
             if _sam(row) != name:
                 raise DirectoryUnavailable("directory_identity_mismatch")
@@ -267,26 +280,16 @@ def _sam(row: Mapping) -> str:
     return value.lower()
 
 
-def _uac(row: Mapping) -> int:
-    value = _text(row, "userAccountControl")
-    if value is None and isinstance(row.get("userAccountControl"), int):
-        value = row["userAccountControl"]
-    try:
-        if value is None or isinstance(value, bool):
-            raise ValueError()
-        return int(value)
-    except (TypeError, ValueError):
-        raise DirectoryUnavailable("directory_response_invalid") from None
-
-
 def user_object(source: str, row: Mapping) -> DirectoryObject:
-    """A verified user from one ``/users`` row: eligible unless UAC bit 2 is set.
+    """A verified person from one ``/users`` row, always eligible (REV-76).
 
-    The label is ``displayName``, falling back to the sAMAccountName.
+    Keep does not handle disabled accounts: ``userAccountControl`` is neither
+    requested nor read, so an odd or missing value never fails a read. The label
+    is ``displayName``, falling back to the sAMAccountName.
     """
     sam = _sam(row)
     return DirectoryObject(
-        PrincipalKey(source, sam), "user", _text(row, "displayName") or sam, _uac(row) & 2 == 0
+        PrincipalKey(source, sam), "user", _text(row, "displayName") or sam, True
     )
 
 
@@ -353,7 +356,7 @@ class ADAPIDirectoryReader:
 
     def _exact(self, kind: Kind, name: str) -> DirectoryObject | None:
         if kind == "user":
-            rows = self.client.find_users(exact_params(name, USER_ATTRIBUTES))
+            rows = self.client.exact_user(name)
         else:
             rows = self.client.find_groups(exact_params(name, GROUP_ATTRIBUTES))
         if len(rows) > 1:
@@ -365,7 +368,11 @@ class ADAPIDirectoryReader:
         return (user_object if kind == "user" else group_object)(self.source, rows[0])
 
     def lookup(self, key: PrincipalKey) -> DirectoryObject:
-        """Cached, else the hinted endpoint then the other; deleted only if both are empty."""
+        """Cached, else the hinted endpoint then the other; not found only if both are empty.
+
+        A not-found object is marked ``deleted``. Publication tombstones a missing
+        group but never stores or negates a missing person (REV-76).
+        """
         cached = self.objects.get(key)
         if cached is not None:
             return cached
@@ -375,7 +382,7 @@ class ADAPIDirectoryReader:
         obj = self._exact(first, name) or self._exact(second, name)
         if obj is None:
             # Both endpoints answered 200 with zero rows: the account is gone.
-            # publish() keeps a tombstone's previously stored kind.
+            # publish() keeps a group tombstone's previously stored kind.
             obj = DirectoryObject(key, first, name, False, deleted=True)
         self.objects[key] = obj
         return obj
@@ -398,7 +405,7 @@ class ADAPIDirectoryReader:
         """Cache user roots, ``lookup_batch`` names per ``/users`` call.
 
         A name a batch omits is not cached, so ``lookup()`` asks both exact
-        endpoints for it: only that can prove deletion.
+        endpoints for it: only that can prove it is not found.
         """
         names = sorted({self._name(k) for k in keys if k not in self.objects})
         for start in range(0, len(names), self.batch):
@@ -410,19 +417,19 @@ class ADAPIDirectoryReader:
         """Recursive user members, flattened to direct group -> user edges.
 
         Display names come from batched ``/users`` calls, yielded batch by batch so
-        the verifier's deadline is checked between calls. A member a batch omits
-        keeps the members route's own userAccountControl with its sAMAccountName
-        as label; it is never marked deleted from a batch.
+        the verifier's deadline is checked between calls. A member a batch omits is
+        an eligible person labelled by its sAMAccountName; it is never marked
+        deleted from a batch.
         """
-        status: dict[str, int] = {}
+        listed: set[str] = set()
         for row in self.client.group_members(self._name(group)):
             sam = _member_name(row)
             if sam is not None:
-                status[sam] = _uac(row)
-        if len(status) + 1 > self.max_objects:
+                listed.add(sam)
+        if len(listed) + 1 > self.max_objects:
             # Fail before any name batch: the group cannot fit one evidence.
             raise DirectoryUnavailable("directory_allocation_exceeded")
-        names = sorted(status)
+        names = sorted(listed)
         for start in range(0, len(names), self.batch):
             chunk = names[start : start + self.batch]
             pending = [n for n in chunk if PrincipalKey(self.source, n) not in self.objects]
@@ -434,7 +441,7 @@ class ADAPIDirectoryReader:
                     self.objects[key] = (
                         user_object(self.source, row)
                         if row is not None
-                        else DirectoryObject(key, "user", sam, status[sam] & 2 == 0)
+                        else DirectoryObject(key, "user", sam, True)
                     )
                 yield key
 
@@ -507,13 +514,13 @@ def verify_root(
 def user_evidence(
     source: str, row: Mapping, generation: int, started_at: datetime
 ) -> DirectoryEvidence:
-    """Complete single-person evidence from the one ``/users`` row sign-in read.
+    """Complete single-person evidence from the one ``/users/user`` row sign-in read.
 
-    Allocate ``generation`` before reading the row. The person is the only root.
+    Allocate ``generation`` before reading the row. The person is the only root
+    and is eligible (REV-76), so the evidence carries no negative fact.
     """
     obj = user_object(source, row)
     key = obj.key
-    eligible = obj.eligible and not obj.deleted
     return DirectoryEvidence(
         source,
         generation,
@@ -522,7 +529,6 @@ def user_evidence(
         frozenset({key}),
         {key: obj},
         {},
-        {key: frozenset({key}) if eligible else frozenset()},
+        {key: frozenset({key})},
         True,
-        negative_keys=frozenset() if eligible else frozenset({key}),
     )

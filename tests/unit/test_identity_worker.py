@@ -32,7 +32,7 @@ def outcome(root, *, saved=True, bootstrap=False, fenced=False, kind="team", roo
         evidence = DirectoryEvidence("adapi", 1, now, now, frozenset(keys), {}, {}, {}, True)
     else:
         evidence = DirectoryEvidence.failed("adapi", 1, keys, now)
-    publication = PublicationResult(saved, 1, (), (), bootstrap, fenced)
+    publication = PublicationResult(saved, 1, (), bootstrap, fenced)
     reason = None if saved else FAILURE_UNAVAILABLE
     return worker.RefreshUnit(
         kind, tuple(roots or (root,)), SaveOutcome(evidence, publication, reason, 1)
@@ -339,7 +339,7 @@ def stoppable(environment):
     def publish(database, read, *, superadmin_group, bootstrap_qualified, on_accepted):
         generation = len(published) + 1
         evidence = read(generation)
-        result = PublicationResult(evidence.complete, 1, (), (), False, False)
+        result = PublicationResult(evidence.complete, 1, (), False, False)
         published.append(sorted(key.object_id for key in evidence.roots))
         if hook[0] is not None:
             hook[0]()

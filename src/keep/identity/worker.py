@@ -184,8 +184,7 @@ class RefreshSummary:
     @property
     def bootstrap_ready(self) -> bool:
         return any(
-            unit.publication is not None and unit.publication.bootstrap_ready
-            for unit in self.units
+            unit.publication is not None and unit.publication.bootstrap_ready for unit in self.units
         )
 
 
@@ -314,11 +313,13 @@ def _log_summary(summary: RefreshSummary, seconds: float) -> None:
         if unit.reason is None:
             continue
         if unit.kind == "team":
-            log_event(log, "directory_root_failed", kind="team", root=unit.roots[0],
-                      reason=unit.reason)
+            log_event(
+                log, "directory_root_failed", kind="team", root=unit.roots[0], reason=unit.reason
+            )
         else:
-            log_event(log, "directory_root_failed", kind="user", count=len(unit.roots),
-                      reason=unit.reason)
+            log_event(
+                log, "directory_root_failed", kind="user", count=len(unit.roots), reason=unit.reason
+            )
     log_event(
         log,
         "directory_refresh_completed",
