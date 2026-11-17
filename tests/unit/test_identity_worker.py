@@ -138,6 +138,7 @@ def test_a_published_refresh_logs_one_completed_record_as_the_refresh_role(cycle
     assert completed["service"]["name"] == "api"
     assert completed["keep"]["role"] == "directory-refresh"
     assert completed["log"]["level"] == "info" and completed["event"]["outcome"] == "success"
+    assert completed["log"]["logger"] == "keep.identity.worker"
     assert completed["keep"]["units"] == 1 and completed["keep"]["published"] == 1
     assert completed["keep"]["failed_roots"] == 0
     assert isinstance(completed["event"]["duration"], int)

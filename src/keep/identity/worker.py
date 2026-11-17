@@ -59,7 +59,9 @@ BOOTSTRAP_ENV = "KEEP_DIRECTORY_BOOTSTRAP_QUALIFIED"
 # REV-75: both entry points write their records to the Product API's index.
 LOG_SERVICE, LOG_ROLE = "api", "directory-refresh"
 
-log = logging.getLogger(__name__)
+# Named, not __name__: run with ``-m`` the module is ``__main__``, and the CronJob's
+# records would carry that as their logger.
+log = logging.getLogger("keep.identity.worker")
 
 register(
     "directory_root_failed",

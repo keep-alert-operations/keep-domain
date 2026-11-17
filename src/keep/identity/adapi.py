@@ -188,7 +188,9 @@ class ADAPIClient:
     def __exit__(self, *args: Any) -> None:
         self.close()
 
-    def _get(self, path: str, params: Params, timeout: float | None) -> list[dict]:
+    def _get(
+        self, path: str, params: Params, timeout: float | None, *, not_found: int | None = None
+    ) -> list[dict]:
         if self.stop is not None and self.stop.is_set():
             raise DirectoryUnavailable("directory_stopped")
         cap = self.call_cap if timeout is None else min(timeout, self.call_cap)
@@ -200,6 +202,9 @@ class ADAPIClient:
             raise DirectoryUnavailable("directory_timeout") from None
         except httpx.HTTPError:
             raise DirectoryUnavailable("directory_transport_failure") from None
+        if not_found is not None and response.status_code == not_found:
+            # The route's own "no such object" answer: zero rows. Its body is never read.
+            return []
         if response.status_code != 200:
             raise DirectoryUnavailable("directory_status_rejected")
         try:
@@ -222,9 +227,12 @@ class ADAPIClient:
         """``GET /users/user`` (REV-76): one person by exact sAMAccountName.
 
         It takes the same query parameters as ``/users`` and answers the same row
-        shape, as a list holding one object; no rows when no person has that name.
+        shape, as a list holding one object. When no person has that name it answers
+        404 (user answer 2026-11-17), read as no rows without reading its body; any
+        other non-200, or a malformed body, is ``DirectoryUnavailable`` as for every
+        route.
         """
-        return self._get("/users/user", exact_params(sam, USER_ATTRIBUTES), timeout)
+        return self._get("/users/user", exact_params(sam, USER_ATTRIBUTES), timeout, not_found=404)
 
     def find_groups(self, params: Params, *, timeout: float | None = None) -> list[dict]:
         """``GET /groups`` with OR'ed ADAPI params (exact unless ``*`` is used)."""

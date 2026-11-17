@@ -22,6 +22,7 @@ from keep.identity.adapi import (
     batch_filter,
     call_timeout,
     escape_filter_value,
+    exact_params,
     job_verification_deadline,
     normalize_username,
     principal_key,
@@ -125,6 +126,10 @@ class FakeADAPI:
                 rows.extend(table.get(plain.lower(), []))
                 if plain.lower() in self.duplicates:
                     rows.extend(table.get(plain.lower(), []))
+        if route == "/users/user" and not rows:
+            # ADAPI's no-match answer (REV-76, user answer 2026-11-17); not JSON here,
+            # so a client that parsed it would fail.
+            return httpx.Response(404, text="Not Found")
         return httpx.Response(200, json=rows)
 
 
@@ -325,6 +330,65 @@ def test_a_missing_person_is_not_negated_and_a_missing_group_tombstones(adapi):
     adapi.status["/users/user"] = 500
     with client(adapi) as c, pytest.raises(DirectoryUnavailable):
         ADAPIDirectoryReader(c, hints={key("gone-team"): "team"}).lookup(key("gone-team"))
+
+
+@pytest.mark.parametrize(
+    ("route", "response", "rows"),
+    [
+        ("/users/user", httpx.Response(404, text="Not Found"), []),
+        ("/users/user", httpx.Response(404, json={"error": "no such user"}), []),
+        ("/users/user", httpx.Response(404), []),
+        ("/users/user", httpx.Response(400, json=[]), None),
+        ("/users/user", httpx.Response(401, json=[]), None),
+        ("/users/user", httpx.Response(500, json=[]), None),
+        ("/users/user", httpx.Response(503, text="down"), None),
+        ("/users/user", httpx.Response(200, text="not json"), None),
+        ("/users/user", httpx.Response(200, json={"rows": []}), None),
+        ("/users/user", httpx.Response(200, json=["x"]), None),
+        ("/users", httpx.Response(404, json=[]), None),
+        ("/groups", httpx.Response(404, json=[]), None),
+        ("/groups/members/user", httpx.Response(404, json=[]), None),
+    ],
+)
+def test_only_a_users_user_404_reads_as_no_row(route, response, rows):
+    """``/users/user`` answers 404 when no person matches: zero rows, body unread. Every
+    other non-200, a malformed body, and a 404 from any other route stay unavailable.
+
+    Requirements: REV-76; identity configuration 6; plan (REV-75/76) open question 3.
+    """
+    seen = []
+
+    def handler(request):
+        path = request.url.path.removeprefix("/api")
+        seen.append(path)
+        return response if path == route else httpx.Response(200, json=[])
+
+    calls = {
+        "/users/user": lambda c: c.exact_user("nobody"),
+        "/users": lambda c: c.find_users(exact_params("nobody", ("sAMAccountName",))),
+        "/groups": lambda c: c.find_groups(exact_params("nobody", ("sAMAccountName",))),
+        "/groups/members/user": lambda c: c.group_members("nobody"),
+    }
+    with ADAPIClient(CONFIG, call_cap=5.0, transport=httpx.MockTransport(handler)) as c:
+        if rows is None:
+            with pytest.raises(DirectoryUnavailable):
+                calls[route](c)
+        else:
+            assert calls[route](c) == rows
+    assert seen == [route]
+
+
+def test_a_person_missing_on_both_endpoints_after_a_users_user_404(adapi):
+    """Sign-in's lookup and ``lookup`` read a ``/users/user`` 404 as not found.
+
+    Requirements: REV-76; identity configuration 3, 6; plan (REV-75/76) B2, B9, open
+    question 3.
+    """
+    with client(adapi) as c:
+        assert c.lookup_user_rows("nobody") == []
+        obj = ADAPIDirectoryReader(c).lookup(key("nobody"))
+    assert obj.deleted and obj.kind == "user"
+    assert [r[0] for r in adapi.requests] == ["/users/user", "/users/user", "/groups"]
 
 
 def test_a_uac_of_514_is_ignored(adapi):
