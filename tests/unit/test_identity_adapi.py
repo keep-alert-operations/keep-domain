@@ -1,7 +1,7 @@
 """ADAPI client and directory reader against an in-memory ADAPI (httpx.MockTransport).
 
-Requirements: REV-73; identity configuration 2, 6-7; plan "ADAPI client" and
-"Directory protocol on ADAPI", A13, A25.
+Requirements: REV-73; REV-76; identity configuration 2, 6-7; plan "ADAPI client" and
+"Directory protocol on ADAPI", A13, A25; plan (REV-75/76) B2 and B9.
 """
 
 import json
@@ -22,6 +22,7 @@ from keep.identity.adapi import (
     batch_filter,
     call_timeout,
     escape_filter_value,
+    exact_params,
     job_verification_deadline,
     normalize_username,
     principal_key,
@@ -46,7 +47,12 @@ def key(name):
 
 
 class FakeADAPI:
-    """Exact samAccountName, sAMAccountName customFilter batches and recursive members."""
+    """Exact samAccountName, sAMAccountName customFilter batches and recursive members.
+
+    ``/users/user`` answers an exact samAccountName with the matching rows (REV-76),
+    the same rows ``/users`` returns for it. Rows keep ADAPI's userAccountControl,
+    which Keep no longer requests or reads.
+    """
 
     def __init__(self):
         self.users = {}
@@ -102,7 +108,9 @@ class FakeADAPI:
                 for r in self.users.get(n.lower(), [])
             ]
             return httpx.Response(200, json=rows)
-        table = self.users if route == "/users" else self.groups
+        if route == "/users/user":
+            assert "customFilter" not in query and len(query["samAccountName"]) == 1
+        table = self.users if route in ("/users", "/users/user") else self.groups
         rows = []
         if "samAccountName" in query:
             rows = list(table.get(query["samAccountName"][0].lower(), []))
@@ -118,6 +126,10 @@ class FakeADAPI:
                 rows.extend(table.get(plain.lower(), []))
                 if plain.lower() in self.duplicates:
                     rows.extend(table.get(plain.lower(), []))
+        if route == "/users/user" and not rows:
+            # ADAPI's no-match answer (REV-76, user answer 2026-11-17); not JSON here,
+            # so a client that parsed it would fail.
+            return httpx.Response(404, text="Not Found")
         return httpx.Response(200, json=rows)
 
 
@@ -183,11 +195,16 @@ def test_normalize_username_trims_and_lowercases():
 
 
 def test_client_id_header_and_repeated_attributes(adapi):
+    """Sign-in's exact person lookup calls ``/users/user`` with the ``/users`` params.
+
+    Requirements: REV-76; identity configuration 6; plan B2 (no userAccountControl)
+    and B9.
+    """
     with client(adapi) as c:
         rows = c.lookup_user_rows(" Alice ")
     route, query, headers = adapi.requests[0]
-    assert route == "/users" and query["samAccountName"] == ["alice"]
-    assert query["attributesToLoad"] == ["sAMAccountName", "displayName", "userAccountControl"]
+    assert route == "/users/user" and query["samAccountName"] == ["alice"]
+    assert query["attributesToLoad"] == ["sAMAccountName", "displayName"]
     assert headers["clientid"] == CLIENT_ID
     assert len(rows) == 1 and c.calls == 1
     assert CLIENT_ID not in repr(CONFIG)
@@ -263,7 +280,7 @@ def test_kind_hint_asks_the_hinted_endpoint_first(adapi):
         reader = ADAPIDirectoryReader(c, hints={key("team-a"): "team"})
         group = reader.lookup(key("team-a"))
         person = reader.lookup(key("alice"))
-    assert [r[0] for r in adapi.requests] == ["/groups", "/users"]
+    assert [r[0] for r in adapi.requests] == ["/groups", "/users/user"]
     assert group.kind == "team" and group.label == "Team A" and group.eligible
     assert person.kind == "user" and person.label == "Alice" and person.eligible
 
@@ -272,7 +289,7 @@ def test_wrong_hint_falls_back_to_the_other_endpoint(adapi):
     with client(adapi) as c:
         reader = ADAPIDirectoryReader(c, hints={key("alice"): "team"})
         obj = reader.lookup(key("alice"))
-    assert [r[0] for r in adapi.requests] == ["/groups", "/users"]
+    assert [r[0] for r in adapi.requests] == ["/groups", "/users/user"]
     assert obj.kind == "user"
 
 
@@ -283,22 +300,112 @@ def test_group_label_prefers_display_name_then_cn(adapi):
         assert reader.lookup(key("named")).label == "Named Group"
 
 
-def test_deleted_only_when_both_endpoints_are_empty(adapi):
+def test_a_missing_person_is_not_negated_and_a_missing_group_tombstones(adapi):
+    """Not found only when both endpoints are empty; only the group is a negative fact.
+
+    Requirements: REV-76; identity configuration 6 and 8; plan B2. Publication
+    skipping the person is checked against PostgreSQL in delivery.
+    """
     with client(adapi) as c:
-        reader = ADAPIDirectoryReader(c, hints={key("gone"): "team"})
-        obj = reader.lookup(key("gone"))
-    assert obj.deleted and not obj.eligible and obj.kind == "team"
-    assert [r[0] for r in adapi.requests] == ["/groups", "/users"]
+        reader = ADAPIDirectoryReader(c, hints={key("gone-team"): "team"})
+        group = reader.lookup(key("gone-team"))
+        person = reader.lookup(key("gone-person"))
+    assert group.deleted and not group.eligible and group.kind == "team"
+    assert person.deleted and not person.eligible and person.kind == "user"
+    assert [r[0] for r in adapi.requests] == ["/groups", "/users/user", "/users/user", "/groups"]
+    evidence = verify_roots(
+        CONFIG,
+        {key("gone-team"): "team", key("gone-person"): "user", key("alice"): "user"},
+        4,
+        deadline_seconds=60,
+        call_cap=5,
+        transport=httpx.MockTransport(adapi),
+    )
+    assert evidence.complete and evidence.failure_reason is None
+    assert evidence.negative_keys == {key("gone-team")}
+    assert evidence.objects[key("gone-person")].deleted
+    assert evidence.memberships[key("gone-person")] == frozenset()
+    assert evidence.memberships[key("alice")] == {key("alice")}
     adapi.requests.clear()
-    adapi.status["/users"] = 500
+    adapi.status["/users/user"] = 500
     with client(adapi) as c, pytest.raises(DirectoryUnavailable):
-        ADAPIDirectoryReader(c, hints={key("gone"): "team"}).lookup(key("gone"))
+        ADAPIDirectoryReader(c, hints={key("gone-team"): "team"}).lookup(key("gone-team"))
 
 
-def test_disabled_user_is_ineligible_not_deleted(adapi):
+@pytest.mark.parametrize(
+    ("route", "response", "rows"),
+    [
+        ("/users/user", httpx.Response(404, text="Not Found"), []),
+        ("/users/user", httpx.Response(404, json={"error": "no such user"}), []),
+        ("/users/user", httpx.Response(404), []),
+        ("/users/user", httpx.Response(400, json=[]), None),
+        ("/users/user", httpx.Response(401, json=[]), None),
+        ("/users/user", httpx.Response(500, json=[]), None),
+        ("/users/user", httpx.Response(503, text="down"), None),
+        ("/users/user", httpx.Response(200, text="not json"), None),
+        ("/users/user", httpx.Response(200, json={"rows": []}), None),
+        ("/users/user", httpx.Response(200, json=["x"]), None),
+        ("/users", httpx.Response(404, json=[]), None),
+        ("/groups", httpx.Response(404, json=[]), None),
+        ("/groups/members/user", httpx.Response(404, json=[]), None),
+    ],
+)
+def test_only_a_users_user_404_reads_as_no_row(route, response, rows):
+    """``/users/user`` answers 404 when no person matches: zero rows, body unread. Every
+    other non-200, a malformed body, and a 404 from any other route stay unavailable.
+
+    Requirements: REV-76; identity configuration 6; plan (REV-75/76) open question 3.
+    """
+    seen = []
+
+    def handler(request):
+        path = request.url.path.removeprefix("/api")
+        seen.append(path)
+        return response if path == route else httpx.Response(200, json=[])
+
+    calls = {
+        "/users/user": lambda c: c.exact_user("nobody"),
+        "/users": lambda c: c.find_users(exact_params("nobody", ("sAMAccountName",))),
+        "/groups": lambda c: c.find_groups(exact_params("nobody", ("sAMAccountName",))),
+        "/groups/members/user": lambda c: c.group_members("nobody"),
+    }
+    with ADAPIClient(CONFIG, call_cap=5.0, transport=httpx.MockTransport(handler)) as c:
+        if rows is None:
+            with pytest.raises(DirectoryUnavailable):
+                calls[route](c)
+        else:
+            assert calls[route](c) == rows
+    assert seen == [route]
+
+
+def test_a_person_missing_on_both_endpoints_after_a_users_user_404(adapi):
+    """Sign-in's lookup and ``lookup`` read a ``/users/user`` 404 as not found.
+
+    Requirements: REV-76; identity configuration 3, 6; plan (REV-75/76) B2, B9, open
+    question 3.
+    """
     with client(adapi) as c:
-        obj = ADAPIDirectoryReader(c).lookup(key("bob"))
-    assert not obj.eligible and not obj.deleted
+        assert c.lookup_user_rows("nobody") == []
+        obj = ADAPIDirectoryReader(c).lookup(key("nobody"))
+    assert obj.deleted and obj.kind == "user"
+    assert [r[0] for r in adapi.requests] == ["/users/user", "/users/user", "/groups"]
+
+
+def test_a_uac_of_514_is_ignored(adapi):
+    """A disabled account (UAC 514) is an eligible person; an odd UAC fails nothing.
+
+    Requirements: REV-76; identity configuration 6; plan B2.
+    """
+    adapi.user("odd", uac="not a number")
+    adapi.users["nouac"] = [{"sAMAccountName": "nouac", "displayName": "No UAC"}]
+    with client(adapi) as c:
+        reader = ADAPIDirectoryReader(c)
+        bob, odd, nouac = (reader.lookup(key(n)) for n in ("bob", "odd", "nouac"))
+    assert bob.eligible and not bob.deleted and bob.label == "Bob"
+    assert odd.eligible and nouac.eligible and nouac.label == "No UAC"
+    assert all(
+        "userAccountControl" not in q.get("attributesToLoad", []) for _, q, _ in adapi.requests
+    )
 
 
 def test_two_rows_are_ambiguous(adapi):
@@ -331,18 +438,19 @@ def test_members_skip_computers_and_batch_names(adapi):
     assert len(batches) == 3
     for query in batches:
         assert query["customFilter"][0].count("(sAMAccountName=") <= 50
-        assert query["attributesToLoad"] == ["sAMAccountName", "displayName", "userAccountControl"]
+        assert query["attributesToLoad"] == ["sAMAccountName", "displayName"]
     assert all(obj.label.startswith("User") for obj in looked)
 
 
-def test_member_omitted_by_batch_keeps_members_route_state(adapi):
+def test_member_omitted_by_batch_is_an_eligible_person_by_name(adapi):
+    """Requirements: REV-73; REV-76 (no disabled state from the members route)."""
     adapi.omit = {"bob"}
     with client(adapi) as c:
         reader = ADAPIDirectoryReader(c, hints={key("team-a"): "team"})
         members = list(reader.members(key("team-a")))
         bob = reader.lookup(key("bob"))
     assert members == [key("alice"), key("bob")]
-    assert bob.label == "bob" and not bob.eligible and not bob.deleted
+    assert bob.label == "bob" and bob.eligible and not bob.deleted
 
 
 def test_member_names_are_escaped_in_batches(adapi):
@@ -369,7 +477,8 @@ def test_oversized_group_fails_before_name_batches(adapi):
     assert [r[0] for r in adapi.requests] == ["/groups/members/user"]
 
 
-def test_prefetch_batches_user_roots_and_proves_deletion_exactly(adapi):
+def test_prefetch_batches_user_roots_and_proves_absence_exactly(adapi):
+    """Requirements: REV-73; REV-76 (a person not found is not a negative fact); B9."""
     names = [f"p{i:03d}" for i in range(101)]
     for name in names:
         adapi.user(name)
@@ -384,9 +493,10 @@ def test_prefetch_batches_user_roots_and_proves_deletion_exactly(adapi):
     )
     assert evidence.complete and evidence.generation == 7
     routes = [r[0] for r in adapi.requests]
-    assert routes.count("/users") == 3 + 1 and routes.count("/groups") == 1
+    assert routes.count("/users") == 3 and routes.count("/users/user") == 1
+    assert routes.count("/groups") == 1
     assert evidence.objects[key("gone")].deleted
-    assert key("gone") in evidence.negative_keys
+    assert evidence.negative_keys == frozenset()
 
 
 def test_verify_root_reads_a_group_with_flattened_edges(adapi):
@@ -402,7 +512,8 @@ def test_verify_root_reads_a_group_with_flattened_edges(adapi):
     assert evidence.complete and evidence.failure_reason is None
     assert evidence.roots == {key("team-a")}
     assert evidence.edges == {key("team-a"): {key("alice"), key("bob")}}
-    assert evidence.memberships[key("team-a")] == {key("alice")}
+    # REV-76: bob's UAC 514 no longer removes him from the group.
+    assert evidence.memberships[key("team-a")] == {key("alice"), key("bob")}
     assert len(adapi.requests) == 3
 
 
@@ -473,11 +584,13 @@ def test_prefetch_failure_returns_incomplete_evidence(adapi):
 
 
 def test_user_evidence_from_a_sign_in_row():
+    """Requirements: REV-76; identity configuration 3 (sign-in evidence); plan B3."""
     row = {"sAMAccountName": "Alice", "displayName": "Alice A", "userAccountControl": "514"}
     evidence = user_evidence("adapi", row, 5, datetime.now(UTC))
     assert evidence.complete and evidence.roots == {key("alice")}
-    assert not evidence.objects[key("alice")].eligible
-    assert evidence.negative_keys == {key("alice")}
+    assert evidence.objects[key("alice")].eligible
+    assert evidence.memberships == {key("alice"): {key("alice")}}
+    assert evidence.negative_keys == frozenset()
     assert json.dumps(evidence.semantic_digest)
 
 

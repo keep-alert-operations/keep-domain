@@ -3,7 +3,7 @@
 The caller allocates generations before starting work and publishes under the
 authorization guard. Failure never turns an incomplete roster into an empty one.
 
-Requirements: REV-73; identity configuration 6-7; worker scope 4.
+Requirements: REV-73; REV-76; identity configuration 6-7; worker scope 4.
 """
 
 from __future__ import annotations
@@ -75,7 +75,10 @@ class DirectoryReader(Protocol):
     source: str
 
     def lookup(self, key: PrincipalKey) -> DirectoryObject:
-        """Return verified object/tombstone; uncertainty raises DirectoryUnavailable."""
+        """Return the verified object, or a not-found one (``deleted``).
+
+        Uncertainty raises DirectoryUnavailable.
+        """
 
     def members(self, group: PrincipalKey) -> Iterable[PrincipalKey]:
         """All direct and primary members; incomplete paging MUST raise."""
@@ -233,7 +236,13 @@ class DirectoryVerifier:
                     elif obj.kind == "team" and not obj.deleted:
                         queue.extend(edges.get(key, ()))
                 memberships[root] = frozenset(eligible)
-        negatives = frozenset(k for k, obj in objects.items() if obj.deleted or not obj.eligible)
+        # REV-76: only a group is a negative fact. A person not found is never
+        # negated (nor stored); Keep does not track disabled or deleted people.
+        negatives = frozenset(
+            k
+            for k, obj in objects.items()
+            if obj.kind == "team" and (obj.deleted or not obj.eligible)
+        )
         return DirectoryEvidence(
             self.reader.source,
             generation,

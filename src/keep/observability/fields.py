@@ -75,6 +75,8 @@ FIELDS = {
         "view",
         # Names of the fields a rejected alert got wrong; a list of keywords.
         "fields",
+        # A directory refresh root: a group's samAccountName, never a person's (REV-75).
+        "root",
     ),
     **_fields("text", stack="error.stack_trace"),
     **_fields(
@@ -87,6 +89,8 @@ FIELDS = {
         sequence="event.sequence",
     ),
     **_keep("long", "projection_seq", "count", "attempt", "repeats", "member", "revision"),
+    # A directory refresh's units of coverage, those published, and its failed roots.
+    **_keep("long", "units", "published", "failed_roots"),
     **_keep("double", "lead_seconds", "delay_seconds"),
     **_keep("boolean", "audit", "suppressed", "time_defaulted"),
 }

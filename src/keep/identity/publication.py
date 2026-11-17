@@ -1,6 +1,10 @@
-"""Atomic directory checkpoint publication and known-revocation enforcement.
+"""Atomic directory checkpoint publication.
 
-Requirements: REV-73; identity configuration 7-8, 12; worker scope 4.
+Requirements: REV-73; REV-76; identity configuration 7-8, 12; worker scope 4.
+
+REV-76: Keep does not track disabled or deleted people. A person ADAPI does not
+find is never stored, tombstoned or negated, and no publication ends a session.
+A group that is not found is still tombstoned.
 
 Run with a trusted database identity: the refresh command, or the Product API for
 sign-in and save on pick. Network traversal must finish before opening the
@@ -35,7 +39,6 @@ from .directory import (
 class PublicationResult:
     accepted: bool
     semantic_revision: int
-    revoked_principals: tuple[str, ...]
     changed_access: tuple[tuple[str, str], ...]
     bootstrap_ready: bool
     # Complete evidence refused because a covered root or team already holds an
@@ -138,8 +141,9 @@ def _rebuild_memberships(conn) -> bool:
 def stored_matches(conn, obj: DirectoryObject) -> bool:
     """Whether a verified stored principal already says what ``obj`` says.
 
-    Sign-in publishes the person's row only when this is false (new, renamed,
-    enabled <-> disabled), so routine sign-ins publish nothing.
+    Sign-in publishes the person's row only when this is false (new, renamed, or
+    stored ineligible or deleted by an earlier version), so routine sign-ins
+    publish nothing.
     """
     row = conn.execute(
         """SELECT kind,display_name,eligible,deleted,evidence_generation,verified_at
@@ -163,6 +167,9 @@ def publish(
     bootstrap_qualified: bool = False,
 ) -> PublicationResult:
     """Publish full evidence or independently verified negative facts only.
+
+    Negative facts are groups not found (REV-76). A person not found is skipped:
+    no principal row, edge or checkpoint is written for them.
 
     Narrower fence (REV-73): complete evidence is refused (``fenced``) only when a
     covered root or team already holds an equal or newer generation. A covered
@@ -198,7 +205,7 @@ def publish(
     if conn.execute(
         "SELECT 1 FROM directory_verifications WHERE generation=%s", (evidence.generation,)
     ).fetchone():
-        return PublicationResult(False, previous, (), (), False)
+        return PublicationResult(False, previous, (), False)
     before_roles = _local_roles(conn)
     before_admins = {tenant for (tenant, _), role in before_roles.items() if role == 3}
     # Under the guard, every statement adapts as little as possible: text ids, the
@@ -226,18 +233,25 @@ def publish(
         for key, obj in evidence.objects.items()
         if obj.kind == "team" or current.get(key, {}).get("kind") == "team"
     }
+    # REV-76: a person not found contributes nothing (judged by the stored kind,
+    # so a stored group that is gone is still tombstoned).
+    missing = {
+        key
+        for key, obj in evidence.objects.items()
+        if obj.deleted and (current[key]["kind"] if key in current else obj.kind) == "user"
+    }
     fenced = evidence.complete and any(newer(key) for key in governing)
     accepted = evidence.complete and not fenced
     applicable = (
         evidence.objects if accepted else {k: evidence.objects[k] for k in evidence.negative_keys}
     )
     changed = False
-    rows, negatives, was_active = [], [], set()
+    rows = []
     for key, obj in sorted(applicable.items(), key=lambda item: _key_order(item[0])):
-        if newer(key):
+        if newer(key) or key in missing:
             continue
         old = current.get(key)
-        # A missing object's tombstone must retain its previously known type.
+        # A missing group's tombstone must retain its previously known type.
         kind = old["kind"] if old and obj.deleted else obj.kind
         values = (kind, obj.label, obj.eligible, obj.deleted)
         if old is None or values != (
@@ -248,10 +262,6 @@ def publish(
         ):
             changed = True
         rows.append((key, *values))
-        if not obj.eligible or obj.deleted:
-            negatives.append(key)
-            if old and old["eligible"] and not old["deleted"]:
-                was_active.add(key)
     stored = [row for row in rows if row[0] in current]
     if stored:
         # One statement for every known principal; the stored row is otherwise known.
@@ -295,20 +305,13 @@ def publish(
             ),
         ).fetchall():
             current[fresh_keys[row["object_id"]]] = row
-    # Known ineligibility ends every local session of that principal.
-    revoked = [current[key]["id"] for key in negatives if key in was_active]
-    if negatives:
-        conn.execute(
-            """UPDATE auth_sessions SET revoked_at=clock_timestamp()
-            WHERE principal_id=ANY(%b::uuid[]) AND revoked_at IS NULL""",
-            ([current[key]["id"] for key in negatives],),
-        )
     if accepted:
         parents = [current[key]["id"] for key in sorted(evidence.edges, key=_key_order)]
         desired = {
             (current[key]["id"], current[child]["id"])
             for key, children in evidence.edges.items()
             for child in children
+            if child not in missing
         }
         existing = {
             (row["parent_id"], row["child_id"])
@@ -343,7 +346,11 @@ def publish(
                 evidence.generation,
                 evidence.completed_at,
                 digest,
-                [current[key]["id"] for key in sorted(evidence.roots, key=_key_order)],
+                [
+                    current[key]["id"]
+                    for key in sorted(evidence.roots, key=_key_order)
+                    if key not in missing
+                ],
             ),
         )
     revision = previous + int(changed)
@@ -370,7 +377,7 @@ def publish(
         ),
     )
     if not accepted and not applicable:
-        return PublicationResult(False, revision, (), (), False, fenced)
+        return PublicationResult(False, revision, (), False, fenced)
     # Content revision may stay unchanged while a newly tracked root or changed
     # configured admin mapping changes derived authority. Fence every derivation,
     # including away-and-back changes, independently of semantic cursor revision.
@@ -479,7 +486,7 @@ def publish(
         # gates need their dedicated reconciliation proof and cannot be lifted.
         conn.execute("""UPDATE capability_gates SET ready=true,reason='directory_bootstrap_verified'
                      WHERE capability='human_auth' AND ready=false AND reason='directory_bootstrap_required'""")
-    return PublicationResult(accepted, revision, tuple(revoked), changed_access, ready, fenced)
+    return PublicationResult(accepted, revision, changed_access, ready, fenced)
 
 
 @dataclass(frozen=True)

@@ -73,21 +73,19 @@ def test_failed_refresh_retains_old_timestamp_and_membership_indefinitely():
     assert "secret" not in repr(failed)
 
 
-def test_known_disable_applies_even_partial_and_stale_complete_cannot_resurrect():
+def test_only_a_group_not_found_is_a_negative_fact():
+    """A person not found is never negated; a group not found is (REV-76).
+
+    Requirements: REV-76; identity configuration 8; plan B2.
+    """
     reader = Reader()
-    accepted = AcceptedDirectory()
-    older = DirectoryVerifier(reader).verify([key("root")], 2)
-    accepted.accept(DirectoryVerifier(reader).verify([key("root")], 1))
-    reader.objects[key("user")] = DirectoryObject(key("user"), "user", "user", False)
-    reader.fail.add(key("other"))
-    accepted.accept(DirectoryVerifier(reader).verify([key("root")], 3))
-    assert accepted.eligible_members(key("root")) == {key("other")}
-    accepted.accept(older)
-    assert key("user") not in accepted.eligible_members(key("root"))
-    reader.objects[key("user")] = DirectoryObject(key("user"), "user", "user", True)
-    reader.fail.clear()
-    accepted.accept(DirectoryVerifier(reader).verify([key("root")], 4))
-    assert key("user") in accepted.eligible_members(key("root"))
+    reader.objects[key("user")] = DirectoryObject(key("user"), "user", "user", False, deleted=True)
+    reader.objects[key("b")] = DirectoryObject(key("b"), "team", "b", False, deleted=True)
+    evidence = DirectoryVerifier(reader).verify([key("root"), key("user")], 1)
+    assert evidence.complete
+    assert evidence.negative_keys == {key("b")}
+    assert evidence.memberships[key("user")] == frozenset()
+    assert evidence.memberships[key("root")] == frozenset()
 
 
 def test_incomplete_page_cannot_establish_absence():
