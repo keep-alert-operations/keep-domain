@@ -27,6 +27,7 @@ GROUPABLE = (
     "display_status",
     "application",
     "component",
+    "object",
     "node_name",
     "site",
     "name",
@@ -34,7 +35,8 @@ GROUPABLE = (
     "active_incident_id",
 )
 GROUP_ORDER = {
-    "severity": ("critical", "high", "warning", "clear"),
+    # v1 severities follow their v2 equivalents in urgency (REV-77).
+    "severity": ("critical", "error", "high", "major", "warning", "clear"),
     "display_status": ("firing", "acknowledged", "resolved"),
 }
 MAX_GROUPS = 1000

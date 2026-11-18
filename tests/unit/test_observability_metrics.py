@@ -69,6 +69,8 @@ def test_listener_starts_only_when_a_port_is_configured():
         ("GET", "/readyz", "health"),
         ("GET", "unmatched", "unmatched"),
         ("POST", "/api/ingest/v1/alerts", "ingest_v1"),
+        # REV-77: the Grafana v1 route has its own class, ahead of the v1 prefix.
+        ("POST", "/api/ingest/v1/grafana", "ingest_v1_grafana"),
         ("POST", "/api/ingest/v2/alerts", "ingest_v2"),
         ("POST", "/api/ingest/v2/grafana", "ingest_grafana"),
         ("POST", "/api/rum-events", "rum"),

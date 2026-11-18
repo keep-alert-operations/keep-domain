@@ -84,7 +84,7 @@ def publish(
     if not maintenance_input_recorded and (
         cause == "source"
         or before is None
-        or any(before[field] != after[field] for field in RULE_FIELDS)
+        or any(before.get(field) != after.get(field) for field in RULE_FIELDS)
     ):
         if original_order is None:
             original_order = conn.execute(

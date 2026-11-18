@@ -197,8 +197,12 @@ def prepare_tenant(database, tenant, profile, *, maintenance_input=None, alert_i
 
 
 def _fields(row):
-    # Older journal rows and maintenance proof have no stored name (REV-54).
-    result = {key: alert_name(row) if key == "name" else row[key] for key in RULE_FIELDS}
+    # Older journal rows and maintenance proof have no stored name (REV-54), and
+    # none from before REV-77, nor proof of a row without one, has an object.
+    result = {
+        key: alert_name(row) if key == "name" else row.get(key) if key == "object" else row[key]
+        for key in RULE_FIELDS
+    }
     for key, value in result.items():
         if isinstance(value, UUID):
             result[key] = str(value)

@@ -19,13 +19,15 @@ FIELDS = {
         "key_field",
         "operator",
         "application",
-        "component",
     )
 }
 FIELDS.update(
     {
         name: Field("string", True)
         for name in (
+            # v2 holds component and v1 holds object; the other is null (REV-77).
+            "component",
+            "object",
             "node_name",
             "site",
             "name",
@@ -46,7 +48,11 @@ FIELDS.update(
         "provider": Field("enum", True, values=("api", "grafana")),
         "alert_rule_url": Field("string", True, 8192),
         "schema_version": Field("enum", values=("v1", "v2")),
-        "severity": Field("enum", values=("critical", "high", "warning", "clear")),
+        # v2 severities, then v1 severities as sent (REV-77); clear is the
+        # first-seen v1 sentinel.
+        "severity": Field(
+            "enum", values=("critical", "high", "error", "major", "warning", "clear")
+        ),
         "status": Field("enum", values=("firing", "resolved")),
         "acknowledged": Field("bool"),
         "suppressed": Field("bool"),
@@ -77,6 +83,7 @@ RULE_FIELDS = frozenset(
         "operator",
         "application",
         "component",
+        "object",
         "node_name",
         "site",
         "impact",
@@ -114,10 +121,12 @@ def alert_name(alert: dict) -> str | None:
 
 
 def alert_provider(alert: dict) -> str | None:
-    """Provider (REV-55): the stored value, else api for v1, whose only route is native.
+    """Provider (REV-55): the stored value, else api for a v1 row without one.
 
     Rows and snapshots written before REV-55 hold no provider; a v2 one reads as
-    none until the provider backfill stores the value of its latest delivery.
+    none until the provider backfill stores the value of its latest delivery. Since
+    REV-77 Grafana can send v1 too, so a stored provider always wins; a v1 row from
+    before REV-55 came through the native route and reads as api.
     """
     provider = alert.get("provider")
     if provider is None and alert.get("schema_version") == "v1":

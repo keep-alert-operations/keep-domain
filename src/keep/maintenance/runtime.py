@@ -180,7 +180,7 @@ def _apply_transition(conn, before, after, when, order, cause, now, catalog):
     needs_input = (
         cause == "source"
         or before is None
-        or any(before[field] != after[field] for field in RULE_FIELDS)
+        or any(before.get(field) != after.get(field) for field in RULE_FIELDS)
     )
     if needs_input:
         adjusted, effects = record_transition(

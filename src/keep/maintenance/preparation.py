@@ -190,8 +190,19 @@ def prepare_replay(database, catalog, alert_id, *, source_item=None):
     predicted = source_item is not None
     if predicted:
         from keep.alerts.lifecycle import apply_source
+        from keep.alerts.v1_native import as_legacy, source_prior
 
-        after, _ = apply_source(current, source_item)
+        # The processor converts an old-vocabulary v1 row on touch (REV-77); the
+        # predicted input keeps the raw row as its before, like the real one.
+        prior, hold = source_prior(
+            current,
+            catalog,
+            source_item["received_at"],
+            source_item.get("admission_order", state["admission_order"] + 1),
+        )
+        after, _ = apply_source(prior, source_item)
+        if hold:
+            after = as_legacy(after)
         before, after_snapshot = _snapshot(current), _snapshot(after)
         order = source_item.get("admission_order", state["admission_order"] + 1)
         at = source_item["received_at"]
