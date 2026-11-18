@@ -304,3 +304,33 @@ def test_started_window_in_old_words_holds_the_old_vocabulary(v1):
     assert source_prior(stored, None, NOW, 5)[1] is False
     # A window that has ended no longer covers the update.
     assert held_by(old, stored, as_sent(stored), NOW + timedelta(hours=2), 5) == []
+
+
+def test_only_a_window_in_the_leaving_words_holds_an_alert(v1):
+    """Requirements: REV-77; maintenance 6 (a window in the new words sees the converted alert)."""
+    from types import SimpleNamespace
+
+    from keep.alerts.v1_native import held_by, source_prior
+
+    stored = dict(old_row(v1), object=None)
+    start = NOW - timedelta(hours=1)
+
+    def catalog(source):
+        segment = Segment(
+            uuid4(), uuid4(), 1, Boundary(start, 1, str(uuid4())), start,
+            NOW + timedelta(hours=1), compile_expression(source, rule=True),
+        )
+        return SimpleNamespace(segments=(segment,)), str(segment.window_id)
+
+    # Written in the new words, the window must see the converted row, so its
+    # cause can open on the conversion; holding would leave the alert unsuppressed.
+    new_words, window = catalog('severity == "major"')
+    assert held_by(new_words, stored, as_sent(stored), NOW, 5) == []
+    assert source_prior(stored, new_words, NOW, 5)[1] is False
+    # Windows are evaluated on the rule snapshot, as maintenance does: a window
+    # on a UUID field matches the same way before and after, so nothing is held.
+    on_id, _ = catalog(f'id == "{stored["id"]}"')
+    assert held_by(on_id, stored, as_sent(stored), NOW, 5) == []
+    # With --reverse the leaving words are the new ones.
+    converted = as_sent(stored)
+    assert held_by(new_words, converted, as_legacy(converted), NOW, 5, reverse=True) == [window]

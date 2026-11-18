@@ -57,25 +57,47 @@ def as_legacy(row: dict) -> dict:
     return result
 
 
-def held_by(catalog, raw, converted, at, order):
+def _in_leaving_words(program, reverse) -> bool:
+    """Whether a window's expression names the vocabulary the row is leaving.
+
+    Forward, that is `component` or critical/high; with `--reverse`, `object` or
+    error/major. A window written in the target words, or in neither, must see
+    the converted row so its cause can open. An expression the rewriter cannot
+    read is treated as leaving words, the safe side.
+    """
+    from keep.cel.v1_rewrite import rewrite
+
+    source = getattr(program, "source", None)
+    if source is None:
+        return True
+    try:
+        return rewrite(source, reverse=reverse).changed
+    except Exception:
+        return True
+
+
+def held_by(catalog, raw, converted, at, order, *, reverse=False):
     """Maintenance windows whose match would change if this row were converted now.
 
     A window that has started cannot have its expression edited, so one still
-    written in the old words would release (or newly catch) the alert at the
-    conversion. Such a row keeps the old words until the window ends; a rerun of
-    the conversion, or the next source update after that, converts it.
+    written in the words the row is leaving would release (or newly catch) the
+    alert at the conversion. Such a row keeps those words until the window ends;
+    a rerun of the conversion, or the next source update after that, converts
+    it. Windows are evaluated on the same rule snapshot maintenance uses.
     """
+    from keep.maintenance.processing import _snapshot
     from keep.maintenance.temporal import Boundary
 
     if catalog is None or raw is converted:
         return []
     boundary = Boundary(at, max(int(order), 0), "v1-native-probe")
+    before, after = _snapshot(raw), _snapshot(converted)
     held = []
     for segment in catalog.segments:
-        if not segment.covers(boundary):
+        if not segment.covers(boundary) or not _in_leaving_words(segment.program, reverse):
             continue
         try:
-            differs = segment.program.evaluate(raw, at) != segment.program.evaluate(converted, at)
+            differs = segment.program.evaluate(before, at) != segment.program.evaluate(after, at)
         except Exception:
             differs = True
         if differs:
