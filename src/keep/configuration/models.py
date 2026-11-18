@@ -9,6 +9,7 @@ from keep.models import StrictModel, Command, uuid_string
 SORTABLE = {
     "application",
     "component",
+    "object",
     "node_name",
     "site",
     "operator",
@@ -47,6 +48,7 @@ GROUPABLE = {
     "display_status",
     "application",
     "component",
+    "object",
     "node_name",
     "site",
     "name",

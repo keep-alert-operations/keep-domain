@@ -5,6 +5,7 @@ from datetime import datetime
 from hashlib import sha256
 import json
 
+from keep.alerts.v1_native import as_sent
 from keep.cel.catalog import INDEX_FIELDS as FIELDS, alert_name, alert_provider, storage_name
 from keep.cel.compiler import PROFILE, epoch_us, timestamp
 from keep.shared.errors import AppError, unavailable
@@ -14,6 +15,7 @@ SORTABLE = frozenset(
     (
         "application",
         "component",
+        "object",
         "node_name",
         "site",
         "operator",
@@ -31,6 +33,8 @@ SORTABLE = frozenset(
         "assignee_id",
     )
 )
+# Urgency order: v1 error ranks with critical and major with high (REV-77).
+SEVERITY_RANK = {"critical": 0, "error": 0, "high": 1, "major": 1, "warning": 2, "clear": 3}
 
 
 def canonical(value: dict) -> bytes:
@@ -107,6 +111,8 @@ def build_document(item: Projection) -> dict:
     if deleted:
         # No source content, note text, display data or actor IDs survive here.
         return result
+    # A v1 snapshot not yet converted is searched as its v1 equivalent (REV-77).
+    snapshot = as_sent(snapshot)
     display = {}
     for name, spec in FIELDS.items():
         if name == "timestamp":
@@ -159,9 +165,7 @@ def build_document(item: Projection) -> dict:
         )
     )
     result["severity_clear_last"] = snapshot["severity"] == "clear"
-    result["severity_rank"] = {"critical": 0, "high": 1, "warning": 2, "clear": 3}[
-        snapshot["severity"]
-    ]
+    result["severity_rank"] = SEVERITY_RANK[snapshot["severity"]]
     # Source presentation strings are preserved independently of integer time fields.
     result["display"] = display
     result["content_digest"] = sha256(canonical(result)).hexdigest()

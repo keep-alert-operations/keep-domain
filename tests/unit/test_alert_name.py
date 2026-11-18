@@ -120,7 +120,8 @@ def test_maintenance_proof_of_unnamed_alerts_is_unchanged(v1):
     snapshot = _snapshot(unnamed)
     assert "name" not in snapshot
     # Byte-identical to the snapshot recorded before names existed.
-    before = {k: unnamed[k] for k in sorted(RULE_FIELDS - {"name"})}
+    # Proof from then had no object either; v2 proof still omits it (REV-77).
+    before = {k: unnamed[k] for k in sorted(RULE_FIELDS - {"name", "object"})}
     before["time_created"] = before["time_created"].astimezone(UTC)
     assert canonical(snapshot) == canonical(wire(before))
     assert "name" not in _snapshot(created(v1, "v1"))

@@ -6,7 +6,6 @@ from keep.ingestion.native import native_time
 from keep.operators.grafana import rule_url
 from keep.shared.errors import AppError
 
-SEVERITY = {"error": "critical", "major": "high", "warning": "warning", "clear": "clear"}
 SEMANTIC_FIELDS = (
     "message",
     "status",
@@ -39,6 +38,13 @@ def delivery_provider(item):
 
 
 def apply_source(previous, item):
+    """Apply one delivery; v1 is stored as sent (REV-77), v2 unchanged.
+
+    A v1 alert keeps `object` (with `component` null) and its severity error,
+    major or warning; `clear` resolves and keeps the last real severity, and is
+    stored only as the first-seen value. The caller converts a stored v1 row that
+    still holds the old vocabulary (keep.alerts.v1_native) before calling this.
+    """
     source = item["payload"]
     when = item["received_at"]
     v1 = item["version"] == "v1"
@@ -48,7 +54,7 @@ def apply_source(previous, item):
         if v1
         else ("resolved" if source["status"] == "resolved" else "firing")
     )
-    severity = SEVERITY[source["severity"]] if v1 else source["severity"]
+    severity = source["severity"]
     source_suppressed = not v1 and source["status"] == "suspended"
     if previous is None:
         current = {
@@ -58,7 +64,8 @@ def apply_source(previous, item):
             "key_field": item["key_field"],
             "operator": source["operator"] if v1 else str(item["operator_id"]),
             "application": source["application"],
-            "component": source["object"] if v1 else source["component"],
+            "component": None if v1 else source["component"],
+            "object": source["object"] if v1 else None,
             "node_name": source.get("node_name"),
             "site": source.get("site"),
             "impact": source.get("impact"),

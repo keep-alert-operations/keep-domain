@@ -10,7 +10,7 @@ from keep.serialization import wire
 
 def maintenance_adjust(conn, row, updated, now, cause, catalog):
     order = None
-    if any(row[field] != updated[field] for field in RULE_FIELDS):
+    if any(row.get(field) != updated.get(field) for field in RULE_FIELDS):
         order = conn.execute(
             "UPDATE tenant_work_state SET admission_order=admission_order+1 WHERE tenant_id=%s RETURNING admission_order",
             (row["tenant_id"],),

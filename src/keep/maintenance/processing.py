@@ -271,13 +271,17 @@ def compile_catalog(snapshot, *, max_work, max_inputs, max_segments):
 def _snapshot(value):
     if value is None:
         return None
-    if not RULE_FIELDS.issubset(value):
+    if not (RULE_FIELDS - {"object"}).issubset(value):
         raise MaintenanceProofError("maintenance_rule_snapshot_incomplete")
-    snapshot = {key: value[key] for key in sorted(RULE_FIELDS)}
+    snapshot = {key: value.get(key) for key in sorted(RULE_FIELDS)}
     if snapshot["name"] is None:
         # Implied by key_field (REV-54); proof recorded before names existed
         # stays byte-identical for continuity, replay digests and checkpoints.
         del snapshot["name"]
+    if snapshot["object"] is None:
+        # Only v1 rows hold an object (REV-77); proof recorded before the field
+        # existed, and v2 proof, stay byte-identical.
+        del snapshot["object"]
     created = snapshot["time_created"]
     if isinstance(created, str):
         try:

@@ -14,6 +14,10 @@ def display_status(alert):
 
 
 def present_alert(alert):
+    from keep.alerts.v1_native import as_sent
+
+    # A v1 row not yet converted reads as its v1 equivalent (REV-77).
+    alert = as_sent(alert)
     result = {key: value for key, value in alert.items() if key not in LEGACY_ACK_FIELDS}
     result["display_status"] = display_status(alert)
     if "key_field" in alert:
@@ -24,6 +28,8 @@ def present_alert(alert):
         # Rows from before REV-55 hold no provider; v1 reads as api.
         result["provider"] = alert_provider(alert)
         result.setdefault("alert_rule_url", None)
+        # Rows and command results from before REV-77 have no object.
+        result.setdefault("object", None)
     return result
 
 

@@ -1,7 +1,8 @@
 from psycopg.types.json import Jsonb
 
-from keep.alerts.lifecycle import apply_source
+from keep.alerts.lifecycle import SEMANTIC_FIELDS, apply_source
 from keep.alerts.repository import insert_alert_identity, publish, store_alert
+from keep.alerts.v1_native import as_legacy, source_prior
 from keep.observability import alert_fields, flow as alert_flow
 from keep.observability.flow import seconds_since
 from keep.shared.errors import AppError, unavailable
@@ -64,7 +65,18 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None, coordinate
             or bytes(claim["identity_material"]) != bytes(item["identity_material"])
         ):
             raise AppError("identity_conflict", "Immutable identity material differs.", 409)
-        current, changed = apply_source(previous, item)
+        # Convert on touch (REV-77): a v1 row still in the old vocabulary is read
+        # as sent, so the conflict check, revision and activity see only the real
+        # change. Maintenance proof keeps the raw row as `before`, continuing the
+        # recorded chain; the one source transition moves it to the new words.
+        # While a started window in the old words would change its match, the
+        # row keeps the old words (v1_native.held_by).
+        prior, hold = source_prior(
+            previous, catalog, item["received_at"], item["admission_order"]
+        )
+        current, changed = apply_source(prior, item)
+        if hold:
+            current, prior = as_legacy(current), previous
     except AppError as error:
         error_code = error.code
         if supplied_item is None:
@@ -98,6 +110,10 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None, coordinate
             now,
             catalog,
         )
+        if prior is not previous:
+            # The vocabulary change alone is no semantic change (REV-77).
+            changed = any(prior.get(f) != current.get(f) for f in SEMANTIC_FIELDS)
+            current["revision"] = prior["revision"] + int(changed)
         store_alert(conn, current, new=previous is None, identity_inserted=True)
         from keep.incidents.state import became_resolved, linked_transition
 
@@ -137,7 +153,7 @@ def _apply_one(conn, tenant, attempt, catalog, *, supplied_item=None, coordinate
             )
         publication = publish(
             conn,
-            previous,
+            prior,
             current,
             item["received_at"],
             "source",

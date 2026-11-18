@@ -7,6 +7,7 @@ availability and latency indicators of reliability 2 to 5.
 
 CLASSES = (
     "ingest_v1",
+    "ingest_v1_grafana",
     "ingest_v2",
     "ingest_grafana",
     "read",
@@ -44,6 +45,9 @@ def classify(method, route):
         return "health"
     if not route or route == "unmatched":
         return "unmatched"
+    # Grafana webhooks into Global (REV-77), before the native v1 prefix.
+    if route.startswith("/api/ingest/v1/grafana"):
+        return "ingest_v1_grafana"
     if route.startswith("/api/ingest/v1/"):
         return "ingest_v1"
     if route.startswith("/api/ingest/v2/grafana"):
